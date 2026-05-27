@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="WebServers">
+    <option name="servers">
+      <webServer id="0fa33521-b73c-421e-800f-728d24cf91e2" name="nas3r">
+        <fileTransfer accessType="SFTP" host="192.168.1.108" port="22" sshConfigId="8c6b5b2d-f6dd-471b-966e-db2f4168a736" sshConfig="mengxl@192.168.1.108:22 key" keyPair="true">
+          <advancedOptions>
+            <advancedOptions dataProtectionLevel="Private" passiveMode="true" shareSSLContext="true" />
+          </advancedOptions>
+        </fileTransfer>
+      </webServer>
+    </option>
+  </component>
+</project>
