@@ -227,9 +227,9 @@ class ModelWrapper(LightningModule):
             for key in batch["target"].keys():
                 batch["target"][key] = batch["target"][key][:, selected_indices]
 
-        target_image = self._images(batch["target"])
-        context_image = self._images(batch["context"])
-        b, v_tgt, _, h, w = target_image.shape
+        target_gt = batch["target"]["image"] if not self.train_cfg.training_context else torch.cat(
+            [batch["context"]["image"], batch["target"]["image"]], dim=1)
+        b, v_tgt, _, h, w = batch["target"]["image"].shape
         v_cxt = batch["context"]["image"].shape[1]
 
         # Run the model.
@@ -267,9 +267,6 @@ class ModelWrapper(LightningModule):
             [batch["context"]["near"], batch["target"]["near"]], dim=1)
         far = batch["target"]["far"] if not self.train_cfg.training_context else torch.cat(
             [batch["context"]["far"], batch["target"]["far"]], dim=1)
-        target_gt = target_image if not self.train_cfg.training_context else torch.cat(
-            [context_image, target_image], dim=1)
-
         # Run decoder
         output = self.decoder.forward(
             gaussians,
