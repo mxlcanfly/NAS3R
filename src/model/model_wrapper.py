@@ -188,6 +188,14 @@ class ModelWrapper(LightningModule):
 
         self.ckpt_path = None
 
+    def _image_key(self, views: dict) -> str:
+        if getattr(self.encoder.cfg, "name", None) == "nas3r-m" and "image_lr" in views:
+            return "image_lr"
+        return "image"
+
+    def _images(self, views: dict) -> Tensor:
+        return views[self._image_key(views)]
+
     def training_step(self, batch, batch_idx):
         # combine batch from different dataloaders
         if isinstance(batch, list):
@@ -209,8 +217,9 @@ class ModelWrapper(LightningModule):
         if self.train_cfg.random_drop_context_views:
             v_cxt = batch["context"]["image"].shape[1]
             selected_indices = dropout_context_views(v_cxt)
-            for key in ["image", "intrinsics", "extrinsics", "index", "near", "far"]:
-                batch["context"][key] = batch["context"][key][:, selected_indices]
+            for key in ["image", "image_lr", "intrinsics", "extrinsics", "index", "near", "far"]:
+                if key in batch["context"]:
+                    batch["context"][key] = batch["context"][key][:, selected_indices]
 
         if self.train_cfg.random_drop_target_views:
             v_tgt = batch["target"]["image"].shape[1]
@@ -218,7 +227,9 @@ class ModelWrapper(LightningModule):
             for key in batch["target"].keys():
                 batch["target"][key] = batch["target"][key][:, selected_indices]
 
-        b, v_tgt, _, h, w = batch["target"]["image"].shape
+        target_image = self._images(batch["target"])
+        context_image = self._images(batch["context"])
+        b, v_tgt, _, h, w = target_image.shape
         v_cxt = batch["context"]["image"].shape[1]
 
         # Run the model.
@@ -256,8 +267,8 @@ class ModelWrapper(LightningModule):
             [batch["context"]["near"], batch["target"]["near"]], dim=1)
         far = batch["target"]["far"] if not self.train_cfg.training_context else torch.cat(
             [batch["context"]["far"], batch["target"]["far"]], dim=1)
-        target_gt = batch["target"]["image"] if not self.train_cfg.training_context else torch.cat(
-            [batch["context"]["image"], batch["target"]["image"]], dim=1)
+        target_gt = target_image if not self.train_cfg.training_context else torch.cat(
+            [context_image, target_image], dim=1)
 
         # Run decoder
         output = self.decoder.forward(
@@ -321,7 +332,8 @@ class ModelWrapper(LightningModule):
 
     def test_step(self, batch, batch_idx):
         v_cxt = batch["context"]["image"].shape[1]
-        b, v_tgt, _, h, w = batch["target"]["image"].shape
+        target_image = self._images(batch["target"])
+        b, v_tgt, _, h, w = target_image.shape
         assert b == 1
 
         if batch_idx % 100 == 0:
@@ -341,6 +353,8 @@ class ModelWrapper(LightningModule):
                     "near": batch["target"]["near"][:, target_view:target_view + 1],
                     "far": batch["target"]["far"][:, target_view:target_view + 1],
                 }
+                if "image_lr" in batch["target"]:
+                    target_data["image_lr"] = batch["target"]["image_lr"][:, target_view:target_view + 1]
 
                 with self.benchmarker.time("encoder"):
                     encoder_output = self.encoder(batch["context"], self.global_step,
@@ -410,7 +424,7 @@ class ModelWrapper(LightningModule):
             rgb_pred = output.color[0]  # (v, 3, h, w)
 
         (scene,) = batch["scene"]
-        rgb_gt = batch["target"]["image"][0]
+        rgb_gt = target_image[0]
 
         # compute scores
         if self.test_cfg.compute_scores:
@@ -469,7 +483,7 @@ class ModelWrapper(LightningModule):
 
         if self.test_cfg.save_compare:
             # Construct comparison image.
-            context_img = batch["context"]["image"][0]
+            context_img = self._images(batch["context"])[0]
             comparison = [
                 add_label(vcat(*context_img), "Context"),
                 add_label(vcat(*rgb_gt), "Target (Ground Truth)"),
@@ -483,8 +497,9 @@ class ModelWrapper(LightningModule):
         for param in self.encoder.parameters():
             param.requires_grad = False
 
-        b, v, _, h, w = target["image"].shape
-        device = target["image"].device
+        target_image = self._images(target)
+        b, v, _, h, w = target_image.shape
+        device = target_image.device
         with torch.set_grad_enabled(True):
             if initial_extrinsics is not None:
                 extrinsics = nn.Parameter(initial_extrinsics)
@@ -518,7 +533,7 @@ class ModelWrapper(LightningModule):
                     total_loss = 0
                     for loss_fn in self.losses:
                         if loss_fn.name in ["mse", "lpips"]:
-                            loss = loss_fn.forward(output.color, target["image"], gaussians, self.global_step)
+                            loss = loss_fn.forward(output.color, target_image, gaussians, self.global_step)
                             total_loss = total_loss + loss
 
                     total_loss.backward()
@@ -589,8 +604,9 @@ class ModelWrapper(LightningModule):
             v_cxt = batch["context"]["image"].shape[1]
             selected_indices = dropout_context_views(v_cxt)
             # Apply selection to all context elements
-            for key in ["image", "intrinsics", "extrinsics", "index", "near", "far"]:
-                batch["context"][key] = batch["context"][key][:, selected_indices]
+            for key in ["image", "image_lr", "intrinsics", "extrinsics", "index", "near", "far"]:
+                if key in batch["context"]:
+                    batch["context"][key] = batch["context"][key][:, selected_indices]
 
         if self.train_cfg.random_drop_target_views:
             v_tgt = batch["target"]["image"].shape[1]
@@ -608,7 +624,9 @@ class ModelWrapper(LightningModule):
             )
 
         v_cxt = batch["context"]["image"].shape[1]
-        b, v_tgt, _, h, w = batch["target"]["image"].shape
+        target_image = self._images(batch["target"])
+        context_image = self._images(batch["context"])
+        b, v_tgt, _, h, w = target_image.shape
         assert b == 1
 
         visualization_dump = {}
@@ -644,7 +662,7 @@ class ModelWrapper(LightningModule):
         intrinsics = torch.cat([context_intrinsics, target_intrinsics], dim=1)
         near = torch.cat([batch["context"]["near"], batch["target"]["near"]], dim=1)
         far = torch.cat([batch["context"]["far"], batch["target"]["far"]], dim=1)
-        target_gt = torch.cat([batch["context"]["image"], batch["target"]["image"]], dim=1)
+        target_gt = torch.cat([context_image, target_image], dim=1)
 
         # Run decoder
         output = self.decoder.forward(
@@ -679,7 +697,7 @@ class ModelWrapper(LightningModule):
         self.log(f"val/context/ssim", ssim_val)
 
         # Construct comparison image.
-        context_img = batch["context"]["image"][0]
+        context_img = context_image[0]
         context_img_depth = vis_depth_map(visualization_dump["depth"][0])  # (v, h, w)
 
         comparison = hcat(
@@ -804,7 +822,7 @@ class ModelWrapper(LightningModule):
     ) -> None:
         # Render probabilistic estimate of scene.
 
-        _, _, _, h, w = batch["context"]["image"].shape
+        _, _, _, h, w = self._images(batch["context"]).shape
         _, v_cxt, _, _ = batch["context"]["extrinsics"].shape
 
         visualization_dump = {}
