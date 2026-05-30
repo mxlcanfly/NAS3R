@@ -16,6 +16,7 @@ from ...dataset.shims.normalize_shim import apply_normalize_shim, normalize_imag
 from ...dataset.shims.patch_shim import apply_patch_shim
 from ...dataset.types import BatchedExample, DataShim
 from ...geometry.projection import sample_image_grid
+from ..super_resolution import FrozenSwinIRUpsampler
 from ..types import Gaussians
 from .backbone import Backbone, BackboneCfg, get_backbone
 from .common.gaussian_adapter import GaussianAdapter, GaussianAdapterCfg, UnifiedGaussianAdapter
@@ -59,6 +60,9 @@ class EncoderNAS3RMCfg:
     pose_head_type: str = 'mlp'
     estimating_focal: bool = False
     estimating_pose: bool = True
+
+    use_swinir_sr: bool = True
+    swinir_weight_path: str = "/space0/mengxl/SRGS-main/model_zoo/swinir/001_classicalSR_DF2K_s64w8_SwinIR-M_x4.pth"
 
     depth_activation: str = 'sigmoid'
 
@@ -108,6 +112,12 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
 
         if self.cfg.estimating_pose:
             self.set_pose_head(cfg, cfg.pose_head_type)
+
+        self.swinir_upsampler = (
+            FrozenSwinIRUpsampler(cfg.swinir_weight_path)
+            if cfg.use_swinir_sr
+            else None
+        )
 
     def set_depth_head(self, output_mode, head_type, landscape_only, depth_mode, conf_mode):
         self.backbone.depth_mode = depth_mode
@@ -171,6 +181,11 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
     ):
         context_image = context.get("image_lr", context["image"])
         target_image = target.get("image_lr", target["image"]) if target is not None else None
+
+        if self.swinir_upsampler is not None:
+            context_image = self.swinir_upsampler(context_image)
+            if target_image is not None:
+                target_image = self.swinir_upsampler(target_image)
 
         device = context_image.device
         b, v_cxt, _, h, w = context_image.shape
