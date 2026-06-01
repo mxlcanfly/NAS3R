@@ -88,6 +88,7 @@ class TrainCfg:
     random_drop_target_views: bool = False
 
     pretrain_camera_head: bool = False
+    refine_only: bool = False
 
 
 def dropout_context_views(v_cxt):
@@ -196,6 +197,21 @@ class ModelWrapper(LightningModule):
     def _images(self, views: dict) -> Tensor:
         return views[self._image_key(views)]
 
+    @rank_zero_only
+    def _save_refine_depth_visualization(self, visualization_dump: dict) -> None:
+        if self.global_step % 500 != 0:
+            return
+        if "depth_refine_before" not in visualization_dump or "depth_refine_after" not in visualization_dump:
+            return
+
+        before = vis_depth_map(visualization_dump["depth_refine_before"][0].detach().cpu().clamp_min(1e-6))
+        after = vis_depth_map(visualization_dump["depth_refine_after"][0].detach().cpu().clamp_min(1e-6))
+        comparison = hcat(
+            add_label(vcat(*before), "Depth Before Refine"),
+            add_label(vcat(*after), "Depth After Refine"),
+        )
+        save_image(add_border(comparison), Path("depth_refine") / f"step_{self.global_step:0>6}.png")
+
     def training_step(self, batch, batch_idx):
         # combine batch from different dataloaders
         if isinstance(batch, list):
@@ -236,6 +252,7 @@ class ModelWrapper(LightningModule):
         visualization_dump = {}
         encoder_output = self.encoder(batch["context"], self.global_step, visualization_dump=visualization_dump,
                                       target=batch["target"] if self.encoder.cfg.estimating_pose else None)
+        self._save_refine_depth_visualization(visualization_dump)
 
         if self.encoder.cfg.estimating_pose:
             pred_extrinsics, pred_extrinsics_cwt = encoder_output['extrinsics']['c'], encoder_output['extrinsics'][
@@ -961,6 +978,11 @@ class ModelWrapper(LightningModule):
                     print(f"Freezing: {name}")
 
     def configure_optimizers(self):
+        if self.train_cfg.refine_only:
+            trainable_keywords = ("resunet_token_fusion", "ptv3_refiner")
+            for name, param in self.named_parameters():
+                param.requires_grad = any(keyword in name for keyword in trainable_keywords)
+
         new_params, new_param_names = [], []
         pretrained_params, pretrained_param_names = [], []
 
@@ -978,7 +1000,7 @@ class ModelWrapper(LightningModule):
                     continue
 
                 # Heads that are always treated as new
-                if any(x in name for x in ["gaussian_param_head", "intrinsic_encoder"]):
+                if any(x in name for x in ["gaussian_param_head", "intrinsic_encoder", "resunet_token_fusion", "ptv3_refiner"]):
                     new_params.append(param)
                     new_param_names.append(name)
                     # print(name)

@@ -1,0 +1,214 @@
+import math
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from einops import rearrange
+
+
+class ResidualBlock(nn.Module):
+    def __init__(
+        self,
+        in_planes: int,
+        planes: int,
+        norm_layer=nn.InstanceNorm2d,
+        stride: int = 1,
+        dilation: int = 1,
+    ) -> None:
+        super().__init__()
+        self.conv1 = nn.Conv2d(
+            in_planes,
+            planes,
+            kernel_size=3,
+            dilation=dilation,
+            padding=dilation,
+            stride=stride,
+            bias=False,
+        )
+        self.conv2 = nn.Conv2d(
+            planes,
+            planes,
+            kernel_size=3,
+            dilation=dilation,
+            padding=dilation,
+            bias=False,
+        )
+        self.relu = nn.ReLU(inplace=True)
+        self.norm1 = norm_layer(planes)
+        self.norm2 = norm_layer(planes)
+
+        if stride == 1 and in_planes == planes:
+            self.downsample = None
+        else:
+            self.downsample = nn.Sequential(
+                nn.Conv2d(in_planes, planes, kernel_size=1, stride=stride),
+                norm_layer(planes),
+            )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.relu(self.norm1(self.conv1(x)))
+        y = self.relu(self.norm2(self.conv2(y)))
+        if self.downsample is not None:
+            x = self.downsample(x)
+        return self.relu(x + y)
+
+
+class ResUnetEncoder(nn.Module):
+    def __init__(self, norm_layer=nn.InstanceNorm2d, feature_dims=(32, 64, 128)) -> None:
+        super().__init__()
+        self.conv1 = nn.Conv2d(3, feature_dims[0], kernel_size=7, stride=1, padding=3, bias=False)
+        self.norm1 = norm_layer(feature_dims[0])
+        self.relu1 = nn.ReLU(inplace=True)
+        self.layer0 = self._make_layer(feature_dims[0], feature_dims[0], stride=1, norm_layer=norm_layer)
+        self.layer1 = self._make_layer(feature_dims[0], feature_dims[1], stride=2, norm_layer=norm_layer)
+        self.layer2 = self._make_layer(feature_dims[1], feature_dims[2], stride=2, norm_layer=norm_layer)
+        self.layer3 = self._make_layer(feature_dims[2], feature_dims[2], stride=1, norm_layer=norm_layer)
+        self.conv2 = nn.Conv2d(feature_dims[2], feature_dims[2], 1, 1, 0)
+
+    def _make_layer(self, in_dim, out_dim, stride=1, dilation=1, norm_layer=nn.InstanceNorm2d):
+        return nn.Sequential(
+            ResidualBlock(in_dim, out_dim, norm_layer=norm_layer, stride=stride, dilation=dilation),
+            ResidualBlock(out_dim, out_dim, norm_layer=norm_layer, stride=1, dilation=dilation),
+        )
+
+    def forward(self, x: torch.Tensor) -> list[torch.Tensor]:
+        features = []
+        x = self.relu1(self.norm1(self.conv1(x)))
+        x = self.layer0(x)
+        features.append(x)  # 1/1: 32, 256x256
+        x = self.layer1(x)
+        features.append(x)  # 1/2: 64, 128x128
+        x = self.layer2(x)
+        features.append(x)  # 1/4: 128, 64x64
+        x = self.conv2(self.layer3(x))
+        features.append(x)  # 1/4: 128, 64x64
+        return features
+
+
+class ResUnetDecoder(nn.Module):
+    def __init__(self, norm_layer=nn.InstanceNorm2d, feature_dims=(32, 64, 128)) -> None:
+        super().__init__()
+        self.decode_layer1 = self._make_fine_layer(2 * feature_dims[-1], feature_dims[-1], feature_dims[-2], norm_layer)
+        self.decode_layer0 = self._make_fine_layer(2 * feature_dims[-2], feature_dims[-2], feature_dims[-3], norm_layer)
+        self.out_layer0 = self._make_fine_layer(2 * feature_dims[0], feature_dims[0], feature_dims[0], norm_layer)
+        self.out_layer1 = self._make_fine_layer(2 * feature_dims[1], feature_dims[1], feature_dims[1], norm_layer)
+        self.out_layer2 = self._make_fine_layer(2 * feature_dims[2], feature_dims[2], feature_dims[2], norm_layer)
+
+    def _make_fine_layer(self, in_dim, mid_dim, out_dim, norm_layer):
+        return nn.Sequential(
+            ResidualBlock(in_dim, mid_dim, norm_layer=norm_layer),
+            ResidualBlock(mid_dim, out_dim, norm_layer=norm_layer),
+        )
+
+    def forward(
+        self,
+        feature_list: list[torch.Tensor],
+        dino_feature_list: list[torch.Tensor] | None = None,
+    ) -> list[torch.Tensor]:
+        out_feature = []
+        x = feature_list[-1]
+        if dino_feature_list is not None:
+            x = x + dino_feature_list[0]
+        x = torch.cat([x, feature_list[-2]], dim=1)
+        out_feature.append(self.out_layer2(x))
+
+        x = self.decode_layer1(x)
+        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=True)
+        if dino_feature_list is not None:
+            x = x + dino_feature_list[1]
+        x = torch.cat([x, feature_list[-3]], dim=1)
+        out_feature.append(self.out_layer1(x))
+
+        x = self.decode_layer0(x)
+        x = F.interpolate(x, scale_factor=2, mode="bilinear", align_corners=True)
+        if dino_feature_list is not None:
+            x = x + dino_feature_list[2]
+        x = torch.cat([x, feature_list[-4]], dim=1)
+        out_feature.append(self.out_layer0(x))
+
+        return out_feature
+
+
+class ResUnet(nn.Module):
+    def __init__(
+        self,
+        dino_dim: int,
+        norm_layer=nn.InstanceNorm2d,
+        feature_dims=(32, 64, 128),
+    ) -> None:
+        super().__init__()
+        self.encoder = ResUnetEncoder(norm_layer=norm_layer, feature_dims=feature_dims)
+        self.decoder = ResUnetDecoder(norm_layer=norm_layer, feature_dims=feature_dims)
+        self.up_dino_cnn = nn.ModuleList(
+            [
+                nn.Conv2d(dino_dim, feature_dims[-1], 1, bias=False),
+                nn.Conv2d(dino_dim, feature_dims[-2], 1, bias=False),
+                nn.Conv2d(dino_dim, feature_dims[-3], 1, bias=False),
+            ]
+        )
+
+    def forward(self, x: torch.Tensor, dino_feature: torch.Tensor) -> list[torch.Tensor]:
+        feature_list = self.encoder(x)
+        dino_feature_list = []
+        for i in range(len(self.up_dino_cnn)):
+            dino_feature_i = self.up_dino_cnn[i](
+                F.interpolate(
+                    dino_feature,
+                    size=feature_list[len(feature_list) - i - 2].shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            )
+            dino_feature_list.append(dino_feature_i)
+        out_feature = self.decoder(feature_list, dino_feature_list)
+        return out_feature
+
+
+class HiSplatResUnetTokenFusion(nn.Module):
+    def __init__(
+        self,
+        token_dim: int,
+        token_ch: int = 64,
+        feature_dims: tuple[int, int, int] = (32, 64, 128),
+        norm_layer=nn.InstanceNorm2d,
+    ) -> None:
+        super().__init__()
+        self.resunet = ResUnet(dino_dim=token_ch, norm_layer=norm_layer, feature_dims=feature_dims)
+        self.proj = nn.Sequential(
+            nn.Conv2d(token_dim, token_ch * 4, 1),
+            nn.BatchNorm2d(token_ch * 4),
+            nn.SiLU(),
+        )
+        self.upsampler0 = nn.Sequential(
+            nn.ConvTranspose2d(token_ch * 4, token_ch * 2, 4, stride=2, padding=1),
+            nn.BatchNorm2d(token_ch * 2),
+            nn.SiLU(),
+        )
+        self.upsampler1 = nn.Sequential(
+            nn.ConvTranspose2d(token_ch * 2, token_ch, 4, stride=2, padding=1),
+            nn.BatchNorm2d(token_ch),
+            nn.SiLU(),
+        )
+
+    def tokens_to_16x16(self, tokens: torch.Tensor) -> torch.Tensor:
+        b, v, n, c = tokens.shape
+        grid = int(math.sqrt(n))
+        if grid * grid != n:
+            raise ValueError(f"Expected square token grid, got {n} tokens.")
+        token_map = rearrange(tokens, "b v (h w) c -> (b v) c h w", h=grid, w=grid)
+        token_map = self.proj(token_map)
+        token_map = self.upsampler0(token_map)
+        token_map = self.upsampler1(token_map)
+        if token_map.shape[-2:] != (16, 16):
+            token_map = F.interpolate(token_map, size=(16, 16), mode="bilinear", align_corners=False)
+        return token_map
+
+    def forward(self, images: torch.Tensor, tokens: torch.Tensor) -> dict[str, torch.Tensor]:
+        b, v = images.shape[:2]
+        images = rearrange(images, "b v c h w -> (b v) c h w")
+        dino_feature = self.tokens_to_16x16(tokens)
+        fused = self.resunet(images, dino_feature)
+        return {
+            "64": rearrange(fused[0], "(b v) c h w -> b v c h w", b=b, v=v),
+            "256": rearrange(fused[2], "(b v) c h w -> b v c h w", b=b, v=v),
+        }
