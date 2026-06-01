@@ -39,28 +39,28 @@ dataset:
   re10k:
     make_baseline_1: true
     view_sampler:
-      warm_up_steps: 10000
+      warm_up_steps: 75_000
       num_target_views: 1
       num_context_views: 2
       max_distance_between_context_views: 150
 
 
 optimizer:
-  lr: 1e-5
+  lr: 1e-4
   warm_up_steps: 1000
-  backbone_lr_multiplier: 1.0
-  min_lr_multiplier: 0.0
+  backbone_lr_multiplier: 0.1
+  min_lr_multiplier: 0.01
 
 data_loader:
   train:
     batch_size: 16
 
 trainer:
-  max_steps: 75001
-  val_check_interval: 5000
+  max_steps: 150_001
+  val_check_interval: 2500
 
 checkpointing:
-  every_n_train_steps: 1000
+  every_n_train_steps: 500
   save_weights_only: false
   save_top_k: 1
 
