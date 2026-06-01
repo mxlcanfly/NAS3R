@@ -64,7 +64,7 @@ class EncoderNAS3RMCfg:
     estimating_pose: bool = True
 
     use_swinir_sr: bool = True
-    swinir_weight_path: str = "/space0/mengxl/SRGS-main/model_zoo/swinir/001_classicalSR_DF2K_s64w8_SwinIR-M_x4.pth"
+    swinir_weight_path: str = "/space0/mengxl/NAS3R-master/pretrained_weights/001_classicalSR_DF2K_s64w8_SwinIR-M_x4.pth"
     use_resunet_fusion: bool = True
     use_ptv3_refine: bool = True
     ptv3_path: str = "/space0/mengxl"
@@ -84,6 +84,17 @@ def rearrange_head(feat, patch_size, H, W):
     feat = F.pixel_shuffle(feat, patch_size)  # B,D,H,W
     feat = rearrange(feat, "b d h w -> b (h w) d")
     return feat
+
+
+def flatten_gaussians(gaussians) -> Gaussians:
+    return Gaussians(
+        rearrange(gaussians.means, "b v r srf spp xyz -> b (v r srf spp) xyz"),
+        rearrange(gaussians.covariances, "b v r srf spp i j -> b (v r srf spp) i j"),
+        rearrange(gaussians.rotations, "b v r srf spp i  -> b (v r srf spp) i "),
+        rearrange(gaussians.scales, "b v r srf spp i  -> b (v r srf spp) i "),
+        rearrange(gaussians.harmonics, "b v r srf spp c d_sh -> b (v r srf spp) c d_sh"),
+        rearrange(gaussians.opacities, "b v r srf spp -> b (v r srf spp)"),
+    )
 
 
 class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
@@ -324,6 +335,7 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             self.map_pdf_to_opacity(densities, global_step),
             rearrange(gaussian_params[..., 1:], "b v r srf c -> b v r srf () c"),
         )
+        gaussians_before_refine = gaussians
 
         if self.ptv3_refiner is not None:
             if fusion_features is None:
@@ -379,14 +391,10 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
         if fusion_features is not None:
             encoder_output["fusion_features"] = fusion_features
 
-        encoder_output["gaussians"] = Gaussians(
-            rearrange(gaussians.means, "b v r srf spp xyz -> b (v r srf spp) xyz"),
-            rearrange(gaussians.covariances, "b v r srf spp i j -> b (v r srf spp) i j"),
-            rearrange(gaussians.rotations, "b v r srf spp i  -> b (v r srf spp) i "),
-            rearrange(gaussians.scales, "b v r srf spp i  -> b (v r srf spp) i "),
-            rearrange(gaussians.harmonics, "b v r srf spp c d_sh -> b (v r srf spp) c d_sh"),
-            rearrange(gaussians.opacities, "b v r srf spp -> b (v r srf spp)"),
-        )
+        if self.ptv3_refiner is not None:
+            encoder_output["gaussians_before_refine"] = flatten_gaussians(gaussians_before_refine)
+
+        encoder_output["gaussians"] = flatten_gaussians(gaussians)
 
         if self.cfg.estimating_pose:
             encoder_output['extrinsics'] = dict()

@@ -243,8 +243,8 @@ class ModelWrapper(LightningModule):
             for key in batch["target"].keys():
                 batch["target"][key] = batch["target"][key][:, selected_indices]
 
-        target_image = self._images(batch["target"])
-        context_image = self._images(batch["context"])
+        target_image = batch["target"]["image"]
+        context_image = batch["context"]["image"]
         b, v_tgt, _, h, w = target_image.shape
         v_cxt = batch["context"]["image"].shape[1]
 
@@ -304,6 +304,25 @@ class ModelWrapper(LightningModule):
             rearrange(output.color, "b v c h w -> (b v) c h w"),
         )
         self.log(f"train/psnr", psnr.mean())
+        self.log(f"train/psnr_after_refine", psnr.mean())
+
+        if "gaussians_before_refine" in encoder_output:
+            with torch.no_grad():
+                output_before_refine = self.decoder.forward(
+                    encoder_output["gaussians_before_refine"],
+                    extrinsics,
+                    intrinsics,
+                    near,
+                    far,
+                    (h, w),
+                    depth_mode=self.train_cfg.depth_mode,
+                )
+                psnr_before_refine = compute_psnr(
+                    rearrange(target_gt, "b v c h w -> (b v) c h w"),
+                    rearrange(output_before_refine.color, "b v c h w -> (b v) c h w"),
+                )
+            self.log(f"train/psnr_before_refine", psnr_before_refine.mean())
+            self.log(f"train/psnr_refine_delta", psnr.mean() - psnr_before_refine.mean())
 
         # Compute and log loss.
         for loss_fn in self.losses:
@@ -338,6 +357,7 @@ class ModelWrapper(LightningModule):
                 f"target = {batch['target']['index'].tolist()}; "
                 f"loss = {total_loss:.6f}; "
                 f"psnr = {psnr.mean().item():.6f}; "
+                f"psnr_before_refine = {psnr_before_refine.mean().item():.6f}; "
             )
         self.log("info/global_step", self.global_step)  # hack for ckpt monitor
 

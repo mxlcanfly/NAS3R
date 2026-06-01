@@ -16,6 +16,13 @@
           </advancedOptions>
         </fileTransfer>
       </webServer>
+      <webServer id="d58345d7-a286-4214-b496-d0e568a1ef68" name="nas3r8">
+        <fileTransfer accessType="SFTP" host="192.168.1.108" port="22" sshConfigId="c08687b9-f4f0-48ad-a073-7983a46b100e" sshConfig="mengxl@192.168.1.108:22 key" keyPair="true">
+          <advancedOptions>
+            <advancedOptions dataProtectionLevel="Private" keepAliveTimeout="0" passiveMode="true" shareSSLContext="true" />
+          </advancedOptions>
+        </fileTransfer>
+      </webServer>
     </option>
   </component>
 </project>

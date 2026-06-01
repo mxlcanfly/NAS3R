@@ -21,7 +21,7 @@ model:
 
     gs_params_head_type: dpt_gs
     pose_free: true
-    pretrained_weights: "/space0/mengxl/NAS3R-master/outputs/exp_re10k/2026-05-27_15-45-54/checkpoints/epoch_36-step_300000.ckpt" # "/space0/mengxl/NAS3R-master/pretrained_weights/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth"
+    pretrained_weights: "/space0/mengxl/NAS3R-master/pretrained_weights/naslr.ckpt" # "/space0/mengxl/NAS3R-master/pretrained_weights/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth"
 
 
     estimating_focal: false 
@@ -56,10 +56,10 @@ optimizer:
 
 data_loader:
   train:
-    batch_size: 16
+    batch_size: 8
 
 trainer:
-  max_steps: 75001
+  max_steps: 120001
   val_check_interval: 10000
 
 checkpointing:
