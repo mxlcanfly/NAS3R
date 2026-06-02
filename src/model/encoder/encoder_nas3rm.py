@@ -169,8 +169,8 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             target: Optional[dict] = None,
             warmup_pts3d: bool = False,
     ):
-        context_image = context.get("image_lr", context["image"])
-        target_image = target.get("image_lr", target["image"]) if target is not None else None
+        context_image = context.get("image", context["image"])
+        target_image = target.get("image", target["image"]) if target is not None else None
 
         device = context_image.device
         b, v_cxt, _, h, w = context_image.shape
