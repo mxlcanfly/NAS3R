@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
-  <component name="PublishConfigData" autoUpload="Always" serverName="mengxl@192.168.1.107:22 key" remoteFilesAllowedToDisappearOnAutoupload="false" confirmBeforeUploading="false">
+  <component name="PublishConfigData" autoUpload="Always" serverName="mengxl@192.168.1.108:22 key" remoteFilesAllowedToDisappearOnAutoupload="false" confirmBeforeUploading="false">
     <option name="confirmBeforeUploading" value="false" />
     <serverData>
       <paths name="mengxl@192.168.1.102:22 key">
@@ -41,14 +41,14 @@
       <paths name="nas3r7">
         <serverdata>
           <mappings>
-            <mapping deploy="/space0/mengxl/NAS3R-master" local="$PROJECT_DIR$" web="/" />
+            <mapping local="$PROJECT_DIR$" web="/" />
           </mappings>
         </serverdata>
       </paths>
       <paths name="nas3r8">
         <serverdata>
           <mappings>
-            <mapping deploy="/space0/mengxl/NAS3R-master" local="$PROJECT_DIR$" web="/" />
+            <mapping local="$PROJECT_DIR$" web="/" />
           </mappings>
         </serverdata>
       </paths>
