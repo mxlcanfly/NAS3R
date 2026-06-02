@@ -4,7 +4,7 @@
     <content url="file://$MODULE_DIR$">
       <sourceFolder url="file://$MODULE_DIR$/src" isTestSource="false" />
     </content>
-    <orderEntry type="jdk" jdkName="Remote 3.11 (sftp://mengxl@192.168.1.107:22/space0/mengxl/miniconda3/envs/nas3r/bin/python)" jdkType="Python SDK" />
+    <orderEntry type="jdk" jdkName="Remote 3.11 (sftp://mengxl@192.168.1.108:22/space0/mengxl/miniconda3/envs/nas3r/bin/python)" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />
   </component>
   <component name="PyDocumentationSettings">
