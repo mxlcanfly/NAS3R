@@ -174,6 +174,16 @@ class HiSplatResUnetTokenFusion(nn.Module):
     ) -> None:
         super().__init__()
         self.resunet = ResUnet(dino_dim=token_ch, norm_layer=norm_layer, feature_dims=feature_dims)
+        self.register_buffer(
+            "image_mean",
+            torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1),
+            persistent=False,
+        )
+        self.register_buffer(
+            "image_std",
+            torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(1, 3, 1, 1),
+            persistent=False,
+        )
         self.proj = nn.Sequential(
             nn.Conv2d(token_dim, token_ch * 4, 1),
             nn.BatchNorm2d(token_ch * 4),
@@ -206,6 +216,7 @@ class HiSplatResUnetTokenFusion(nn.Module):
     def forward(self, images: torch.Tensor, tokens: torch.Tensor) -> dict[str, torch.Tensor]:
         b, v = images.shape[:2]
         images = rearrange(images, "b v c h w -> (b v) c h w")
+        images = (images.clamp(0, 1) - self.image_mean) / self.image_std
         dino_feature = self.tokens_to_16x16(tokens)
         fused = self.resunet(images, dino_feature)
         return {

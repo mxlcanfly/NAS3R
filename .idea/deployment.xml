@@ -41,7 +41,7 @@
       <paths name="nas3r8">
         <serverdata>
           <mappings>
-            <mapping deploy="/space0/mengxl/NAS3R-master" local="$PROJECT_DIR$" web="/" />
+            <mapping local="$PROJECT_DIR$" web="/" />
           </mappings>
         </serverdata>
       </paths>

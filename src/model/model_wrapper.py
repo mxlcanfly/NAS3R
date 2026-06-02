@@ -89,6 +89,8 @@ class TrainCfg:
 
     pretrain_camera_head: bool = False
     refine_only: bool = False
+    refine_train_gaussian_head: bool = False
+    before_refine_loss_weight: float = 0.0
 
 
 def dropout_context_views(v_cxt):
@@ -307,7 +309,8 @@ class ModelWrapper(LightningModule):
         self.log(f"train/psnr_after_refine", psnr.mean())
 
         if "gaussians_before_refine" in encoder_output:
-            with torch.no_grad():
+            before_refine_loss_weight = self.train_cfg.before_refine_loss_weight
+            if before_refine_loss_weight > 0:
                 output_before_refine = self.decoder.forward(
                     encoder_output["gaussians_before_refine"],
                     extrinsics,
@@ -317,12 +320,38 @@ class ModelWrapper(LightningModule):
                     (h, w),
                     depth_mode=self.train_cfg.depth_mode,
                 )
+            else:
+                with torch.no_grad():
+                    output_before_refine = self.decoder.forward(
+                        encoder_output["gaussians_before_refine"],
+                        extrinsics,
+                        intrinsics,
+                        near,
+                        far,
+                        (h, w),
+                        depth_mode=self.train_cfg.depth_mode,
+                    )
+
+            with torch.no_grad():
                 psnr_before_refine = compute_psnr(
                     rearrange(target_gt, "b v c h w -> (b v) c h w"),
-                    rearrange(output_before_refine.color, "b v c h w -> (b v) c h w"),
+                    rearrange(output_before_refine.color.detach(), "b v c h w -> (b v) c h w"),
                 )
             self.log(f"train/psnr_before_refine", psnr_before_refine.mean())
             self.log(f"train/psnr_refine_delta", psnr.mean() - psnr_before_refine.mean())
+
+            if before_refine_loss_weight > 0:
+                for loss_fn in self.losses:
+                    if loss_fn.name in ['mse', 'lpips']:
+                        before_refine_loss = loss_fn.forward(
+                            output_before_refine.color,
+                            target_gt,
+                            encoder_output["gaussians_before_refine"],
+                            self.global_step,
+                        )
+                        before_refine_loss = before_refine_loss_weight * before_refine_loss
+                        self.log(f"loss/before_refine_{loss_fn.name}", before_refine_loss)
+                        total_loss += before_refine_loss
 
         # Compute and log loss.
         for loss_fn in self.losses:
@@ -999,7 +1028,10 @@ class ModelWrapper(LightningModule):
 
     def configure_optimizers(self):
         if self.train_cfg.refine_only:
-            trainable_keywords = ("resunet_token_fusion", "ptv3_refiner")
+            trainable_keywords = ["resunet_token_fusion", "ptv3_refiner"]
+            if self.train_cfg.refine_train_gaussian_head:
+                trainable_keywords += ["gaussian_param_head"]
+            trainable_keywords = tuple(trainable_keywords)
             for name, param in self.named_parameters():
                 param.requires_grad = any(keyword in name for keyword in trainable_keywords)
 
