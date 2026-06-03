@@ -132,36 +132,90 @@ class ResUnetDecoder(nn.Module):
 class ResUnet(nn.Module):
     def __init__(
         self,
-        dino_dim: int,
+        dino_dim: int | None = None,
         norm_layer=nn.InstanceNorm2d,
         feature_dims=(32, 64, 128),
     ) -> None:
         super().__init__()
         self.encoder = ResUnetEncoder(norm_layer=norm_layer, feature_dims=feature_dims)
         self.decoder = ResUnetDecoder(norm_layer=norm_layer, feature_dims=feature_dims)
-        self.up_dino_cnn = nn.ModuleList(
-            [
-                nn.Conv2d(dino_dim, feature_dims[-1], 1, bias=False),
-                nn.Conv2d(dino_dim, feature_dims[-2], 1, bias=False),
-                nn.Conv2d(dino_dim, feature_dims[-3], 1, bias=False),
-            ]
-        )
-
-    def forward(self, x: torch.Tensor, dino_feature: torch.Tensor) -> list[torch.Tensor]:
-        feature_list = self.encoder(x)
-        dino_feature_list = []
-        for i in range(len(self.up_dino_cnn)):
-            dino_feature_i = self.up_dino_cnn[i](
-                F.interpolate(
-                    dino_feature,
-                    size=feature_list[len(feature_list) - i - 2].shape[-2:],
-                    mode="bilinear",
-                    align_corners=False,
-                )
+        if dino_dim is None:
+            self.up_dino_cnn = None
+        else:
+            self.up_dino_cnn = nn.ModuleList(
+                [
+                    nn.Conv2d(dino_dim, feature_dims[-1], 1, bias=False),
+                    nn.Conv2d(dino_dim, feature_dims[-2], 1, bias=False),
+                    nn.Conv2d(dino_dim, feature_dims[-3], 1, bias=False),
+                ]
             )
-            dino_feature_list.append(dino_feature_i)
+
+    def forward(self, x: torch.Tensor, dino_feature: torch.Tensor | None = None) -> list[torch.Tensor]:
+        feature_list = self.encoder(x)
+        dino_feature_list = None
+        if self.up_dino_cnn is not None:
+            if dino_feature is None:
+                raise ValueError("dino_feature is required when ResUnet is initialized with dino_dim.")
+            dino_feature_list = []
+            for i in range(len(self.up_dino_cnn)):
+                dino_feature_i = self.up_dino_cnn[i](
+                    F.interpolate(
+                        dino_feature,
+                        size=feature_list[len(feature_list) - i - 2].shape[-2:],
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                )
+                dino_feature_list.append(dino_feature_i)
         out_feature = self.decoder(feature_list, dino_feature_list)
         return out_feature
+
+
+class ImageNetResUnetFeatureExtractor(nn.Module):
+    def __init__(
+        self,
+        token_dim: int | None = None,
+        token_feature_dim: int = 128,
+        feature_dims: tuple[int, int, int] = (32, 64, 128),
+        norm_layer=nn.InstanceNorm2d,
+    ) -> None:
+        super().__init__()
+        self.resunet = ResUnet(dino_dim=token_feature_dim if token_dim is not None else None, norm_layer=norm_layer, feature_dims=feature_dims)
+        self.d_out = feature_dims[0]
+        self.token_dim = token_dim
+        if token_dim is not None:
+            self.token_upsampler = nn.Sequential(
+                nn.ConvTranspose2d(token_dim, token_feature_dim * 2, kernel_size=4, stride=2, padding=1),
+                nn.BatchNorm2d(token_feature_dim * 2),
+                nn.SiLU(),
+                nn.ConvTranspose2d(token_feature_dim * 2, token_feature_dim, kernel_size=4, stride=2, padding=1),
+                nn.BatchNorm2d(token_feature_dim),
+                nn.SiLU(),
+            )
+        else:
+            self.token_upsampler = None
+        self.register_buffer("mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 1, 3, 1, 1), persistent=False)
+        self.register_buffer("std", torch.tensor([0.229, 0.224, 0.225]).view(1, 1, 3, 1, 1), persistent=False)
+
+    def tokens_to_feature(self, tokens: torch.Tensor) -> torch.Tensor:
+        if self.token_upsampler is None:
+            raise ValueError("token_dim must be set to fuse backbone tokens.")
+        b, v, n, c = tokens.shape
+        grid = int(math.sqrt(n))
+        if grid * grid != n:
+            raise ValueError(f"Expected square token grid, got {n} tokens.")
+        token_map = rearrange(tokens, "b v (h w) c -> (b v) c h w", h=grid, w=grid)
+        return self.token_upsampler(token_map)
+
+    def forward(self, images: torch.Tensor, tokens: torch.Tensor | None = None) -> torch.Tensor:
+        b, v, _, h, w = images.shape
+        images = (images - self.mean.to(dtype=images.dtype)) / self.std.to(dtype=images.dtype)
+        images = rearrange(images, "b v c h w -> (b v) c h w")
+        token_feature = self.tokens_to_feature(tokens) if tokens is not None else None
+        features = self.resunet(images, token_feature)[-1]
+        if features.shape[-2:] != (h, w):
+            features = F.interpolate(features, size=(h, w), mode="bilinear", align_corners=False)
+        return rearrange(features, "(b v) c h w -> b v c h w", b=b, v=v)
 
 
 class HiSplatResUnetTokenFusion(nn.Module):

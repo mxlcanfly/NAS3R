@@ -1,6 +1,3 @@
-import sys
-from pathlib import Path
-
 import torch
 import torch.nn as nn
 from einops import rearrange, repeat
@@ -8,47 +5,84 @@ from einops import rearrange, repeat
 from .common.gaussians import build_covariance
 
 
-class GaussianPTV3Refiner(nn.Module):
+class PointMLPResidualBlock(nn.Module):
+    def __init__(self, channels: int, hidden_channels: int) -> None:
+        super().__init__()
+        self.point_mlp = nn.Sequential(
+            nn.Conv1d(channels, hidden_channels, 1, bias=False),
+            nn.BatchNorm1d(hidden_channels),
+            nn.GELU(),
+            nn.Conv1d(hidden_channels, channels, 1, bias=False),
+            nn.BatchNorm1d(channels),
+        )
+        self.local_mlp = nn.Sequential(
+            nn.Conv2d(channels, channels, 3, padding=1, groups=channels, bias=False),
+            nn.BatchNorm2d(channels),
+            nn.GELU(),
+            nn.Conv2d(channels, channels, 1, bias=False),
+            nn.BatchNorm2d(channels),
+        )
+        self.act = nn.GELU()
+
+    def forward(self, x: torch.Tensor, h: int, w: int) -> torch.Tensor:
+        point_residual = self.point_mlp(x)
+        local_feature = rearrange(x, "bv c (h w) -> bv c h w", h=h, w=w)
+        local_residual = self.local_mlp(local_feature)
+        local_residual = rearrange(local_residual, "bv c h w -> bv c (h w)")
+        return self.act(x + point_residual + local_residual)
+
+
+class PointMLPFeatureRefiner(nn.Module):
     def __init__(
         self,
-        ptv3_path: str = "/space0/mengxl",
-        in_channels: int = 138,
-        grid_size: float = 0.02,
-        hidden_channels: int = 256,
-        refine_rotation: bool = False,
-        refine_sh: bool = False,
+        in_channels: int,
+        out_channels: int,
+        hidden_channels: int = 64,
+        num_blocks: int = 3,
+    ) -> None:
+        super().__init__()
+        self.input_proj = nn.Sequential(
+            nn.Conv1d(in_channels, out_channels, 1, bias=False),
+            nn.BatchNorm1d(out_channels),
+            nn.GELU(),
+        )
+        self.blocks = nn.ModuleList(
+            [
+                PointMLPResidualBlock(out_channels, hidden_channels)
+                for _ in range(num_blocks)
+            ]
+        )
+
+    def forward(self, feat: torch.Tensor, h: int, w: int) -> torch.Tensor:
+        x = self.input_proj(feat)
+        for block in self.blocks:
+            x = block(x, h, w)
+        return x
+
+
+class GaussianPointMLPRefiner(nn.Module):
+    def __init__(
+        self,
+        feature_channels: int = 32,
+        pt_channels: int = 32,
+        hidden_channels: int = 128,
         sh_degree: int = 0,
     ) -> None:
         super().__init__()
-        self.grid_size = grid_size
+        self.raw_feature_channels = feature_channels + 3 + 1 + 3 + 3
+        self.pt_channels = pt_channels
         self.sh_dim = 3 * ((sh_degree + 1) ** 2)
-
-        ptv3_root = Path(ptv3_path)
-        if str(ptv3_root) not in sys.path:
-            sys.path.insert(0, str(ptv3_root))
-
-        try:
-            from PointTransformerV3.model import PointTransformerV3
-        except Exception as exc:
-            raise ImportError(
-                "Failed to import PointTransformerV3. Please make sure "
-                f"{ptv3_root}/PointTransformerV3 is importable and dependencies "
-                "such as addict, spconv, and torch_scatter are installed."
-            ) from exc
-
-        self.ptv3 = PointTransformerV3(
-            in_channels=in_channels,
-            enc_channels=(64, 128, 256, 512, 512),
-            dec_channels=(64, 128, 256, 512),
-            enable_flash=False,
-            enc_patch_size=(128, 128, 128, 128, 128),
-            dec_patch_size=(128, 128, 128, 128),
+        self.point_mlp = PointMLPFeatureRefiner(
+            self.raw_feature_channels,
+            pt_channels,
+            hidden_channels=hidden_channels,
+            num_blocks=3,
         )
 
         out_channels = 3 + 3 + 1 + 4 + self.sh_dim
 
         layers = []
-        mlp_in = 64
+        mlp_in = pt_channels
         for _ in range(3):
             layers.extend([nn.Linear(mlp_in, hidden_channels), nn.GELU()])
             mlp_in = hidden_channels
@@ -59,53 +93,41 @@ class GaussianPTV3Refiner(nn.Module):
 
     def _flatten_inputs(
         self,
-        fusion64: torch.Tensor,
+        fusion_feature: torch.Tensor,
+        render_error: torch.Tensor,
         depth: torch.Tensor,
         point_map: torch.Tensor,
-        image_lr: torch.Tensor,
-        ray_direction: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        b, v, c, h, w = fusion64.shape
-        coord = rearrange(point_map, "b v h w xyz -> (b v h w) xyz")
+        context_image: torch.Tensor,
+    ) -> torch.Tensor:
         feat = torch.cat(
             [
-                rearrange(fusion64, "b v c h w -> (b v h w) c"),
+                rearrange(fusion_feature, "b v c h w -> (b v h w) c"),
+                rearrange(render_error, "b v c h w -> (b v h w) c"),
                 rearrange(depth, "b v h w -> (b v h w) 1"),
-                coord,
-                rearrange(image_lr, "b v c h w -> (b v h w) c"),
-                rearrange(ray_direction, "b v h w xyz -> (b v h w) xyz"),
+                rearrange(point_map, "b v h w xyz -> (b v h w) xyz"),
+                rearrange(context_image, "b v c h w -> (b v h w) c"),
             ],
             dim=-1,
         )
-        batch = repeat(
-            torch.arange(b * v, device=fusion64.device),
-            "bv -> (bv hw)",
-            hw=h * w,
-        )
-        return coord, feat, batch
+        return feat
 
     def forward(
         self,
-        fusion64: torch.Tensor,
+        fusion_feature: torch.Tensor,
+        render_error: torch.Tensor,
         depth: torch.Tensor,
         point_map: torch.Tensor,
-        image_lr: torch.Tensor,
-        ray_direction: torch.Tensor,
+        context_image: torch.Tensor,
         gaussians,
     ):
-        b, v, _, h, w = fusion64.shape
-        coord, feat, batch = self._flatten_inputs(
-            fusion64, depth, point_map, image_lr, ray_direction
+        b, v, _, h, w = fusion_feature.shape
+        feat = self._flatten_inputs(
+            fusion_feature, render_error, depth, point_map, context_image
         )
-        point = self.ptv3(
-            {
-                "coord": coord.float(),
-                "feat": feat.float(),
-                "batch": batch,
-                "grid_size": self.grid_size,
-            }
-        )
-        delta = self.delta_head(point.feat.float())
+        feat = rearrange(feat.float(), "(b v h w) c -> (b v) c (h w)", b=b, v=v, h=h, w=w)
+        refined_feat = self.point_mlp(feat, h, w)
+        refined_feat = rearrange(refined_feat, "(b v) c hw -> (b v hw) c", b=b, v=v)
+        delta = self.delta_head(refined_feat)
         delta = rearrange(delta, "(b v h w) c -> b v (h w) c", b=b, v=v, h=h, w=w)
 
         means = gaussians.means
