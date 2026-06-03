@@ -78,11 +78,13 @@ class TrainCfg:
     distiller: str
     distill_max_steps: int
     training_context: bool
-    freeze_pretrained: bool
-    freeze_backbone: bool
-    freeze_pose_head: bool
-    freeze_aggregator: bool
-    freeze_intrinsics_head: bool
+    freeze_pretrained: bool = False
+    freeze_backbone: bool = False
+    freeze_depth_head: bool = False
+    freeze_gaussian_param_head: bool = False
+    freeze_pose_head: bool = False
+    freeze_aggregator: bool = False
+    freeze_intrinsics_head: bool = False
 
     random_drop_context_views: bool = False
     random_drop_target_views: bool = False
@@ -164,6 +166,7 @@ class ModelWrapper(LightningModule):
         self.encoder = encoder
         self.encoder_visualizer = encoder_visualizer
         self.decoder = decoder
+        object.__setattr__(self.encoder, "decoder", self.decoder)
         self.data_shim = get_data_shim(self.encoder)
         self.losses = nn.ModuleList(losses)
 
@@ -187,6 +190,7 @@ class ModelWrapper(LightningModule):
         self.all_metrics_sub = {}
 
         self.ckpt_path = None
+        self._apply_train_freezing()
 
     def training_step(self, batch, batch_idx):
         # combine batch from different dataloaders
@@ -942,6 +946,41 @@ class ModelWrapper(LightningModule):
                     param.requires_grad = False
                     print(f"Freezing: {name}")
 
+    def _apply_train_freezing(self) -> None:
+        freeze_keywords = []
+
+        if self.train_cfg.freeze_backbone:
+            freeze_keywords.append("encoder.backbone")
+        if self.train_cfg.freeze_depth_head:
+            freeze_keywords.extend(
+                [
+                    "encoder.downstream_depth_head",
+                    "encoder.depth_head",
+                    "encoder.backbone.model.depth_head",
+                ]
+            )
+        if self.train_cfg.freeze_gaussian_param_head:
+            freeze_keywords.append("encoder.gaussian_param_head")
+        if self.train_cfg.freeze_pose_head:
+            freeze_keywords.extend(["encoder.pose_head", "encoder.pose_head2", "camera_head"])
+        if self.train_cfg.freeze_aggregator:
+            freeze_keywords.extend(["encoder.backbone.aggregator", "encoder.backbone.model.aggregator"])
+        if self.train_cfg.freeze_intrinsics_head:
+            freeze_keywords.extend(
+                [
+                    "intrinsic_encoder",
+                    "intrinsics_token",
+                    "intrinsics_head",
+                    "intrinsics_embed",
+                ]
+            )
+
+        if self.train_cfg.freeze_pretrained:
+            freeze_keywords.append("encoder")
+
+        if freeze_keywords:
+            self.freeze_params(freeze_keywords=freeze_keywords)
+
     def configure_optimizers(self):
         new_params, new_param_names = [], []
         pretrained_params, pretrained_param_names = [], []
@@ -960,7 +999,15 @@ class ModelWrapper(LightningModule):
                     continue
 
                 # Heads that are always treated as new
-                if any(x in name for x in ["gaussian_param_head", "intrinsic_encoder"]):
+                if any(
+                    x in name
+                    for x in [
+                        "gaussian_param_head",
+                        "intrinsic_encoder",
+                        "resunet_feature_extractor",
+                        "pointmlp_refiner",
+                    ]
+                ):
                     new_params.append(param)
                     new_param_names.append(name)
                     # print(name)

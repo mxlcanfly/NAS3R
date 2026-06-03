@@ -56,6 +56,8 @@ train:
   training_context: false
   freeze_pretrained: false
   freeze_backbone: false
+  freeze_depth_head: false
+  freeze_gaussian_param_head: false
   freeze_pose_head: false
   freeze_aggregator: false
   freeze_intrinsics_head: false
