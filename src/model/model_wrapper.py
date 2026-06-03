@@ -78,18 +78,17 @@ class TrainCfg:
     distiller: str
     distill_max_steps: int
     training_context: bool
-    freeze_pretrained: bool = False
-    freeze_backbone: bool = False
-    freeze_depth_head: bool = False
-    freeze_gaussian_param_head: bool = False
-    freeze_pose_head: bool = False
-    freeze_aggregator: bool = False
-    freeze_intrinsics_head: bool = False
+    freeze_pretrained: bool
+    freeze_backbone: bool
+    freeze_pose_head: bool
+    freeze_aggregator: bool
+    freeze_intrinsics_head: bool
 
     random_drop_context_views: bool = False
     random_drop_target_views: bool = False
 
     pretrain_camera_head: bool = False
+    refine_only: bool = False
 
 
 def dropout_context_views(v_cxt):
@@ -166,7 +165,6 @@ class ModelWrapper(LightningModule):
         self.encoder = encoder
         self.encoder_visualizer = encoder_visualizer
         self.decoder = decoder
-        object.__setattr__(self.encoder, "decoder", self.decoder)
         self.data_shim = get_data_shim(self.encoder)
         self.losses = nn.ModuleList(losses)
 
@@ -190,7 +188,29 @@ class ModelWrapper(LightningModule):
         self.all_metrics_sub = {}
 
         self.ckpt_path = None
-        self._apply_train_freezing()
+
+    def _image_key(self, views: dict) -> str:
+        if getattr(self.encoder.cfg, "name", None) == "nas3r-m" and "image_lr" in views:
+            return "image_lr"
+        return "image"
+
+    def _images(self, views: dict) -> Tensor:
+        return views[self._image_key(views)]
+
+    @rank_zero_only
+    def _save_refine_depth_visualization(self, visualization_dump: dict) -> None:
+        if self.global_step % 500 != 0:
+            return
+        if "depth_refine_before" not in visualization_dump or "depth_refine_after" not in visualization_dump:
+            return
+
+        before = vis_depth_map(visualization_dump["depth_refine_before"][0].detach().cpu().clamp_min(1e-6))
+        after = vis_depth_map(visualization_dump["depth_refine_after"][0].detach().cpu().clamp_min(1e-6))
+        comparison = hcat(
+            add_label(vcat(*before), "Depth Before Refine"),
+            add_label(vcat(*after), "Depth After Refine"),
+        )
+        save_image(add_border(comparison), Path("depth_refine") / f"step_{self.global_step:0>6}.png")
 
     def training_step(self, batch, batch_idx):
         # combine batch from different dataloaders
@@ -213,8 +233,9 @@ class ModelWrapper(LightningModule):
         if self.train_cfg.random_drop_context_views:
             v_cxt = batch["context"]["image"].shape[1]
             selected_indices = dropout_context_views(v_cxt)
-            for key in ["image", "intrinsics", "extrinsics", "index", "near", "far"]:
-                batch["context"][key] = batch["context"][key][:, selected_indices]
+            for key in ["image", "image_lr", "intrinsics", "extrinsics", "index", "near", "far"]:
+                if key in batch["context"]:
+                    batch["context"][key] = batch["context"][key][:, selected_indices]
 
         if self.train_cfg.random_drop_target_views:
             v_tgt = batch["target"]["image"].shape[1]
@@ -222,13 +243,16 @@ class ModelWrapper(LightningModule):
             for key in batch["target"].keys():
                 batch["target"][key] = batch["target"][key][:, selected_indices]
 
-        b, v_tgt, _, h, w = batch["target"]["image"].shape
+        target_image = batch["target"]["image"]
+        context_image = batch["context"]["image"]
+        b, v_tgt, _, h, w = target_image.shape
         v_cxt = batch["context"]["image"].shape[1]
 
         # Run the model.
         visualization_dump = {}
         encoder_output = self.encoder(batch["context"], self.global_step, visualization_dump=visualization_dump,
                                       target=batch["target"] if self.encoder.cfg.estimating_pose else None)
+        self._save_refine_depth_visualization(visualization_dump)
 
         if self.encoder.cfg.estimating_pose:
             pred_extrinsics, pred_extrinsics_cwt = encoder_output['extrinsics']['c'], encoder_output['extrinsics'][
@@ -260,8 +284,8 @@ class ModelWrapper(LightningModule):
             [batch["context"]["near"], batch["target"]["near"]], dim=1)
         far = batch["target"]["far"] if not self.train_cfg.training_context else torch.cat(
             [batch["context"]["far"], batch["target"]["far"]], dim=1)
-        target_gt = batch["target"]["image"] if not self.train_cfg.training_context else torch.cat(
-            [batch["context"]["image"], batch["target"]["image"]], dim=1)
+        target_gt = target_image if not self.train_cfg.training_context else torch.cat(
+            [context_image, target_image], dim=1)
 
         # Run decoder
         output = self.decoder.forward(
@@ -280,7 +304,8 @@ class ModelWrapper(LightningModule):
             rearrange(output.color, "b v c h w -> (b v) c h w"),
         )
         self.log(f"train/psnr", psnr.mean())
-        psnr_before_refine = None
+        self.log(f"train/psnr_after_refine", psnr.mean())
+
         if "gaussians_before_refine" in encoder_output:
             with torch.no_grad():
                 output_before_refine = self.decoder.forward(
@@ -296,7 +321,8 @@ class ModelWrapper(LightningModule):
                     rearrange(target_gt, "b v c h w -> (b v) c h w"),
                     rearrange(output_before_refine.color, "b v c h w -> (b v) c h w"),
                 )
-            self.log("train/psnr_before_refine", psnr_before_refine.mean())
+            self.log(f"train/psnr_before_refine", psnr_before_refine.mean())
+            self.log(f"train/psnr_refine_delta", psnr.mean() - psnr_before_refine.mean())
 
         # Compute and log loss.
         for loss_fn in self.losses:
@@ -331,8 +357,7 @@ class ModelWrapper(LightningModule):
                 f"target = {batch['target']['index'].tolist()}; "
                 f"loss = {total_loss:.6f}; "
                 f"psnr = {psnr.mean().item():.6f}; "
-                f"psnr_before_refine = "
-                f"{psnr_before_refine.mean().item() if psnr_before_refine is not None else float('nan'):.6f}; "
+                f"psnr_before_refine = {psnr_before_refine.mean().item():.6f}; "
             )
         self.log("info/global_step", self.global_step)  # hack for ckpt monitor
 
@@ -344,7 +369,8 @@ class ModelWrapper(LightningModule):
 
     def test_step(self, batch, batch_idx):
         v_cxt = batch["context"]["image"].shape[1]
-        b, v_tgt, _, h, w = batch["target"]["image"].shape
+        target_image = self._images(batch["target"])
+        b, v_tgt, _, h, w = target_image.shape
         assert b == 1
 
         if batch_idx % 100 == 0:
@@ -364,6 +390,8 @@ class ModelWrapper(LightningModule):
                     "near": batch["target"]["near"][:, target_view:target_view + 1],
                     "far": batch["target"]["far"][:, target_view:target_view + 1],
                 }
+                if "image_lr" in batch["target"]:
+                    target_data["image_lr"] = batch["target"]["image_lr"][:, target_view:target_view + 1]
 
                 with self.benchmarker.time("encoder"):
                     encoder_output = self.encoder(batch["context"], self.global_step,
@@ -433,7 +461,7 @@ class ModelWrapper(LightningModule):
             rgb_pred = output.color[0]  # (v, 3, h, w)
 
         (scene,) = batch["scene"]
-        rgb_gt = batch["target"]["image"][0]
+        rgb_gt = target_image[0]
 
         # compute scores
         if self.test_cfg.compute_scores:
@@ -492,7 +520,7 @@ class ModelWrapper(LightningModule):
 
         if self.test_cfg.save_compare:
             # Construct comparison image.
-            context_img = batch["context"]["image"][0]
+            context_img = self._images(batch["context"])[0]
             comparison = [
                 add_label(vcat(*context_img), "Context"),
                 add_label(vcat(*rgb_gt), "Target (Ground Truth)"),
@@ -506,8 +534,9 @@ class ModelWrapper(LightningModule):
         for param in self.encoder.parameters():
             param.requires_grad = False
 
-        b, v, _, h, w = target["image"].shape
-        device = target["image"].device
+        target_image = self._images(target)
+        b, v, _, h, w = target_image.shape
+        device = target_image.device
         with torch.set_grad_enabled(True):
             if initial_extrinsics is not None:
                 extrinsics = nn.Parameter(initial_extrinsics)
@@ -541,7 +570,7 @@ class ModelWrapper(LightningModule):
                     total_loss = 0
                     for loss_fn in self.losses:
                         if loss_fn.name in ["mse", "lpips"]:
-                            loss = loss_fn.forward(output.color, target["image"], gaussians, self.global_step)
+                            loss = loss_fn.forward(output.color, target_image, gaussians, self.global_step)
                             total_loss = total_loss + loss
 
                     total_loss.backward()
@@ -612,8 +641,9 @@ class ModelWrapper(LightningModule):
             v_cxt = batch["context"]["image"].shape[1]
             selected_indices = dropout_context_views(v_cxt)
             # Apply selection to all context elements
-            for key in ["image", "intrinsics", "extrinsics", "index", "near", "far"]:
-                batch["context"][key] = batch["context"][key][:, selected_indices]
+            for key in ["image", "image_lr", "intrinsics", "extrinsics", "index", "near", "far"]:
+                if key in batch["context"]:
+                    batch["context"][key] = batch["context"][key][:, selected_indices]
 
         if self.train_cfg.random_drop_target_views:
             v_tgt = batch["target"]["image"].shape[1]
@@ -631,7 +661,9 @@ class ModelWrapper(LightningModule):
             )
 
         v_cxt = batch["context"]["image"].shape[1]
-        b, v_tgt, _, h, w = batch["target"]["image"].shape
+        target_image = self._images(batch["target"])
+        context_image = self._images(batch["context"])
+        b, v_tgt, _, h, w = target_image.shape
         assert b == 1
 
         visualization_dump = {}
@@ -667,7 +699,7 @@ class ModelWrapper(LightningModule):
         intrinsics = torch.cat([context_intrinsics, target_intrinsics], dim=1)
         near = torch.cat([batch["context"]["near"], batch["target"]["near"]], dim=1)
         far = torch.cat([batch["context"]["far"], batch["target"]["far"]], dim=1)
-        target_gt = torch.cat([batch["context"]["image"], batch["target"]["image"]], dim=1)
+        target_gt = torch.cat([context_image, target_image], dim=1)
 
         # Run decoder
         output = self.decoder.forward(
@@ -702,7 +734,7 @@ class ModelWrapper(LightningModule):
         self.log(f"val/context/ssim", ssim_val)
 
         # Construct comparison image.
-        context_img = batch["context"]["image"][0]
+        context_img = context_image[0]
         context_img_depth = vis_depth_map(visualization_dump["depth"][0])  # (v, h, w)
 
         comparison = hcat(
@@ -827,7 +859,7 @@ class ModelWrapper(LightningModule):
     ) -> None:
         # Render probabilistic estimate of scene.
 
-        _, _, _, h, w = batch["context"]["image"].shape
+        _, _, _, h, w = self._images(batch["context"]).shape
         _, v_cxt, _, _ = batch["context"]["extrinsics"].shape
 
         visualization_dump = {}
@@ -965,42 +997,12 @@ class ModelWrapper(LightningModule):
                     param.requires_grad = False
                     print(f"Freezing: {name}")
 
-    def _apply_train_freezing(self) -> None:
-        freeze_keywords = []
-
-        if self.train_cfg.freeze_backbone:
-            freeze_keywords.append("encoder.backbone")
-        if self.train_cfg.freeze_depth_head:
-            freeze_keywords.extend(
-                [
-                    "encoder.downstream_depth_head",
-                    "encoder.depth_head",
-                    "encoder.backbone.model.depth_head",
-                ]
-            )
-        if self.train_cfg.freeze_gaussian_param_head:
-            freeze_keywords.append("encoder.gaussian_param_head")
-        if self.train_cfg.freeze_pose_head:
-            freeze_keywords.extend(["encoder.pose_head", "encoder.pose_head2", "camera_head"])
-        if self.train_cfg.freeze_aggregator:
-            freeze_keywords.extend(["encoder.backbone.aggregator", "encoder.backbone.model.aggregator"])
-        if self.train_cfg.freeze_intrinsics_head:
-            freeze_keywords.extend(
-                [
-                    "intrinsic_encoder",
-                    "intrinsics_token",
-                    "intrinsics_head",
-                    "intrinsics_embed",
-                ]
-            )
-
-        if self.train_cfg.freeze_pretrained:
-            freeze_keywords.append("encoder")
-
-        if freeze_keywords:
-            self.freeze_params(freeze_keywords=freeze_keywords)
-
     def configure_optimizers(self):
+        if self.train_cfg.refine_only:
+            trainable_keywords = ("resunet_token_fusion", "ptv3_refiner")
+            for name, param in self.named_parameters():
+                param.requires_grad = any(keyword in name for keyword in trainable_keywords)
+
         new_params, new_param_names = [], []
         pretrained_params, pretrained_param_names = [], []
 
@@ -1018,15 +1020,7 @@ class ModelWrapper(LightningModule):
                     continue
 
                 # Heads that are always treated as new
-                if any(
-                    x in name
-                    for x in [
-                        "gaussian_param_head",
-                        "intrinsic_encoder",
-                        "resunet_feature_extractor",
-                        "pointmlp_refiner",
-                    ]
-                ):
+                if any(x in name for x in ["gaussian_param_head", "intrinsic_encoder", "resunet_token_fusion", "ptv3_refiner"]):
                     new_params.append(param)
                     new_param_names.append(name)
                     # print(name)

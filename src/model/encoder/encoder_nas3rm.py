@@ -15,13 +15,14 @@ from ...dataset.shims.bounds_shim import apply_bounds_shim
 from ...dataset.shims.normalize_shim import apply_normalize_shim, normalize_image
 from ...dataset.shims.patch_shim import apply_patch_shim
 from ...dataset.types import BatchedExample, DataShim
-from ...geometry.projection import sample_image_grid
+from ...geometry.projection import get_world_rays, sample_image_grid
+from ..super_resolution import FrozenSwinIRUpsampler
 from ..types import Gaussians
+from .ptv3_refiner import GaussianPTV3Refiner
+from .resunet_fusion import HiSplatResUnetTokenFusion
 from .backbone import Backbone, BackboneCfg, get_backbone
 from .common.gaussian_adapter import GaussianAdapter, GaussianAdapterCfg, UnifiedGaussianAdapter
 from .encoder import Encoder
-from .ptv3_refiner import GaussianPointMLPRefiner
-from .resunet_fusion import ImageNetResUnetFeatureExtractor
 from .visualization.encoder_visualizer_epipolar_cfg import EncoderVisualizerEpipolarCfg
 from ...misc.cam_utils import camera_normalization, convert_pose_to_4x4, depth_projector, \
     unproject_depth_map_to_point_map_batch
@@ -62,12 +63,19 @@ class EncoderNAS3RMCfg:
     estimating_focal: bool = False
     estimating_pose: bool = True
 
+    use_swinir_sr: bool = True
+    swinir_weight_path: str = "/space0/mengxl/NAS3R-master/pretrained_weights/001_classicalSR_DF2K_s64w8_SwinIR-M_x4.pth"
+    use_resunet_fusion: bool = True
+    use_ptv3_refine: bool = True
+    ptv3_path: str = "/space0/mengxl"
+    ptv3_grid_size: float = 0.02
+    ptv3_refine_rotation: bool = False
+    ptv3_refine_sh: bool = False
+
     depth_activation: str = 'sigmoid'
 
     equal_fxfy: bool = True
     equal_view_intrinsics: bool = True
-    use_resunet_feature_extractor: bool = False
-    use_context_render_error: bool = False
 
 
 def rearrange_head(feat, patch_size, H, W):
@@ -76,6 +84,17 @@ def rearrange_head(feat, patch_size, H, W):
     feat = F.pixel_shuffle(feat, patch_size)  # B,D,H,W
     feat = rearrange(feat, "b d h w -> b (h w) d")
     return feat
+
+
+def flatten_gaussians(gaussians) -> Gaussians:
+    return Gaussians(
+        rearrange(gaussians.means, "b v r srf spp xyz -> b (v r srf spp) xyz"),
+        rearrange(gaussians.covariances, "b v r srf spp i j -> b (v r srf spp) i j"),
+        rearrange(gaussians.rotations, "b v r srf spp i  -> b (v r srf spp) i "),
+        rearrange(gaussians.scales, "b v r srf spp i  -> b (v r srf spp) i "),
+        rearrange(gaussians.harmonics, "b v r srf spp c d_sh -> b (v r srf spp) c d_sh"),
+        rearrange(gaussians.opacities, "b v r srf spp -> b (v r srf spp)"),
+    )
 
 
 class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
@@ -113,15 +132,25 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
         if self.cfg.estimating_pose:
             self.set_pose_head(cfg, cfg.pose_head_type)
 
-        self.decoder = None
-        self.resunet_feature_extractor = (
-            ImageNetResUnetFeatureExtractor(token_dim=self.backbone.dec_embed_dim)
-            if self.cfg.use_resunet_feature_extractor
+        self.swinir_upsampler = (
+            FrozenSwinIRUpsampler(cfg.swinir_weight_path)
+            if cfg.use_swinir_sr
             else None
         )
-        self.pointmlp_refiner = (
-            GaussianPointMLPRefiner(sh_degree=self.cfg.gaussian_adapter.sh_degree)
-            if self.cfg.use_resunet_feature_extractor and self.cfg.use_context_render_error
+        self.resunet_token_fusion = (
+            HiSplatResUnetTokenFusion(token_dim=self.backbone.dec_embed_dim)
+            if cfg.use_resunet_fusion
+            else None
+        )
+        self.ptv3_refiner = (
+            GaussianPTV3Refiner(
+                ptv3_path=cfg.ptv3_path,
+                grid_size=cfg.ptv3_grid_size,
+                refine_rotation=cfg.ptv3_refine_rotation,
+                refine_sh=cfg.ptv3_refine_sh,
+                sh_degree=cfg.gaussian_adapter.sh_degree,
+            )
+            if cfg.use_ptv3_refine
             else None
         )
 
@@ -185,16 +214,16 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             target: Optional[dict] = None,
             warmup_pts3d: bool = False,
     ):
-        context_image = context.get("image", context["image"])
-        target_image = target.get("image", target["image"]) if target is not None else None
+        context_image = context.get("image_lr", context["image"])
+        target_image = target.get("image_lr", target["image"]) if target is not None else None
+        context_image_sr = (
+            self.swinir_upsampler(context_image)
+            if self.swinir_upsampler is not None
+            else context["image"]
+        )
 
         device = context_image.device
         b, v_cxt, _, h, w = context_image.shape
-        resunet_feature_256 = None
-        context_image_rgb = context_image
-        if context_image_rgb.detach().amin().item() < 0:
-            context_image_rgb = context_image_rgb * 0.5 + 0.5
-        context_image_rgb = context_image_rgb.clamp(0, 1)
 
         if target is not None:
             v_tgt = target_image.shape[1]
@@ -214,11 +243,12 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             out = self.backbone(context_input)
 
         dec_feat, shape, images = out['dec_feat'], out['shape'], out['images']
-        if self.resunet_feature_extractor is not None:
-            context_tokens = dec_feat[-1][:, :v_cxt].float()
-            resunet_feature_256 = {
-                "context": self.resunet_feature_extractor(context_image_rgb, context_tokens),
-            }
+        fusion_features = None
+        if self.resunet_token_fusion is not None:
+            fusion_features = self.resunet_token_fusion(
+                context_image_sr[:, :v_cxt],
+                dec_feat[-1][:, :v_cxt],
+            )
 
         with torch.amp.autocast('cuda', enabled=False):
             all_other_params = []
@@ -291,8 +321,8 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
                                                                       rearrange(context_intrinsics,
                                                                                 "b v ... -> (b v ) ..."))
 
-        point_map_from_depth = rearrange(point_map_from_depth, "(b v) ... -> b v ...", b=b, v=v_cxt)
-        depth_to_pts_all = rearrange(point_map_from_depth, "b v h w xyz -> b v (h w) xyz")
+        depth_to_pts_all = rearrange(point_map_from_depth, "(b v) ... -> b v ...", b=b, v=v_cxt)
+        depth_to_pts_all = rearrange(depth_to_pts_all, "b v h w xyz -> b v (h w) xyz")
         # print("depth_to_pts_all", depth_to_pts_all[0,0,0])
         depth_to_pts_all = depth_to_pts_all.unsqueeze(-2)
         gaussian_params = rearrange(gaussians, "... (srf c) -> ... srf c",
@@ -305,12 +335,44 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             self.map_pdf_to_opacity(densities, global_step),
             rearrange(gaussian_params[..., 1:], "b v r srf c -> b v r srf () c"),
         )
+        gaussians_before_refine = gaussians
+
+        if self.ptv3_refiner is not None:
+            if fusion_features is None:
+                raise RuntimeError("PTv3 refinement requires use_resunet_fusion=True.")
+            if visualization_dump is not None:
+                visualization_dump["depth_refine_before"] = depth_all.detach()
+            xy_ray, _ = sample_image_grid((h, w), device)
+            xy_ray = rearrange(xy_ray, "h w xy -> (h w) () xy")
+            ray_coords = xy_ray.unsqueeze(0).unsqueeze(0).repeat(b, v_cxt, 1, 1, 1)
+            ray_extrinsics = context_extrinsics.unsqueeze(2).unsqueeze(2)
+            ray_intrinsics = context_intrinsics.unsqueeze(2).unsqueeze(2)
+            _, ray_direction = get_world_rays(ray_coords, ray_extrinsics, ray_intrinsics)
+            ray_direction = rearrange(ray_direction, "b v (h w) () xyz -> b v h w xyz", h=h, w=w)
+            point_map = rearrange(point_map_from_depth, "(b v) h w xyz -> b v h w xyz", b=b, v=v_cxt)
+            gaussians = self.ptv3_refiner(
+                fusion_features["64"],
+                depth_all,
+                point_map,
+                context_image,
+                ray_direction,
+                gaussians,
+            )
+            if visualization_dump is not None:
+                refined_points = gaussians.means.mean(dim=(3, 4))
+                refined_depth = depth_projector(
+                    rearrange(refined_points, "b v hw xyz -> (b v) hw xyz"),
+                    rearrange(context_extrinsics, "b v i j -> (b v) i j"),
+                )
+                visualization_dump["depth_refine_after"] = rearrange(
+                    refined_depth.squeeze(-1), "(b v) (h w) -> b v h w", b=b, v=v_cxt, h=h, w=w
+                ).detach()
 
         # Dump visualizations if needed.
         if visualization_dump is not None:
             visualization_dump["depth"] = depths_per_view
-            if resunet_feature_256 is not None:
-                visualization_dump["resunet_feature_256"] = resunet_feature_256["context"]
+            if fusion_features is not None:
+                visualization_dump["fusion_features"] = fusion_features
 
             visualization_dump["scales"] = rearrange(
                 gaussians.scales, "b v r srf spp xyz -> b (v r srf spp) xyz"
@@ -326,49 +388,13 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             )  # (b, v, h, w, 1, 1)
 
         encoder_output = dict()
+        if fusion_features is not None:
+            encoder_output["fusion_features"] = fusion_features
 
-        encoder_gaussians = Gaussians(
-            rearrange(gaussians.means, "b v r srf spp xyz -> b (v r srf spp) xyz"),
-            rearrange(gaussians.covariances, "b v r srf spp i j -> b (v r srf spp) i j"),
-            rearrange(gaussians.rotations, "b v r srf spp i  -> b (v r srf spp) i "),
-            rearrange(gaussians.scales, "b v r srf spp i  -> b (v r srf spp) i "),
-            rearrange(gaussians.harmonics, "b v r srf spp c d_sh -> b (v r srf spp) c d_sh"),
-            rearrange(gaussians.opacities, "b v r srf spp -> b (v r srf spp)"),
-        )
-        encoder_output["gaussians_before_refine"] = encoder_gaussians
+        if self.ptv3_refiner is not None:
+            encoder_output["gaussians_before_refine"] = flatten_gaussians(gaussians_before_refine)
 
-        if self.cfg.use_context_render_error and self.decoder is not None:
-            context_render = self.decoder.forward(
-                encoder_gaussians,
-                context_extrinsics,
-                context_intrinsics,
-                context["near"],
-                context["far"],
-                (h, w),
-                depth_mode=None,
-            ).color
-            encoder_output["context_render"] = context_render
-            encoder_output["context_render_error"] = (context_image_rgb - context_render).abs()
-
-            if self.pointmlp_refiner is not None and resunet_feature_256 is not None:
-                gaussians = self.pointmlp_refiner(
-                    resunet_feature_256["context"],
-                    encoder_output["context_render_error"],
-                    depths_per_view,
-                    point_map_from_depth,
-                    context_image_rgb,
-                    gaussians,
-                )
-                encoder_gaussians = Gaussians(
-                    rearrange(gaussians.means, "b v r srf spp xyz -> b (v r srf spp) xyz"),
-                    rearrange(gaussians.covariances, "b v r srf spp i j -> b (v r srf spp) i j"),
-                    rearrange(gaussians.rotations, "b v r srf spp i  -> b (v r srf spp) i "),
-                    rearrange(gaussians.scales, "b v r srf spp i  -> b (v r srf spp) i "),
-                    rearrange(gaussians.harmonics, "b v r srf spp c d_sh -> b (v r srf spp) c d_sh"),
-                    rearrange(gaussians.opacities, "b v r srf spp -> b (v r srf spp)"),
-                )
-
-        encoder_output["gaussians"] = encoder_gaussians
+        encoder_output["gaussians"] = flatten_gaussians(gaussians)
 
         if self.cfg.estimating_pose:
             encoder_output['extrinsics'] = dict()
@@ -381,9 +407,6 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             encoder_output['intrinsics']['c'] = pred_intrinsics[:, :v_cxt]
             if target is not None:
                 encoder_output['intrinsics']['cwt'] = pred_intrinsics
-
-        if resunet_feature_256 is not None:
-            encoder_output["resunet_feature_256"] = resunet_feature_256
 
         return encoder_output
 

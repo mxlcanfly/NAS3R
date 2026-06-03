@@ -20,6 +20,7 @@ class CheckpointingCfg:
     save_top_k: int
     save_weights_only: bool
     resume: bool
+    resume_from_latest: bool = False
 
 @dataclass
 class ModelCfg:

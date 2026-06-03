@@ -21,13 +21,14 @@ model:
 
     gs_params_head_type: dpt_gs
     pose_free: true
-    pretrained_weights: "/space0/mengxl/NAS3R-master/pretrained_weights/re10k_nas3r-m_pretrained-I.ckpt"
+    pretrained_weights: "/space0/mengxl/NAS3R-master/pretrained_weights/naslr.ckpt" # "/space0/mengxl/NAS3R-master/pretrained_weights/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth"
 
 
-    estimating_focal: false
+    estimating_focal: false 
     depth_activation: 'sigmoid'
-    use_resunet_feature_extractor: true
-    use_context_render_error: true
+    use_ptv3_refine: true
+    ptv3_path: /space0/mengxl
+    ptv3_grid_size: 0.02
 
     pose_head:
       pose_init_t: true
@@ -55,10 +56,10 @@ optimizer:
 
 data_loader:
   train:
-    batch_size: 16
+    batch_size: 8
 
 trainer:
-  max_steps: 75001
+  max_steps: 90001
   val_check_interval: 10000
 
 checkpointing:
@@ -69,10 +70,6 @@ checkpointing:
 
 train:
   training_context: false
-  freeze_backbone: true
-  freeze_depth_head: true
-  freeze_gaussian_param_head: true
-  freeze_pose_head: true
 
 
 test:
