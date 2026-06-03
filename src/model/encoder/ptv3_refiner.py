@@ -23,27 +23,32 @@ class GaussianPTV3Refiner(nn.Module):
         self.grid_size = grid_size
         self.sh_dim = 3 * ((sh_degree + 1) ** 2)
 
-        ptv3_root = Path(ptv3_path)
-        if str(ptv3_root) not in sys.path:
-            sys.path.insert(0, str(ptv3_root))
+        litept_root = Path(ptv3_path)
+        if (litept_root / "LitePT-main").exists():
+            litept_root = litept_root / "LitePT-main"
+        if str(litept_root) not in sys.path:
+            sys.path.insert(0, str(litept_root))
 
         try:
-            from PointTransformerV3.model import PointTransformerV3
+            from litept.model import LitePT
         except Exception as exc:
             raise ImportError(
-                "Failed to import PointTransformerV3. Please make sure "
-                f"{ptv3_root}/PointTransformerV3 is importable and dependencies "
-                "such as addict, spconv, and torch_scatter are installed."
+                "Failed to import LitePT. Please make sure "
+                f"{litept_root} is importable and dependencies such as "
+                "flash_attn, spconv, torch_scatter, and pointrope are installed."
             ) from exc
 
-        self.ptv3 = PointTransformerV3(
-            in_channels=in_channels,
-            enc_channels=(64, 128, 256, 512, 512),
-            dec_channels=(64, 128, 256, 512),
-            enable_flash=False,
+        self.input_proj = nn.Sequential(
+            nn.Linear(in_channels, 64),
+            nn.LayerNorm(64),
+            nn.GELU(),
+        )
+        self.point_backbone = LitePT(
+            in_channels=64,
             enc_patch_size=(128, 128, 128, 128, 128),
             dec_patch_size=(128, 128, 128, 128),
         )
+        self.output_proj = nn.Linear(72, 64)
 
         out_channels = 3 + 3 + 1 + 4 + self.sh_dim
 
@@ -97,15 +102,17 @@ class GaussianPTV3Refiner(nn.Module):
         coord, feat, batch = self._flatten_inputs(
             fusion64, depth, point_map, image_lr, ray_direction
         )
-        point = self.ptv3(
+        tmp_feature = self.input_proj(feat.float())
+        point = self.point_backbone(
             {
                 "coord": coord.float(),
-                "feat": feat.float(),
+                "feat": tmp_feature,
                 "batch": batch,
                 "grid_size": self.grid_size,
             }
         )
-        delta = self.delta_head(point.feat.float())
+        out = tmp_feature + self.output_proj(point.feat.float())
+        delta = self.delta_head(out)
         delta = rearrange(delta, "(b v h w) c -> b v (h w) c", b=b, v=v, h=h, w=w)
 
         means = gaussians.means

@@ -56,7 +56,7 @@ optimizer:
 
 data_loader:
   train:
-    batch_size: 8
+    batch_size: 16
 
 trainer:
   max_steps: 120001
@@ -71,8 +71,8 @@ checkpointing:
 train:
   training_context: false
   refine_only: true
-  refine_train_gaussian_head: true
-  before_refine_loss_weight: 0.1
+  refine_train_gaussian_head: false
+  lr_gaussian_loss_weight: 1.0
 
 
 test:

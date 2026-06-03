@@ -45,6 +45,7 @@ from ..visualization.validation_in_3d import render_cameras, render_projections,
 from .decoder.decoder import Decoder, DepthRenderingMode
 from .encoder import Encoder
 from .encoder.visualization.encoder_visualizer import EncoderVisualizer
+from .ply_export import export_ply
 from ..misc.intrinsics_utils import estimate_intrinsics
 from ..evaluation.metrics import compute_pose_error, compute_pose_error_for_batch
 from ..misc.cam_utils import pose_auc
@@ -90,7 +91,7 @@ class TrainCfg:
     pretrain_camera_head: bool = False
     refine_only: bool = False
     refine_train_gaussian_head: bool = False
-    before_refine_loss_weight: float = 0.0
+    lr_gaussian_loss_weight: float = 1.0
 
 
 def dropout_context_views(v_cxt):
@@ -199,20 +200,65 @@ class ModelWrapper(LightningModule):
     def _images(self, views: dict) -> Tensor:
         return views[self._image_key(views)]
 
+    def _run_output_dir(self) -> Path:
+        checkpoint_callback = getattr(self.trainer, "checkpoint_callback", None)
+        checkpoint_dir = getattr(checkpoint_callback, "dirpath", None)
+        if checkpoint_dir is not None:
+            return Path(checkpoint_dir).parent
+
+        logger = getattr(self, "logger", None)
+        save_dir = getattr(logger, "save_dir", None)
+        if save_dir is not None:
+            return Path(save_dir)
+
+        return Path.cwd()
+
     @rank_zero_only
-    def _save_refine_depth_visualization(self, visualization_dump: dict) -> None:
+    def _save_training_gaussian_debug(
+            self,
+            gaussians_lr,
+            gaussians_lr_hr,
+            rendered_depth: Tensor | None,
+            rendered_color: Tensor | None,
+            target_color: Tensor | None,
+            reference_extrinsics: Tensor,
+    ) -> None:
         if self.global_step % 500 != 0:
             return
-        if "depth_refine_before" not in visualization_dump or "depth_refine_after" not in visualization_dump:
-            return
 
-        before = vis_depth_map(visualization_dump["depth_refine_before"][0].detach().cpu().clamp_min(1e-6))
-        after = vis_depth_map(visualization_dump["depth_refine_after"][0].detach().cpu().clamp_min(1e-6))
-        comparison = hcat(
-            add_label(vcat(*before), "Depth Before Refine"),
-            add_label(vcat(*after), "Depth After Refine"),
-        )
-        save_image(add_border(comparison), Path("depth_refine") / f"step_{self.global_step:0>6}.png")
+        output_dir = self._run_output_dir()
+        step_name = f"step_{self.global_step:0>6}"
+        ply_dir = output_dir / "debug_gaussians" / step_name
+        depth_dir = output_dir / "debug_depth"
+        render_dir = output_dir / "debug_render"
+
+        def save_gaussians_ply(gaussians, path: Path) -> None:
+            export_ply(
+                reference_extrinsics[0, 0].detach(),
+                gaussians.means[0].detach(),
+                gaussians.scales[0].detach(),
+                gaussians.rotations[0].detach(),
+                gaussians.harmonics[0].detach(),
+                gaussians.opacities[0].detach(),
+                path,
+                save_sh_dc_only=True,
+            )
+
+        save_gaussians_ply(gaussians_lr, ply_dir / "lr.ply")
+        save_gaussians_ply(gaussians_lr_hr, ply_dir / "lr_hr.ply")
+
+        if rendered_depth is not None:
+            depth_vis = vis_depth_map(rendered_depth[0].detach().cpu().clamp_min(1e-6))
+            save_image(add_border(vcat(*depth_vis)), depth_dir / f"{step_name}_lr_hr.png")
+
+        if rendered_color is not None and target_color is not None:
+            render = rendered_color[0].detach().cpu().clamp(0, 1)
+            target = target_color[0].detach().cpu().clamp(0, 1)
+            comparison = hcat(
+                add_label(vcat(*render), "LR+HR Render"),
+                add_label(vcat(*target), "Target"),
+            )
+            save_image(add_border(comparison), render_dir / f"{step_name}_render_target.png")
 
     def training_step(self, batch, batch_idx):
         # combine batch from different dataloaders
@@ -254,7 +300,6 @@ class ModelWrapper(LightningModule):
         visualization_dump = {}
         encoder_output = self.encoder(batch["context"], self.global_step, visualization_dump=visualization_dump,
                                       target=batch["target"] if self.encoder.cfg.estimating_pose else None)
-        self._save_refine_depth_visualization(visualization_dump)
 
         if self.encoder.cfg.estimating_pose:
             pred_extrinsics, pred_extrinsics_cwt = encoder_output['extrinsics']['c'], encoder_output['extrinsics'][
@@ -300,6 +345,29 @@ class ModelWrapper(LightningModule):
             depth_mode=self.train_cfg.depth_mode,
         )
 
+        debug_depth = output.depth
+        if self.global_step % 500 == 0 and debug_depth is None:
+            with torch.no_grad():
+                debug_output = self.decoder.forward(
+                    gaussians,
+                    extrinsics,
+                    intrinsics,
+                    near,
+                    far,
+                    (h, w),
+                    depth_mode="depth",
+                )
+            debug_depth = debug_output.depth
+
+        self._save_training_gaussian_debug(
+            encoder_output["gaussians_lr"],
+            gaussians,
+            debug_depth,
+            output.color,
+            target_gt,
+            extrinsics,
+        )
+
         # Compute PSNR
         psnr = compute_psnr(
             rearrange(target_gt, "b v c h w -> (b v) c h w"),
@@ -308,50 +376,33 @@ class ModelWrapper(LightningModule):
         self.log(f"train/psnr", psnr.mean())
         self.log(f"train/psnr_after_refine", psnr.mean())
 
-        if "gaussians_before_refine" in encoder_output:
-            before_refine_loss_weight = self.train_cfg.before_refine_loss_weight
-            if before_refine_loss_weight > 0:
-                output_before_refine = self.decoder.forward(
-                    encoder_output["gaussians_before_refine"],
-                    extrinsics,
-                    intrinsics,
-                    near,
-                    far,
-                    (h, w),
-                    depth_mode=self.train_cfg.depth_mode,
-                )
-            else:
-                with torch.no_grad():
-                    output_before_refine = self.decoder.forward(
-                        encoder_output["gaussians_before_refine"],
-                        extrinsics,
-                        intrinsics,
-                        near,
-                        far,
-                        (h, w),
-                        depth_mode=self.train_cfg.depth_mode,
+        if "gaussians_lr" in encoder_output and self.train_cfg.lr_gaussian_loss_weight > 0:
+            output_lr = self.decoder.forward(
+                encoder_output["gaussians_lr"],
+                extrinsics,
+                intrinsics,
+                near,
+                far,
+                (h, w),
+                depth_mode=self.train_cfg.depth_mode,
+            )
+            psnr_lr = compute_psnr(
+                rearrange(target_gt, "b v c h w -> (b v) c h w"),
+                rearrange(output_lr.color, "b v c h w -> (b v) c h w"),
+            )
+            self.log("train/psnr_lr_gaussians", psnr_lr.mean())
+
+            for loss_fn in self.losses:
+                if loss_fn.name in ['mse', 'lpips']:
+                    lr_loss = loss_fn.forward(
+                        output_lr.color,
+                        target_gt,
+                        encoder_output["gaussians_lr"],
+                        self.global_step,
                     )
-
-            with torch.no_grad():
-                psnr_before_refine = compute_psnr(
-                    rearrange(target_gt, "b v c h w -> (b v) c h w"),
-                    rearrange(output_before_refine.color.detach(), "b v c h w -> (b v) c h w"),
-                )
-            self.log(f"train/psnr_before_refine", psnr_before_refine.mean())
-            self.log(f"train/psnr_refine_delta", psnr.mean() - psnr_before_refine.mean())
-
-            if before_refine_loss_weight > 0:
-                for loss_fn in self.losses:
-                    if loss_fn.name in ['mse', 'lpips']:
-                        before_refine_loss = loss_fn.forward(
-                            output_before_refine.color,
-                            target_gt,
-                            encoder_output["gaussians_before_refine"],
-                            self.global_step,
-                        )
-                        before_refine_loss = before_refine_loss_weight * before_refine_loss
-                        self.log(f"loss/before_refine_{loss_fn.name}", before_refine_loss)
-                        total_loss += before_refine_loss
+                    lr_loss = self.train_cfg.lr_gaussian_loss_weight * lr_loss
+                    self.log(f"loss/lr_gaussians_{loss_fn.name}", lr_loss)
+                    total_loss += lr_loss
 
         # Compute and log loss.
         for loss_fn in self.losses:
@@ -386,7 +437,6 @@ class ModelWrapper(LightningModule):
                 f"target = {batch['target']['index'].tolist()}; "
                 f"loss = {total_loss:.6f}; "
                 f"psnr = {psnr.mean().item():.6f}; "
-                f"psnr_before_refine = {psnr_before_refine.mean().item():.6f}; "
             )
         self.log("info/global_step", self.global_step)  # hack for ckpt monitor
 
@@ -1028,7 +1078,7 @@ class ModelWrapper(LightningModule):
 
     def configure_optimizers(self):
         if self.train_cfg.refine_only:
-            trainable_keywords = ["resunet_token_fusion", "ptv3_refiner"]
+            trainable_keywords = ["resunet_token_fusion", "ptv3_refiner", "hr_lite_refiner"]
             if self.train_cfg.refine_train_gaussian_head:
                 trainable_keywords += ["gaussian_param_head"]
             trainable_keywords = tuple(trainable_keywords)
@@ -1052,7 +1102,7 @@ class ModelWrapper(LightningModule):
                     continue
 
                 # Heads that are always treated as new
-                if any(x in name for x in ["gaussian_param_head", "intrinsic_encoder", "resunet_token_fusion", "ptv3_refiner"]):
+                if any(x in name for x in ["gaussian_param_head", "intrinsic_encoder", "resunet_token_fusion", "ptv3_refiner", "hr_lite_refiner"]):
                     new_params.append(param)
                     new_param_names.append(name)
                     # print(name)

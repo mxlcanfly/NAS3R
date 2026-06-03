@@ -67,7 +67,7 @@ train:
   pretrain_camera_head: false
   refine_only: false
   refine_train_gaussian_head: false
-  before_refine_loss_weight: 0.0
+  lr_gaussian_loss_weight: 1.0
 
 
 test:
