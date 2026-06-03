@@ -26,9 +26,6 @@ model:
 
     estimating_focal: false 
     depth_activation: 'sigmoid'
-    use_ptv3_refine: true
-    ptv3_path: /space0/mengxl
-    ptv3_grid_size: 0.02
 
     pose_head:
       pose_init_t: true

@@ -209,6 +209,5 @@ class HiSplatResUnetTokenFusion(nn.Module):
         dino_feature = self.tokens_to_16x16(tokens)
         fused = self.resunet(images, dino_feature)
         return {
-            "64": rearrange(fused[0], "(b v) c h w -> b v c h w", b=b, v=v),
             "256": rearrange(fused[2], "(b v) c h w -> b v c h w", b=b, v=v),
         }

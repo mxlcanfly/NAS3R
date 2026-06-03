@@ -7,25 +7,20 @@ import torch.nn.functional as F
 from einops import rearrange
 from jaxtyping import Float
 from torch import Tensor, nn
-import math
 
 from .backbone.croco.misc import transpose_to_landscape
 from .heads import head_factory, camera_head_factory
-from ...dataset.shims.bounds_shim import apply_bounds_shim
 from ...dataset.shims.normalize_shim import apply_normalize_shim, normalize_image
-from ...dataset.shims.patch_shim import apply_patch_shim
 from ...dataset.types import BatchedExample, DataShim
-from ...geometry.projection import get_world_rays, sample_image_grid
 from ..super_resolution import FrozenSwinIRUpsampler
 from ..types import Gaussians
-from .ptv3_refiner import GaussianPTV3Refiner
+from .anchor_feature_sampler import AnchorFeatureAggregator, AnchorFeatureSampler
 from .resunet_fusion import HiSplatResUnetTokenFusion
-from .backbone import Backbone, BackboneCfg, get_backbone
+from .backbone import BackboneCfg, get_backbone
 from .common.gaussian_adapter import GaussianAdapter, GaussianAdapterCfg, UnifiedGaussianAdapter
 from .encoder import Encoder
 from .visualization.encoder_visualizer_epipolar_cfg import EncoderVisualizerEpipolarCfg
-from ...misc.cam_utils import camera_normalization, convert_pose_to_4x4, depth_projector, \
-    unproject_depth_map_to_point_map_batch
+from ...misc.cam_utils import convert_pose_to_4x4, unproject_depth_map_to_point_map_batch
 from .heads.pose_head import PoseHeadCfg
 
 inf = float('inf')
@@ -66,11 +61,14 @@ class EncoderNAS3RMCfg:
     use_swinir_sr: bool = True
     swinir_weight_path: str = "/space0/mengxl/NAS3R-master/pretrained_weights/001_classicalSR_DF2K_s64w8_SwinIR-M_x4.pth"
     use_resunet_fusion: bool = True
-    use_ptv3_refine: bool = True
-    ptv3_path: str = "/space0/mengxl"
-    ptv3_grid_size: float = 0.02
-    ptv3_refine_rotation: bool = False
-    ptv3_refine_sh: bool = False
+    use_anchor_feature_sampler: bool = False
+    use_anchor_feature_aggregator: bool = False
+    anchor_feature_patch_size: int = 4
+    anchor_feature_max_anchors: int | None = None
+    anchor_feature_patch_dim: int = 512
+    anchor_feature_num_views: int = 2
+    anchor_feature_view_dim: int = 128
+    anchor_feature_out_dim: int = 256
 
     depth_activation: str = 'sigmoid'
 
@@ -142,15 +140,21 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             if cfg.use_resunet_fusion
             else None
         )
-        self.ptv3_refiner = (
-            GaussianPTV3Refiner(
-                ptv3_path=cfg.ptv3_path,
-                grid_size=cfg.ptv3_grid_size,
-                refine_rotation=cfg.ptv3_refine_rotation,
-                refine_sh=cfg.ptv3_refine_sh,
-                sh_degree=cfg.gaussian_adapter.sh_degree,
+        self.anchor_feature_sampler = (
+            AnchorFeatureSampler(
+                patch_size=cfg.anchor_feature_patch_size,
             )
-            if cfg.use_ptv3_refine
+            if cfg.use_anchor_feature_sampler
+            else None
+        )
+        self.anchor_feature_aggregator = (
+            AnchorFeatureAggregator(
+                patch_feature_dim=cfg.anchor_feature_patch_dim,
+                num_views=cfg.anchor_feature_num_views,
+                view_dim=cfg.anchor_feature_view_dim,
+                out_dim=cfg.anchor_feature_out_dim,
+            )
+            if cfg.use_anchor_feature_aggregator
             else None
         )
 
@@ -335,38 +339,24 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             self.map_pdf_to_opacity(densities, global_step),
             rearrange(gaussian_params[..., 1:], "b v r srf c -> b v r srf () c"),
         )
-        gaussians_before_refine = gaussians
+        anchor_feature_samples = None
+        anchor_features = None
+        if self.anchor_feature_sampler is not None:
+            if fusion_features is None or "256" not in fusion_features:
+                raise RuntimeError("Anchor feature sampling requires use_resunet_fusion=True.")
 
-        if self.ptv3_refiner is not None:
-            if fusion_features is None:
-                raise RuntimeError("PTv3 refinement requires use_resunet_fusion=True.")
-            if visualization_dump is not None:
-                visualization_dump["depth_refine_before"] = depth_all.detach()
-            xy_ray, _ = sample_image_grid((h, w), device)
-            xy_ray = rearrange(xy_ray, "h w xy -> (h w) () xy")
-            ray_coords = xy_ray.unsqueeze(0).unsqueeze(0).repeat(b, v_cxt, 1, 1, 1)
-            ray_extrinsics = context_extrinsics.unsqueeze(2).unsqueeze(2)
-            ray_intrinsics = context_intrinsics.unsqueeze(2).unsqueeze(2)
-            _, ray_direction = get_world_rays(ray_coords, ray_extrinsics, ray_intrinsics)
-            ray_direction = rearrange(ray_direction, "b v (h w) () xyz -> b v h w xyz", h=h, w=w)
-            point_map = rearrange(point_map_from_depth, "(b v) h w xyz -> b v h w xyz", b=b, v=v_cxt)
-            gaussians = self.ptv3_refiner(
-                fusion_features["64"],
-                depth_all,
-                point_map,
-                context_image,
-                ray_direction,
-                gaussians,
+            anchors = rearrange(depth_to_pts_all.squeeze(-2), "b v r xyz -> b (v r) xyz")
+            if self.cfg.anchor_feature_max_anchors is not None:
+                anchors = anchors[:, :self.cfg.anchor_feature_max_anchors]
+
+            anchor_feature_samples = self.anchor_feature_sampler(
+                anchors,
+                fusion_features["256"],
+                context_extrinsics,
+                context_intrinsics,
             )
-            if visualization_dump is not None:
-                refined_points = gaussians.means.mean(dim=(3, 4))
-                refined_depth = depth_projector(
-                    rearrange(refined_points, "b v hw xyz -> (b v) hw xyz"),
-                    rearrange(context_extrinsics, "b v i j -> (b v) i j"),
-                )
-                visualization_dump["depth_refine_after"] = rearrange(
-                    refined_depth.squeeze(-1), "(b v) (h w) -> b v h w", b=b, v=v_cxt, h=h, w=w
-                ).detach()
+            if self.anchor_feature_aggregator is not None:
+                anchor_features = self.anchor_feature_aggregator(anchor_feature_samples)
 
         # Dump visualizations if needed.
         if visualization_dump is not None:
@@ -390,9 +380,10 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
         encoder_output = dict()
         if fusion_features is not None:
             encoder_output["fusion_features"] = fusion_features
-
-        if self.ptv3_refiner is not None:
-            encoder_output["gaussians_before_refine"] = flatten_gaussians(gaussians_before_refine)
+        if anchor_feature_samples is not None:
+            encoder_output["anchor_feature_samples"] = anchor_feature_samples
+        if anchor_features is not None:
+            encoder_output["anchor_features"] = anchor_features
 
         encoder_output["gaussians"] = flatten_gaussians(gaussians)
 

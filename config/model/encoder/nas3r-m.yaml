@@ -52,3 +52,14 @@ depth_activation: 'sigmoid'
 
 equal_fxfy: true
 equal_view_intrinsics: true
+
+use_swinir_sr: true
+use_resunet_fusion: true
+use_anchor_feature_sampler: true
+use_anchor_feature_aggregator: true
+anchor_feature_patch_size: 4
+anchor_feature_max_anchors: null
+anchor_feature_patch_dim: 512
+anchor_feature_num_views: 2
+anchor_feature_view_dim: 128
+anchor_feature_out_dim: 256
