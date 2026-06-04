@@ -15,6 +15,7 @@ from ...dataset.types import BatchedExample, DataShim
 from ..super_resolution import FrozenSwinIRUpsampler
 from ..types import Gaussians
 from .anchor_feature_sampler import AnchorFeatureAggregator, AnchorFeatureSampler
+from .anchor_geometry_encoder import AnchorGeometryEncoder
 from .resunet_fusion import HiSplatResUnetTokenFusion
 from .backbone import BackboneCfg, get_backbone
 from .common.gaussian_adapter import GaussianAdapter, GaussianAdapterCfg, UnifiedGaussianAdapter
@@ -69,6 +70,12 @@ class EncoderNAS3RMCfg:
     anchor_feature_num_views: int = 2
     anchor_feature_view_dim: int = 128
     anchor_feature_out_dim: int = 256
+    use_anchor_geometry_query: bool = False
+    anchor_geometry_num_frequencies: int = 6
+    anchor_geometry_knn: int = 8
+    anchor_geometry_query_dim: int = 128
+    anchor_geometry_hidden_dim: int = 256
+    anchor_geometry_knn_chunk_size: int = 256
 
     depth_activation: str = 'sigmoid'
 
@@ -155,6 +162,17 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
                 out_dim=cfg.anchor_feature_out_dim,
             )
             if cfg.use_anchor_feature_aggregator
+            else None
+        )
+        self.anchor_geometry_encoder = (
+            AnchorGeometryEncoder(
+                num_frequencies=cfg.anchor_geometry_num_frequencies,
+                knn=cfg.anchor_geometry_knn,
+                query_dim=cfg.anchor_geometry_query_dim,
+                hidden_dim=cfg.anchor_geometry_hidden_dim,
+                knn_chunk_size=cfg.anchor_geometry_knn_chunk_size,
+            )
+            if cfg.use_anchor_geometry_query
             else None
         )
 
@@ -341,13 +359,17 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
         )
         anchor_feature_samples = None
         anchor_features = None
-        if self.anchor_feature_sampler is not None:
-            if fusion_features is None or "256" not in fusion_features:
-                raise RuntimeError("Anchor feature sampling requires use_resunet_fusion=True.")
-
+        anchor_geometry_query = None
+        anchor_spacing = None
+        anchors = None
+        if self.anchor_feature_sampler is not None or self.anchor_geometry_encoder is not None:
             anchors = rearrange(depth_to_pts_all.squeeze(-2), "b v r xyz -> b (v r) xyz")
             if self.cfg.anchor_feature_max_anchors is not None:
                 anchors = anchors[:, :self.cfg.anchor_feature_max_anchors]
+
+        if self.anchor_feature_sampler is not None:
+            if fusion_features is None or "256" not in fusion_features:
+                raise RuntimeError("Anchor feature sampling requires use_resunet_fusion=True.")
 
             anchor_feature_samples = self.anchor_feature_sampler(
                 anchors,
@@ -357,6 +379,10 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             )
             if self.anchor_feature_aggregator is not None:
                 anchor_features = self.anchor_feature_aggregator(anchor_feature_samples)
+        if self.anchor_geometry_encoder is not None:
+            geometry_encoding = self.anchor_geometry_encoder(anchors)
+            anchor_geometry_query = geometry_encoding.query
+            anchor_spacing = geometry_encoding.spacing
 
         # Dump visualizations if needed.
         if visualization_dump is not None:
@@ -384,6 +410,11 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             encoder_output["anchor_feature_samples"] = anchor_feature_samples
         if anchor_features is not None:
             encoder_output["anchor_features"] = anchor_features
+        if anchors is not None:
+            encoder_output["anchors"] = anchors
+        if anchor_geometry_query is not None:
+            encoder_output["anchor_geometry_query"] = anchor_geometry_query
+            encoder_output["anchor_spacing"] = anchor_spacing
 
         encoder_output["gaussians"] = flatten_gaussians(gaussians)
 

@@ -963,7 +963,11 @@ class ModelWrapper(LightningModule):
 
     def configure_optimizers(self):
         if self.train_cfg.refine_only:
-            trainable_keywords = ("resunet_token_fusion",)
+            trainable_keywords = (
+                "resunet_token_fusion",
+                "anchor_feature_aggregator",
+                "anchor_geometry_encoder",
+            )
             for name, param in self.named_parameters():
                 param.requires_grad = any(keyword in name for keyword in trainable_keywords)
 
@@ -984,7 +988,16 @@ class ModelWrapper(LightningModule):
                     continue
 
                 # Heads that are always treated as new
-                if any(x in name for x in ["gaussian_param_head", "intrinsic_encoder", "resunet_token_fusion"]):
+                if any(
+                    x in name
+                    for x in [
+                        "gaussian_param_head",
+                        "intrinsic_encoder",
+                        "resunet_token_fusion",
+                        "anchor_feature_aggregator",
+                        "anchor_geometry_encoder",
+                    ]
+                ):
                     new_params.append(param)
                     new_param_names.append(name)
                     # print(name)

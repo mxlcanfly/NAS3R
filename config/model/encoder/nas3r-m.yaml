@@ -53,13 +53,21 @@ depth_activation: 'sigmoid'
 equal_fxfy: true
 equal_view_intrinsics: true
 
-use_swinir_sr: true
-use_resunet_fusion: true
-use_anchor_feature_sampler: true
-use_anchor_feature_aggregator: true
+use_swinir_sr: false
+use_resunet_fusion: false
+use_anchor_feature_sampler: false
+use_anchor_feature_aggregator: false
 anchor_feature_patch_size: 4
 anchor_feature_max_anchors: null
 anchor_feature_patch_dim: 512
 anchor_feature_num_views: 2
 anchor_feature_view_dim: 128
 anchor_feature_out_dim: 256
+
+# q_geo = MLP([Fourier(anchor_xyz), log(local_knn_spacing)])
+use_anchor_geometry_query: true
+anchor_geometry_num_frequencies: 6
+anchor_geometry_knn: 8
+anchor_geometry_query_dim: 128
+anchor_geometry_hidden_dim: 256
+anchor_geometry_knn_chunk_size: 256
