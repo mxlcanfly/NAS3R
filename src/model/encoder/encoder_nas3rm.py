@@ -18,7 +18,7 @@ from ...dataset.types import BatchedExample, DataShim
 from ...geometry.projection import get_world_rays, sample_image_grid
 from ..super_resolution import FrozenSwinIRUpsampler
 from ..types import Gaussians
-from .ptv3_refiner import GaussianPTV3Refiner
+from .litept_refiner import GaussianLitePTRefiner
 from .resunet_fusion import HiSplatResUnetTokenFusion
 from .backbone import Backbone, BackboneCfg, get_backbone
 from .common.gaussian_adapter import GaussianAdapter, GaussianAdapterCfg, UnifiedGaussianAdapter
@@ -66,11 +66,11 @@ class EncoderNAS3RMCfg:
     use_swinir_sr: bool = True
     swinir_weight_path: str = "/space0/mengxl/SRGS-main/model_zoo/swinir/001_classicalSR_DF2K_s64w8_SwinIR-M_x4.pth"
     use_resunet_fusion: bool = True
-    use_ptv3_refine: bool = True
-    ptv3_path: str = "/space0/mengxl"
-    ptv3_grid_size: float = 0.02
-    ptv3_refine_rotation: bool = False
-    ptv3_refine_sh: bool = False
+    use_litept_refine: bool = True
+    litept_path: str = "/space0/mengxl/LitePT-main"
+    litept_grid_size: float = 0.02
+    litept_refine_rotation: bool = False
+    litept_refine_sh: bool = False
 
     depth_activation: str = 'sigmoid'
 
@@ -131,15 +131,16 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             if cfg.use_resunet_fusion
             else None
         )
-        self.ptv3_refiner = (
-            GaussianPTV3Refiner(
-                ptv3_path=cfg.ptv3_path,
-                grid_size=cfg.ptv3_grid_size,
-                refine_rotation=cfg.ptv3_refine_rotation,
-                refine_sh=cfg.ptv3_refine_sh,
+        self.litept_refiner = (
+            GaussianLitePTRefiner(
+                litept_path=cfg.litept_path,
+                in_channels=42,
+                grid_size=cfg.litept_grid_size,
+                refine_rotation=cfg.litept_refine_rotation,
+                refine_sh=cfg.litept_refine_sh,
                 sh_degree=cfg.gaussian_adapter.sh_degree,
             )
-            if cfg.use_ptv3_refine
+            if cfg.use_litept_refine
             else None
         )
 
@@ -203,13 +204,8 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             target: Optional[dict] = None,
             warmup_pts3d: bool = False,
     ):
-        context_image = context.get("image_lr", context["image"])
-        target_image = target.get("image_lr", target["image"]) if target is not None else None
-        context_image_sr = (
-            self.swinir_upsampler(context_image)
-            if self.swinir_upsampler is not None
-            else context["image"]
-        )
+        context_image = context["image"]
+        target_image = target["image"] if target is not None else None
 
         device = context_image.device
         b, v_cxt, _, h, w = context_image.shape
@@ -235,7 +231,7 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
         fusion_features = None
         if self.resunet_token_fusion is not None:
             fusion_features = self.resunet_token_fusion(
-                context_image_sr[:, :v_cxt],
+                context_image[:, :v_cxt],
                 dec_feat[-1][:, :v_cxt],
             )
 
@@ -325,9 +321,9 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             rearrange(gaussian_params[..., 1:], "b v r srf c -> b v r srf () c"),
         )
 
-        if self.ptv3_refiner is not None:
+        if self.litept_refiner is not None:
             if fusion_features is None:
-                raise RuntimeError("PTv3 refinement requires use_resunet_fusion=True.")
+                raise RuntimeError("LitePT refinement requires use_resunet_fusion=True.")
             if visualization_dump is not None:
                 visualization_dump["depth_refine_before"] = depth_all.detach()
             xy_ray, _ = sample_image_grid((h, w), device)
@@ -338,8 +334,8 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             _, ray_direction = get_world_rays(ray_coords, ray_extrinsics, ray_intrinsics)
             ray_direction = rearrange(ray_direction, "b v (h w) () xyz -> b v h w xyz", h=h, w=w)
             point_map = rearrange(point_map_from_depth, "(b v) h w xyz -> b v h w xyz", b=b, v=v_cxt)
-            gaussians = self.ptv3_refiner(
-                fusion_features["64"],
+            gaussians = self.litept_refiner(
+                fusion_features["256"],
                 depth_all,
                 point_map,
                 context_image,

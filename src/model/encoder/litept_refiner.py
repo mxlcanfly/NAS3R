@@ -8,10 +8,10 @@ from einops import rearrange, repeat
 from .common.gaussians import build_covariance
 
 
-class GaussianPTV3Refiner(nn.Module):
+class GaussianLitePTRefiner(nn.Module):
     def __init__(
         self,
-        ptv3_path: str = "/space0/mengxl",
+        litept_path: str = "/space0/mengxl/LitePT-main",
         in_channels: int = 42,
         grid_size: float = 0.02,
         hidden_channels: int = 256,
@@ -20,35 +20,32 @@ class GaussianPTV3Refiner(nn.Module):
         sh_degree: int = 0,
     ) -> None:
         super().__init__()
+        del refine_rotation, refine_sh
         self.grid_size = grid_size
         self.sh_dim = 3 * ((sh_degree + 1) ** 2)
 
-        ptv3_root = Path(ptv3_path)
-        if str(ptv3_root) not in sys.path:
-            sys.path.insert(0, str(ptv3_root))
+        litept_root = Path(litept_path)
+        if not (litept_root / "litept" / "model.py").is_file():
+            litept_root = litept_root / "LitePT-main"
+        if str(litept_root) not in sys.path:
+            sys.path.insert(0, str(litept_root))
 
         try:
-            from PointTransformerV3.model import PointTransformerV3
+            from litept.model import LitePT
+            from torch_scatter import scatter_mean
         except Exception as exc:
             raise ImportError(
-                "Failed to import PointTransformerV3. Please make sure "
-                f"{ptv3_root}/PointTransformerV3 is importable and dependencies "
-                "such as addict, spconv, and torch_scatter are installed."
+                "Failed to import LitePT. Please make sure "
+                f"{litept_root} is importable and flash_attn, spconv, "
+                "torch_scatter, and PointROPE are installed."
             ) from exc
 
-        self.ptv3 = PointTransformerV3(
-            in_channels=in_channels,
-            enc_channels=(64, 128, 256, 512, 512),
-            dec_channels=(64, 128, 256, 512),
-            enable_flash=False,
-            enc_patch_size=(128, 128, 128, 128, 128),
-            dec_patch_size=(128, 128, 128, 128),
-        )
+        self.scatter_mean = scatter_mean
+        self.litept = LitePT(in_channels=in_channels)
 
         out_channels = 3 + 3 + 1 + 4 + self.sh_dim
-
         layers = []
-        mlp_in = 64
+        mlp_in = 72
         for _ in range(3):
             layers.extend([nn.Linear(mlp_in, hidden_channels), nn.GELU()])
             mlp_in = hidden_channels
@@ -65,7 +62,7 @@ class GaussianPTV3Refiner(nn.Module):
         image: torch.Tensor,
         ray_direction: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        b, v, c, h, w = fusion_feature.shape
+        b, v, _, h, w = fusion_feature.shape
         coord = rearrange(point_map, "b v h w xyz -> (b v h w) xyz")
         feat = torch.cat(
             [
@@ -84,6 +81,34 @@ class GaussianPTV3Refiner(nn.Module):
         )
         return coord, feat, batch
 
+    def _grid_sample(
+        self,
+        coord: torch.Tensor,
+        feat: torch.Tensor,
+        batch: torch.Tensor,
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+        grid_coord = torch.div(
+            coord - coord.min(dim=0).values,
+            self.grid_size,
+            rounding_mode="trunc",
+        ).int()
+        voxel_key = torch.cat([batch[:, None].int(), grid_coord], dim=-1)
+        unique_key, inverse = torch.unique(
+            voxel_key,
+            sorted=True,
+            return_inverse=True,
+            dim=0,
+        )
+        sampled_coord = self.scatter_mean(coord, inverse, dim=0)
+        sampled_feat = self.scatter_mean(feat, inverse, dim=0)
+        return {
+            "coord": sampled_coord.float(),
+            "grid_coord": unique_key[:, 1:].int(),
+            "feat": sampled_feat.float(),
+            "batch": unique_key[:, 0].long(),
+            "grid_size": self.grid_size,
+        }, inverse
+
     def forward(
         self,
         fusion_feature: torch.Tensor,
@@ -97,15 +122,11 @@ class GaussianPTV3Refiner(nn.Module):
         coord, feat, batch = self._flatten_inputs(
             fusion_feature, depth, point_map, image, ray_direction
         )
-        point = self.ptv3(
-            {
-                "coord": coord.float(),
-                "feat": feat.float(),
-                "batch": batch,
-                "grid_size": self.grid_size,
-            }
-        )
-        delta = self.delta_head(point.feat.float())
+        sampled_point, inverse = self._grid_sample(coord, feat, batch)
+        point = self.litept(sampled_point)
+        dense_feat = point.feat[inverse]
+
+        delta = self.delta_head(dense_feat.float())
         delta = rearrange(delta, "(b v h w) c -> b v (h w) c", b=b, v=v, h=h, w=w)
 
         means = gaussians.means
@@ -116,7 +137,12 @@ class GaussianPTV3Refiner(nn.Module):
 
         num_gaussians_per_pixel = means.shape[3] * means.shape[4]
         delta = repeat(delta, "b v hw c -> b v hw r c", r=num_gaussians_per_pixel)
-        delta = rearrange(delta, "b v hw (s spp) c -> b v hw s spp c", s=means.shape[3], spp=means.shape[4])
+        delta = rearrange(
+            delta,
+            "b v hw (s spp) c -> b v hw s spp c",
+            s=means.shape[3],
+            spp=means.shape[4],
+        )
 
         cursor = 0
         delta_means = delta[..., cursor:cursor + 3]
@@ -128,9 +154,9 @@ class GaussianPTV3Refiner(nn.Module):
 
         means = means + delta_means
         scales = (scales + delta_scales).clamp_min(1e-6)
-        opacities_raw = torch.logit(opacities.clamp(1e-6, 1 - 1e-6)) + delta_opacities
-        opacities = opacities_raw.sigmoid()
-
+        opacities = (
+            torch.logit(opacities.clamp(1e-6, 1 - 1e-6)) + delta_opacities
+        ).sigmoid()
 
         delta_rotations = delta[..., cursor:cursor + 4]
         cursor += 4

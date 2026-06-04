@@ -21,14 +21,15 @@ model:
 
     gs_params_head_type: dpt_gs
     pose_free: true
-    pretrained_weights: "/space0/mengxl/NAS3R-master/outputs/exp_re10k/2026-05-27_15-45-54/checkpoints/epoch_36-step_300000.ckpt" # "/space0/mengxl/NAS3R-master/pretrained_weights/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth"
+    pretrained_weights: "/space0/mengxl/NAS3R-master/pretrained_weights/re10k_nas3r-m_pretrained-I.ckpt" # "/space0/mengxl/NAS3R-master/pretrained_weights/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth"
 
 
     estimating_focal: false 
     depth_activation: 'sigmoid'
-    use_ptv3_refine: true
-    ptv3_path: /space0/mengxl
-    ptv3_grid_size: 0.02
+    use_swinir_sr: false
+    use_litept_refine: true
+    litept_path: /space0/mengxl/LitePT-main
+    litept_grid_size: 0.02
 
     pose_head:
       pose_init_t: true
@@ -56,7 +57,7 @@ optimizer:
 
 data_loader:
   train:
-    batch_size: 16
+    batch_size: 8
 
 trainer:
   max_steps: 75001
@@ -70,6 +71,7 @@ checkpointing:
 
 train:
   training_context: false
+  refine_only: true
 
 
 test:

@@ -190,8 +190,6 @@ class ModelWrapper(LightningModule):
         self.ckpt_path = None
 
     def _image_key(self, views: dict) -> str:
-        if getattr(self.encoder.cfg, "name", None) == "nas3r-m" and "image_lr" in views:
-            return "image_lr"
         return "image"
 
     def _images(self, views: dict) -> Tensor:
