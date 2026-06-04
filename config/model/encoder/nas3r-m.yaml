@@ -53,7 +53,7 @@ depth_activation: 'sigmoid'
 equal_fxfy: true
 equal_view_intrinsics: true
 
-use_swinir_sr: false
+use_swinir_sr: true
 use_resunet_fusion: false
 use_anchor_feature_sampler: false
 use_anchor_feature_aggregator: false
@@ -71,3 +71,7 @@ anchor_geometry_knn: 8
 anchor_geometry_query_dim: 128
 anchor_geometry_hidden_dim: 256
 anchor_geometry_knn_chunk_size: 256
+
+# Local information richness on SR images for entropy-guided anchor sampling.
+entropy_num_gray_levels: 256
+entropy_window_size: 9

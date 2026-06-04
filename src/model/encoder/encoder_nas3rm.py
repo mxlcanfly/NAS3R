@@ -23,6 +23,7 @@ from .encoder import Encoder
 from .visualization.encoder_visualizer_epipolar_cfg import EncoderVisualizerEpipolarCfg
 from ...misc.cam_utils import convert_pose_to_4x4, unproject_depth_map_to_point_map_batch
 from .heads.pose_head import PoseHeadCfg
+from .local_entropy import compute_local_shannon_entropy
 
 inf = float('inf')
 
@@ -76,6 +77,8 @@ class EncoderNAS3RMCfg:
     anchor_geometry_query_dim: int = 128
     anchor_geometry_hidden_dim: int = 256
     anchor_geometry_knn_chunk_size: int = 256
+    entropy_num_gray_levels: int = 256
+    entropy_window_size: int = 9
 
     depth_activation: str = 'sigmoid'
 
@@ -243,6 +246,11 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             if self.swinir_upsampler is not None
             else context["image"]
         )
+        sr_entropy = compute_local_shannon_entropy(
+            context_image_sr,
+            num_gray_levels=self.cfg.entropy_num_gray_levels,
+            window_size=self.cfg.entropy_window_size,
+        )
 
         device = context_image.device
         b, v_cxt, _, h, w = context_image.shape
@@ -404,6 +412,7 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             )  # (b, v, h, w, 1, 1)
 
         encoder_output = dict()
+        encoder_output["sr_entropy"] = sr_entropy
         if fusion_features is not None:
             encoder_output["fusion_features"] = fusion_features
         if anchor_feature_samples is not None:
