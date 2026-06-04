@@ -13,7 +13,7 @@
       <paths name="mengxl@192.168.1.107:22 key">
         <serverdata>
           <mappings>
-            <mapping local="$PROJECT_DIR$" web="/" />
+            <mapping deploy="/space0/mengxl/NAS3R-master" local="$PROJECT_DIR$" web="/" />
           </mappings>
         </serverdata>
       </paths>

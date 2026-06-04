@@ -1005,7 +1005,7 @@ class ModelWrapper(LightningModule):
                         "gaussian_param_head",
                         "intrinsic_encoder",
                         "resunet_feature_extractor",
-                        "pointmlp_refiner",
+                        "litept_refiner",
                     ]
                 ):
                     new_params.append(param)

@@ -20,7 +20,7 @@ from ..types import Gaussians
 from .backbone import Backbone, BackboneCfg, get_backbone
 from .common.gaussian_adapter import GaussianAdapter, GaussianAdapterCfg, UnifiedGaussianAdapter
 from .encoder import Encoder
-from .ptv3_refiner import GaussianPointMLPRefiner
+from .ptv3_refiner import GaussianLitePTRefiner
 from .resunet_fusion import ImageNetResUnetFeatureExtractor
 from .visualization.encoder_visualizer_epipolar_cfg import EncoderVisualizerEpipolarCfg
 from ...misc.cam_utils import camera_normalization, convert_pose_to_4x4, depth_projector, \
@@ -119,8 +119,8 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             if self.cfg.use_resunet_feature_extractor
             else None
         )
-        self.pointmlp_refiner = (
-            GaussianPointMLPRefiner(sh_degree=self.cfg.gaussian_adapter.sh_degree)
+        self.litept_refiner = (
+            GaussianLitePTRefiner(sh_degree=self.cfg.gaussian_adapter.sh_degree)
             if self.cfg.use_resunet_feature_extractor and self.cfg.use_context_render_error
             else None
         )
@@ -350,12 +350,13 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             encoder_output["context_render"] = context_render
             encoder_output["context_render_error"] = (context_image_rgb - context_render).abs()
 
-            if self.pointmlp_refiner is not None and resunet_feature_256 is not None:
-                gaussians = self.pointmlp_refiner(
+            if self.litept_refiner is not None and resunet_feature_256 is not None:
+                gaussians = self.litept_refiner(
                     resunet_feature_256["context"],
                     encoder_output["context_render_error"],
                     depths_per_view,
                     point_map_from_depth,
+                    context_extrinsics,
                     context_image_rgb,
                     gaussians,
                 )
