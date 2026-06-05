@@ -54,7 +54,7 @@ equal_fxfy: true
 equal_view_intrinsics: true
 
 use_swinir_sr: true
-use_resunet_fusion: false
+use_resunet_fusion: true
 use_anchor_feature_sampler: false
 use_anchor_feature_aggregator: false
 anchor_feature_patch_size: 4
