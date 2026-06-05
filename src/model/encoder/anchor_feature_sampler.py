@@ -11,6 +11,7 @@ from ...geometry.projection import homogenize_points, transform_world2cam, proje
 @dataclass
 class AnchorFeatureSamples:
     features: torch.Tensor
+    entropy: torch.Tensor | None
     valid_mask: torch.Tensor
     projected_xy: torch.Tensor
     camera_depth: torch.Tensor
@@ -65,6 +66,7 @@ class AnchorFeatureSampler(nn.Module):
         feature_map: torch.Tensor,
         extrinsics: torch.Tensor,
         intrinsics: torch.Tensor,
+        entropy_map: torch.Tensor | None = None,
     ) -> AnchorFeatureSamples:
         b, num_views, channels, feat_h, feat_w = feature_map.shape
         num_anchors = anchors.shape[1]
@@ -101,9 +103,51 @@ class AnchorFeatureSampler(nn.Module):
             v=num_views,
             n=num_anchors,
         )
+        sampled_entropy = None
+        if entropy_map is not None:
+            if entropy_map.ndim != 4:
+                raise ValueError(
+                    "Expected entropy_map with shape [B, V, H, W], "
+                    f"got {tuple(entropy_map.shape)}."
+                )
+            if entropy_map.shape[:2] != (b, num_views):
+                raise ValueError(
+                    "Expected entropy_map batch/view dimensions "
+                    f"{(b, num_views)}, got {tuple(entropy_map.shape[:2])}."
+                )
+            entropy_map = entropy_map.to(
+                device=feature_map.device,
+                dtype=feature_map.dtype,
+            ).unsqueeze(2)
+            if entropy_map.shape[-2:] != (feat_h, feat_w):
+                entropy_map = F.interpolate(
+                    rearrange(entropy_map, "b v c h w -> (b v) c h w"),
+                    size=(feat_h, feat_w),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            else:
+                entropy_map = rearrange(entropy_map, "b v c h w -> (b v) c h w")
+
+            sampled_entropy = F.grid_sample(
+                entropy_map,
+                patch_grid,
+                mode="bilinear",
+                padding_mode=self.padding_mode,
+                align_corners=True,
+            )
+            sampled_entropy = rearrange(
+                sampled_entropy,
+                "(b v) c n p -> b n v (p c)",
+                b=b,
+                v=num_views,
+                n=num_anchors,
+            )
+            sampled_features = torch.cat([sampled_features, sampled_entropy], dim=-1)
 
         return AnchorFeatureSamples(
             features=sampled_features,
+            entropy=sampled_entropy,
             valid_mask=valid_mask_flat,
             projected_xy=rearrange(projected_xy, "b v n xy -> b n v xy"),
             camera_depth=camera_depth_flat,

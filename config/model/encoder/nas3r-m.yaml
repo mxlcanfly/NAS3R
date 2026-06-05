@@ -55,11 +55,11 @@ equal_view_intrinsics: true
 
 use_swinir_sr: true
 use_resunet_fusion: true
-use_anchor_feature_sampler: false
-use_anchor_feature_aggregator: false
-anchor_feature_patch_size: 4
+use_anchor_feature_sampler: true
+use_anchor_feature_aggregator: true
+anchor_feature_patch_size: 6
 anchor_feature_max_anchors: null
-anchor_feature_patch_dim: 512
+anchor_feature_patch_dim: 1152
 anchor_feature_num_views: 2
 anchor_feature_view_dim: 128
 anchor_feature_out_dim: 256
@@ -68,9 +68,36 @@ anchor_feature_out_dim: 256
 use_anchor_geometry_query: true
 anchor_geometry_num_frequencies: 6
 anchor_geometry_knn: 8
-anchor_geometry_query_dim: 128
-anchor_geometry_hidden_dim: 256
+anchor_geometry_query_dim: 256
+anchor_geometry_hidden_dim: 512
 anchor_geometry_knn_chunk_size: 256
+
+# Fuse multi-view anchor features and geometric queries with LitePT-style point aggregation.
+use_anchor_litept_fusion: true
+anchor_litept_path: /space0/mengxl/LitePT-main
+anchor_litept_use_full: true
+anchor_litept_grid_size: 0.02
+anchor_litept_token_dim: 512
+anchor_litept_output_dim: 128
+anchor_litept_enc_channels: [64, 128, 256, 384, 504]
+anchor_litept_enc_num_head: [4, 8, 8, 16, 28]
+anchor_litept_dec_channels: [128, 128, 256, 384]
+anchor_litept_dec_num_head: [8, 8, 8, 12]
+anchor_litept_fallback_blocks: 0
+anchor_litept_fallback_knn: 16
+anchor_litept_fallback_chunk_size: 1024
+
+# Decode local residual Gaussians from aggregated anchor tokens.
+use_anchor_gaussian_decoder: true
+anchor_gaussian_decoder_hidden_dim: 512
+anchor_gaussians_per_anchor: 8
+anchor_scaffold_scale_divisor: 2.4
+anchor_scaffold_opacity_multiplier: 0.6
+anchor_child_offset_radius: 0.75
+anchor_child_scale_residual_range: 0.5
+anchor_child_opacity_residual_range: 2.0
+anchor_child_rotation_residual_range: 0.1
+anchor_child_sh_residual_range: 0.1
 
 # Local information richness on SR images for entropy-guided anchor sampling.
 entropy_num_gray_levels: 256

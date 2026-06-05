@@ -17,6 +17,7 @@ import numpy as np
 import cv2
 import os
 import time
+import torch.nn.functional as F
 
 from ..dataset.data_module import get_data_shim
 from ..dataset.types import BatchedExample
@@ -30,6 +31,7 @@ from ..misc.LocalLogger import LOG_PATH, LocalLogger
 from ..misc.nn_module_tools import convert_to_buffer
 from ..misc.step_tracker import StepTracker
 from ..misc.utils import vis_depth_map, confidence_map, get_overlap_tag
+from .ply_export import export_ply
 from ..visualization.annotation import add_label
 from ..visualization.camera_trajectory.interpolation import (
     interpolate_extrinsics,
@@ -89,6 +91,8 @@ class TrainCfg:
 
     pretrain_camera_head: bool = False
     refine_only: bool = False
+    depth_consistency_weight: float = 0.0
+    debug_save_every_n_steps: int = 0
 
 
 def dropout_context_views(v_cxt):
@@ -197,6 +201,118 @@ class ModelWrapper(LightningModule):
     def _images(self, views: dict) -> Tensor:
         return views[self._image_key(views)]
 
+    def _training_debug_dir(self) -> Path:
+        checkpoint_callback = getattr(self.trainer, "checkpoint_callback", None)
+        checkpoint_dir = getattr(checkpoint_callback, "dirpath", None)
+        if checkpoint_dir is None:
+            checkpoint_dir = Path(self.trainer.default_root_dir) / "checkpoints"
+        return Path(checkpoint_dir) / "debug_train" / f"step_{self.global_step:0>6}"
+
+    @torch.no_grad()
+    def _save_training_debug_outputs(
+            self,
+            batch: BatchedExample,
+            output,
+            gaussians,
+            target_gt: Tensor,
+            context_extrinsics: Tensor,
+            context_intrinsics: Tensor,
+            encoder_output: dict,
+            image_shape: tuple[int, int],
+    ) -> None:
+        if self.global_rank != 0:
+            return
+        if self.train_cfg.debug_save_every_n_steps <= 0:
+            return
+        if self.global_step % self.train_cfg.debug_save_every_n_steps != 0:
+            return
+
+        debug_dir = self._training_debug_dir()
+        pred = output.color[0, 0].detach()
+        gt = target_gt[0, 0].detach()
+        depth = vis_depth_map(output.depth[0, 0].detach())
+        comparison_rows = [hcat(pred, gt, depth)]
+
+        if "context_lr_depth" in encoder_output:
+            if self.train_cfg.training_context:
+                context_rendered_depth = output.depth[:, :context_extrinsics.shape[1]]
+            else:
+                context_output = self.decoder.forward(
+                    gaussians,
+                    context_extrinsics,
+                    context_intrinsics,
+                    batch["context"]["near"],
+                    batch["context"]["far"],
+                    image_shape,
+                    depth_mode=self.train_cfg.depth_mode,
+                )
+                context_rendered_depth = context_output.depth
+
+            lr_depth_up = F.interpolate(
+                rearrange(
+                    encoder_output["context_lr_depth"][0].detach(),
+                    "v h w -> v () h w",
+                ),
+                size=context_rendered_depth.shape[-2:],
+                mode="bicubic",
+                align_corners=False,
+            ).squeeze(1)
+            for view_idx in range(context_extrinsics.shape[1]):
+                comparison_rows.append(
+                    hcat(
+                        vis_depth_map(lr_depth_up[view_idx]),
+                        vis_depth_map(context_rendered_depth[0, view_idx].detach()),
+                    )
+                )
+
+        save_image(add_border(vcat(*comparison_rows)), debug_dir / "comparison.png")
+
+        for view_idx in range(context_extrinsics.shape[1]):
+            export_ply(
+                context_extrinsics[0, view_idx].detach(),
+                gaussians.means[0].detach(),
+                gaussians.scales[0].detach(),
+                gaussians.rotations[0].detach(),
+                gaussians.harmonics[0].detach(),
+                gaussians.opacities[0].detach(),
+                debug_dir / f"context_view{view_idx}_gaussians.ply",
+            )
+
+    def _depth_consistency_loss(
+            self,
+            rendered_depth: Tensor,
+            lr_depth: Tensor,
+            near: Tensor,
+            far: Tensor,
+    ) -> Tensor:
+        if rendered_depth is None:
+            raise RuntimeError("Depth consistency requires decoder output.depth.")
+
+        target_depth = F.interpolate(
+            rearrange(lr_depth.detach(), "b v h w -> (b v) () h w"),
+            size=rendered_depth.shape[-2:],
+            mode="bicubic",
+            align_corners=False,
+        )
+        target_depth = rearrange(
+            target_depth.squeeze(1),
+            "(b v) h w -> b v h w",
+            b=rendered_depth.shape[0],
+            v=rendered_depth.shape[1],
+        )
+
+        near = near[..., None, None]
+        far = far[..., None, None]
+        valid = (
+            torch.isfinite(target_depth)
+            & torch.isfinite(rendered_depth)
+            & (target_depth > near)
+            & (target_depth < far)
+        )
+        if not valid.any():
+            return rendered_depth.new_zeros(())
+        return (rendered_depth - target_depth).abs()[valid].mean()
+
     def training_step(self, batch, batch_idx):
         # combine batch from different dataloaders
         if isinstance(batch, list):
@@ -281,6 +397,16 @@ class ModelWrapper(LightningModule):
             (h, w),
             depth_mode=self.train_cfg.depth_mode,
         )
+        self._save_training_debug_outputs(
+            batch,
+            output,
+            gaussians,
+            target_gt,
+            context_extrinsics,
+            context_intrinsics,
+            encoder_output,
+            (h, w),
+        )
 
         # Compute PSNR
         psnr = compute_psnr(
@@ -295,6 +421,37 @@ class ModelWrapper(LightningModule):
                 loss = loss_fn.forward(output.color, target_gt, gaussians, self.global_step)
                 self.log(f"loss/{loss_fn.name}", loss)
                 total_loss += loss
+
+        if (
+                self.train_cfg.depth_consistency_weight > 0
+                and "context_lr_depth" in encoder_output
+        ):
+            if self.train_cfg.training_context:
+                context_rendered_depth = output.depth[:, :v_cxt]
+            else:
+                context_output = self.decoder.forward(
+                    gaussians,
+                    context_extrinsics,
+                    context_intrinsics,
+                    batch["context"]["near"],
+                    batch["context"]["far"],
+                    (h, w),
+                    depth_mode=self.train_cfg.depth_mode,
+                )
+                context_rendered_depth = context_output.depth
+
+            depth_consistency_loss = self._depth_consistency_loss(
+                context_rendered_depth,
+                encoder_output["context_lr_depth"],
+                batch["context"]["near"],
+                batch["context"]["far"],
+            )
+            depth_consistency_loss = (
+                self.train_cfg.depth_consistency_weight
+                * depth_consistency_loss
+            )
+            self.log("loss/depth_consistency", depth_consistency_loss)
+            total_loss += depth_consistency_loss
 
         self.log("loss/total", total_loss)
 
@@ -967,6 +1124,8 @@ class ModelWrapper(LightningModule):
                 "resunet_token_fusion",
                 "anchor_feature_aggregator",
                 "anchor_geometry_encoder",
+                "anchor_litept_fusion",
+                "anchor_gaussian_decoder",
             )
             for name, param in self.named_parameters():
                 param.requires_grad = any(keyword in name for keyword in trainable_keywords)
@@ -987,15 +1146,15 @@ class ModelWrapper(LightningModule):
                 if not param.requires_grad:
                     continue
 
-                # Heads that are always treated as new
+                # Newly added refinement modules are trained with the full LR.
                 if any(
                     x in name
                     for x in [
-                        "gaussian_param_head",
-                        "intrinsic_encoder",
                         "resunet_token_fusion",
                         "anchor_feature_aggregator",
                         "anchor_geometry_encoder",
+                        "anchor_litept_fusion",
+                        "anchor_gaussian_decoder",
                     ]
                 ):
                     new_params.append(param)
