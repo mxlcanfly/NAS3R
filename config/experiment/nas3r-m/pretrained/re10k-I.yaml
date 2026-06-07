@@ -65,6 +65,7 @@ checkpointing:
   every_n_train_steps: 1000
   save_weights_only: false
   save_top_k: 1
+  resume_from_latest: false
 
 
 train:

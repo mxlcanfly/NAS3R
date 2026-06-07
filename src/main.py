@@ -1,4 +1,5 @@
 import os
+import re
 from pathlib import Path
 
 import hydra
@@ -47,6 +48,65 @@ def load_trusted_checkpoint(path: str | Path, map_location: str = "cpu"):
         return torch.load(path, map_location=map_location)
 
 
+def checkpoint_step(path: Path) -> int:
+    match = re.search(r"(?:step[=_-]?)(\d+)", path.stem)
+    return int(match.group(1)) if match is not None else -1
+
+
+def find_latest_checkpoint(path: Path) -> Path | None:
+    if path.is_file():
+        search_root = path.parent
+    elif path.name == "checkpoints":
+        search_root = path
+    else:
+        search_root = path / "checkpoints"
+
+    if not search_root.is_dir():
+        return None
+
+    checkpoints = [
+        candidate
+        for candidate in search_root.glob("*.ckpt")
+        if candidate.is_file()
+    ]
+    if not checkpoints:
+        return None
+    return max(
+        checkpoints,
+        key=lambda candidate: (checkpoint_step(candidate), candidate.stat().st_mtime_ns),
+    )
+
+
+def resolve_checkpoint_path(cfg, output_dir: Path) -> Path | None:
+    configured_path = update_checkpoint_path(cfg.checkpointing.load, cfg.wandb)
+    if not cfg.checkpointing.resume_from_latest:
+        return configured_path
+
+    if configured_path is not None:
+        latest = find_latest_checkpoint(configured_path)
+        if latest is None:
+            raise FileNotFoundError(
+                f"No checkpoint found for resume under {configured_path}."
+            )
+        return latest
+
+    candidates = []
+    for run_dir in output_dir.parent.iterdir():
+        if not run_dir.is_dir() or run_dir == output_dir:
+            continue
+        latest = find_latest_checkpoint(run_dir)
+        if latest is not None:
+            candidates.append(latest)
+
+    if not candidates:
+        print(cyan(f"No previous checkpoint found under {output_dir.parent}; starting fresh."))
+        return None
+    return max(
+        candidates,
+        key=lambda candidate: (candidate.stat().st_mtime_ns, checkpoint_step(candidate)),
+    )
+
+
 class IterationTimer(Callback):
     def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
         pl_module._step_start_time = time.time()
@@ -72,13 +132,29 @@ def train(cfg_dict: DictConfig):
     )
     print(cyan(f"Saving outputs to {output_dir}."))
 
+    checkpoint_path = resolve_checkpoint_path(cfg, output_dir)
+    should_resume = (
+        cfg.checkpointing.resume or cfg.checkpointing.resume_from_latest
+    )
+    if should_resume and checkpoint_path is not None:
+        print(cyan(f"Resuming training from {checkpoint_path}."))
+
     # Set up logging with wandb.
     callbacks = []
     if cfg_dict.wandb.mode != "disabled":
 
-        if cfg.checkpointing.load is not None and cfg.checkpointing.resume:
-            print(cfg.checkpointing.load, Path(cfg.checkpointing.load).parent.parent)
-            with open(Path(cfg.checkpointing.load).parent.parent / "wandb_run_id.txt") as f:
+        resume_run_dir = (
+            checkpoint_path.parent.parent
+            if should_resume and checkpoint_path is not None
+            else None
+        )
+        resume_id_path = (
+            resume_run_dir / "wandb_run_id.txt"
+            if resume_run_dir is not None
+            else None
+        )
+        if resume_id_path is not None and resume_id_path.is_file():
+            with resume_id_path.open() as f:
                 resume_id = f.read().strip()
             logger = WandbLogger(
                 project=cfg_dict.wandb.project,
@@ -138,9 +214,6 @@ def train(cfg_dict: DictConfig):
     )
     callbacks[-1].CHECKPOINT_EQUALS_CHAR = '_'
 
-    # Prepare the checkpoint for loading.
-    checkpoint_path = update_checkpoint_path(cfg.checkpointing.load, cfg.wandb)
-
     # This allows the current step to be shared with the data loader processes.
     step_tracker = StepTracker()
 
@@ -174,7 +247,11 @@ def train(cfg_dict: DictConfig):
         distiller = distiller.eval()
 
     # Load the encoder weights.
-    if cfg.model.encoder.pretrained_weights and cfg.mode == "train":
+    if (
+        cfg.model.encoder.pretrained_weights
+        and cfg.mode == "train"
+        and not (should_resume and checkpoint_path is not None)
+    ):
         weight_path = cfg.model.encoder.pretrained_weights
         ckpt_weights = load_trusted_checkpoint(weight_path, map_location='cpu')
         if 'model' in ckpt_weights:
@@ -203,7 +280,7 @@ def train(cfg_dict: DictConfig):
         'distiller': distiller,
     }
 
-    if cfg.mode == "train" and checkpoint_path is not None and not cfg.checkpointing.resume:
+    if cfg.mode == "train" and checkpoint_path is not None and not should_resume:
         # Just load model weights but no optimizer state
         print(f"Loading full model weights from {checkpoint_path}")
         model_wrapper = ModelWrapper.load_from_checkpoint(
@@ -224,7 +301,7 @@ def train(cfg_dict: DictConfig):
 
     if cfg.mode == "train":
         trainer.fit(model_wrapper, datamodule=data_module,
-                    ckpt_path=checkpoint_path if cfg.checkpointing.resume else None, )
+                    ckpt_path=checkpoint_path if should_resume else None, )
     else:
         model_wrapper.ckpt_path = checkpoint_path
         trainer.test(

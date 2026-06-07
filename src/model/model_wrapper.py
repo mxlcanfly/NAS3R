@@ -274,12 +274,46 @@ class ModelWrapper(LightningModule):
             depth_mode=self.train_cfg.depth_mode,
         )
 
-        # Compute PSNR
-        psnr = compute_psnr(
+        # Compute PSNR after refinement.
+        psnr_after_refine = compute_psnr(
             rearrange(target_gt, "b v c h w -> (b v) c h w"),
             rearrange(output.color, "b v c h w -> (b v) c h w"),
         )
-        self.log(f"train/psnr", psnr.mean())
+        mean_psnr_after_refine = psnr_after_refine.mean()
+        self.log("train/psnr", mean_psnr_after_refine)
+        self.log("train/psnr_after_refine", mean_psnr_after_refine)
+
+        should_print = (
+            self.global_rank == 0
+            and self.global_step % self.train_cfg.print_log_every_n_steps == 0
+        )
+        mean_psnr_before_refine = None
+        psnr_refine_gain = None
+        if should_print and "gaussians_before_refine" in encoder_output:
+            with torch.no_grad():
+                output_before_refine = self.decoder.forward(
+                    encoder_output["gaussians_before_refine"],
+                    extrinsics,
+                    intrinsics,
+                    near,
+                    far,
+                    (h, w),
+                    depth_mode=self.train_cfg.depth_mode,
+                )
+                psnr_before_refine = compute_psnr(
+                    rearrange(target_gt, "b v c h w -> (b v) c h w"),
+                    rearrange(
+                        output_before_refine.color,
+                        "b v c h w -> (b v) c h w",
+                    ),
+                )
+                mean_psnr_before_refine = psnr_before_refine.mean()
+                psnr_refine_gain = (
+                    mean_psnr_after_refine.detach() - mean_psnr_before_refine
+                )
+
+            self.log("train/psnr_before_refine", mean_psnr_before_refine)
+            self.log("train/psnr_refine_gain", psnr_refine_gain)
 
         # Compute and log loss.
         for loss_fn in self.losses:
@@ -302,10 +336,16 @@ class ModelWrapper(LightningModule):
             self.log(f"train/target_angular_error", target_rot_error)
             self.log(f"train/target_transl_error", target_transl_error)
 
-        if (
-                self.global_rank == 0
-                and self.global_step % self.train_cfg.print_log_every_n_steps == 0
-        ):
+        if should_print:
+            psnr_comparison = ""
+            if mean_psnr_before_refine is not None:
+                psnr_comparison = (
+                    f"psnr_before_refine = "
+                    f"{mean_psnr_before_refine.item():.6f}; "
+                    f"psnr_after_refine = "
+                    f"{mean_psnr_after_refine.item():.6f}; "
+                    f"psnr_refine_gain = {psnr_refine_gain.item():+.6f}; "
+                )
             print(
                 f"Epoch {self.current_epoch}; "
                 f"train step {self.global_step}; "
@@ -313,7 +353,7 @@ class ModelWrapper(LightningModule):
                 f"context = {batch['context']['index'].tolist()}; "
                 f"target = {batch['target']['index'].tolist()}; "
                 f"loss = {total_loss:.6f}; "
-                f"psnr = {psnr.mean().item():.6f}; "
+                f"{psnr_comparison}"
             )
         self.log("info/global_step", self.global_step)  # hack for ckpt monitor
 

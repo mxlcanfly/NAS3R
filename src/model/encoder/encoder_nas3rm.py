@@ -350,11 +350,16 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             encoder_output["context_render"] = context_render
             encoder_output["context_render_error"] = (context_image_rgb - context_render).abs()
 
+            gt_grad_x, gt_grad_y, context_tr_map = self.compute_gradient_map(context["image"])
+            ren_grad_x, ren_grad_y, reder_tr_map = self.compute_gradient_map(context_render)
+            tr_error_map = context_tr_map - reder_tr_map
+            encoder_output["context_tr_error_map"] = tr_error_map
+
             if self.litept_refiner is not None and resunet_feature_256 is not None:
                 gaussians = self.litept_refiner(
                     resunet_feature_256["context"],
                     encoder_output["context_render_error"],
-                    depths_per_view,
+                    tr_error_map,
                     point_map_from_depth,
                     context_extrinsics,
                     context_image_rgb,
@@ -445,3 +450,41 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             return batch
 
         return data_shim
+
+    def compute_gradient_map(self, img):
+        dim = img.dim()
+
+        # --- 1. 维度适配 (关键修改) ---
+        # 如果是 5D (B, V, C, H, W)，比如 (1, 2, 3, 224, 224)
+        # 我们需要把 B 和 V 合并，变成 (B*V, C, H, W) 才能做卷积
+        if dim == 5:
+            B, V, C, H, W = img.shape
+            img = img.view(B * V, C, H, W)
+        elif dim == 3:
+            img = img.unsqueeze(0)  # (C, H, W) -> (1, C, H, W)
+
+        # --- 2. 转灰度 ---
+        if img.shape[1] == 3:
+            img_gray = 0.299 * img[:, 0:1] + 0.587 * img[:, 1:2] + 0.114 * img[:, 2:3]
+        else:
+            img_gray = img
+
+        # --- 3. Sobel 算子 (保持不变) ---
+        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
+                               dtype=img.dtype, device=img.device).view(1, 1, 3, 3)
+        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]],
+                               dtype=img.dtype, device=img.device).view(1, 1, 3, 3)
+
+        grad_x = F.conv2d(img_gray, sobel_x, padding=1)
+        grad_y = F.conv2d(img_gray, sobel_y, padding=1)
+
+        magnitude = torch.sqrt(grad_x ** 2 + grad_y ** 2 + 1e-8)
+
+        # --- 4. 维度还原 (关键修改) ---
+        # 如果输入是 5D，输出也要还原回 (B, V, 1, H, W)
+        if dim == 5:
+            grad_x = grad_x.view(B, V, 1, H, W)
+            grad_y = grad_y.view(B, V, 1, H, W)
+            magnitude = magnitude.view(B, V, 1, H, W)
+
+        return grad_x, grad_y, magnitude
