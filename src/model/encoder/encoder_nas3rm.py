@@ -73,10 +73,10 @@ class EncoderNAS3RMCfg:
     use_anchor_feature_aggregator: bool = False
     anchor_feature_patch_size: int = 4
     anchor_feature_max_anchors: int | None = None
-    anchor_feature_patch_dim: int = 512
+    anchor_feature_patch_dim: int = 1024
     anchor_feature_num_views: int = 2
     anchor_feature_view_dim: int = 128
-    anchor_feature_out_dim: int = 256
+    anchor_feature_out_dim: int = 512
     use_anchor_geometry_query: bool = False
     anchor_geometry_num_frequencies: int = 6
     anchor_geometry_knn: int = 8
@@ -476,6 +476,14 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
         depth_all = [all_depth_res_i['depth'] for all_depth_res_i in all_depth_res]
         depth_all = torch.stack(depth_all, dim=1).squeeze(-1)  # [b, v, h, w]
         depths_per_view = depth_all
+        if fusion_features is not None:
+            fusion_features["combined256"] = (
+                self.resunet_token_fusion.build_combined_256(
+                    fusion_features,
+                    context_image_sr[:, :v_cxt],
+                    depths_per_view,
+                )
+            )
 
         context_extrinsics = pred_extrinsics[:, :v_cxt] if self.cfg.estimating_pose else context["extrinsics"]
         context_intrinsics = pred_intrinsics[:, :v_cxt] if self.cfg.estimating_focal else context["intrinsics"]
@@ -513,12 +521,12 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
                 anchors = anchors[:, :self.cfg.anchor_feature_max_anchors]
 
         if self.anchor_feature_sampler is not None:
-            if fusion_features is None or "256" not in fusion_features:
+            if fusion_features is None or "combined256" not in fusion_features:
                 raise RuntimeError("Anchor feature sampling requires use_resunet_fusion=True.")
 
             anchor_feature_samples = self.anchor_feature_sampler(
                 anchors,
-                fusion_features["256"],
+                fusion_features["combined256"],
                 context_extrinsics,
                 context_intrinsics,
             )
@@ -568,6 +576,7 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
                 anchors,
                 scaffold_gaussians,
                 anchor_spacing,
+                context_extrinsics,
             )
             final_gaussians = anchor_child_output["gaussians"]
 

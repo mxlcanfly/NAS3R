@@ -254,7 +254,7 @@ class ModelWrapper(LightningModule):
                     "v h w -> v () h w",
                 ),
                 size=context_rendered_depth.shape[-2:],
-                mode="bicubic",
+                mode="bilinear",
                 align_corners=False,
             ).squeeze(1)
             for view_idx in range(context_extrinsics.shape[1]):
@@ -291,7 +291,7 @@ class ModelWrapper(LightningModule):
         target_depth = F.interpolate(
             rearrange(lr_depth.detach(), "b v h w -> (b v) () h w"),
             size=rendered_depth.shape[-2:],
-            mode="bicubic",
+            mode="bilinear",
             align_corners=False,
         )
         target_depth = rearrange(
@@ -311,7 +311,7 @@ class ModelWrapper(LightningModule):
         )
         if not valid.any():
             return rendered_depth.new_zeros(())
-        return (rendered_depth - target_depth).abs()[valid].mean()
+        return F.l1_loss(rendered_depth[valid], target_depth[valid])
 
     def training_step(self, batch, batch_idx):
         # combine batch from different dataloaders
