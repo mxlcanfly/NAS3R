@@ -447,8 +447,6 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             rearrange(gaussian_params[..., 1:], "b v r srf c -> b v r srf () c"),
         )
         anchors = rearrange(depth_to_pts_all.squeeze(-2), "b v r xyz -> b (v r) xyz")
-        if self.cfg.anchor_feature_max_anchors is not None:
-            anchors = anchors[:, :self.cfg.anchor_feature_max_anchors]
 
         anchor_feature_samples = self.anchor_feature_sampler(
             anchors,
@@ -484,6 +482,8 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             scaffold_gaussians,
             anchor_spacing,
             context_extrinsics,
+            context_intrinsics,
+            context_image_sr.shape[-2:],
         )
         final_gaussians = anchor_child_output["gaussians"]
 

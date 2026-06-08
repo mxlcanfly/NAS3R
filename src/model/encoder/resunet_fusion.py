@@ -5,12 +5,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-from .multiview_feature_transformer import (
-    MultiViewFeatureTransformer,
-    feature_add_position_list,
-)
-
-
 class ResidualBlock(nn.Module):
     def __init__(
         self,
@@ -179,14 +173,7 @@ class HiSplatResUnetTokenFusion(nn.Module):
     ) -> None:
         super().__init__()
         self.resunet = ResUnet(dino_dim=token_ch, norm_layer=norm_layer, feature_dims=feature_dims)
-        self.transformer_attn_splits = 2
-        self.transformer = MultiViewFeatureTransformer(
-            num_layers=6,
-            d_model=feature_dims[-1],
-            attention_type="swin",
-            ffn_dim_expansion=4,
-        )
-        combined_channels = feature_dims[-1] + feature_dims[0] + 3 + 1
+        combined_channels = feature_dims[0] + 3 + 1
         condition_channels = 64
         self.condition_regressor = nn.Sequential(
             nn.Conv2d(combined_channels, condition_channels, 3, padding=1),
@@ -233,22 +220,8 @@ class HiSplatResUnetTokenFusion(nn.Module):
         images = rearrange(images, "b v c h w -> (b v) c h w")
         dino_feature = self.tokens_to_16x16(tokens)
         fused = self.resunet(images, dino_feature)
-        feature_64 = rearrange(fused[0], "(b v) c h w -> b v c h w", b=b, v=v)
-        transformer_input = [feature_64[:, view_idx] for view_idx in range(v)]
-        transformer_input = feature_add_position_list(
-            transformer_input,
-            self.transformer_attn_splits,
-            feature_64.size(2),
-        )
-        trans_feature_64 = self.transformer(
-            transformer_input,
-            self.transformer_attn_splits,
-        )
         return {
-            "64": feature_64,
-            "128": rearrange(fused[1], "(b v) c h w -> b v c h w", b=b, v=v),
             "256": rearrange(fused[2], "(b v) c h w -> b v c h w", b=b, v=v),
-            "trans64": torch.stack(trans_feature_64, dim=1),
         }
 
     def build_combined_256(
@@ -259,15 +232,6 @@ class HiSplatResUnetTokenFusion(nn.Module):
     ) -> torch.Tensor:
         cnn_feature_256 = fusion_features["256"]
         b, v, _, target_h, target_w = cnn_feature_256.shape
-        trans_feature = fusion_features["trans64"]
-        _, _, trans_channels, trans_h, trans_w = trans_feature.shape
-
-        trans_feature_256 = F.interpolate(
-            trans_feature.view(b * v, trans_channels, trans_h, trans_w),
-            size=(target_h, target_w),
-            mode="bilinear",
-            align_corners=True,
-        ).view(b, v, trans_channels, target_h, target_w)
 
         if sr_images.shape[-2:] == (target_h, target_w):
             sr_images_256 = sr_images
@@ -301,7 +265,6 @@ class HiSplatResUnetTokenFusion(nn.Module):
         dtype = cnn_feature_256.dtype
         combined = torch.cat(
             [
-                trans_feature_256.to(dtype=dtype),
                 cnn_feature_256,
                 sr_images_256.to(dtype=dtype),
                 lr_depth_256.to(dtype=dtype),

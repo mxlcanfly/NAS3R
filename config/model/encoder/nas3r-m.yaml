@@ -55,7 +55,6 @@ equal_view_intrinsics: true
 
 use_swinir_sr: true
 anchor_feature_patch_size: 6
-anchor_feature_max_anchors: null
 anchor_feature_patch_dim: 2304
 anchor_feature_num_views: 2
 anchor_feature_view_dim: 128
@@ -76,5 +75,5 @@ anchor_litept_token_dim: 512
 # Decode local residual Gaussians from aggregated anchor tokens.
 anchor_gaussian_decoder_hidden_dim: 512
 anchor_gaussians_per_anchor: 8
-anchor_scaffold_scale_divisor: 2.4
-anchor_scaffold_opacity_multiplier: 0.6
+anchor_scaffold_scale_divisor: 4.0
+anchor_scaffold_opacity_multiplier: 1.0

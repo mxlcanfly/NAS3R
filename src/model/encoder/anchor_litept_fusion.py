@@ -131,7 +131,6 @@ class AnchorLitePTFusion(nn.Module):
             nn.LayerNorm(token_dim),
             nn.GELU(),
         )
-        self.output_norm = nn.LayerNorm(token_dim)
 
     def _load_litept(
         self,
@@ -215,7 +214,7 @@ class AnchorLitePTFusion(nn.Module):
         anchors: torch.Tensor,
         anchor_features: torch.Tensor,
         geometry_query: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
+    ) -> torch.Tensor:
         tokens = self.input_proj(torch.cat([anchor_features, geometry_query], dim=-1))
         litept_delta = self._run_full_litept(anchors, tokens)
         if litept_delta is None:
@@ -226,6 +225,5 @@ class AnchorLitePTFusion(nn.Module):
                     f"{self.last_litept_error or 'LitePT is unavailable or input is not CUDA.'}"
                 )
             litept_delta = self.fallback_pt(anchors, tokens)
-        # tokens = self.output_norm(tokens + litept_delta)
         tokens = tokens + litept_delta
         return tokens

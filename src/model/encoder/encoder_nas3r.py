@@ -3,7 +3,6 @@ from dataclasses import dataclass
 from typing import Literal, Optional
 
 import torch
-import torch.nn.functional as F
 from einops import rearrange
 from jaxtyping import Float
 from torch import Tensor, nn
@@ -27,9 +26,7 @@ from .common.gaussian_adapter import GaussianAdapter, GaussianAdapterCfg, Unifie
 from .encoder import Encoder
 from .visualization.encoder_visualizer_epipolar_cfg import EncoderVisualizerEpipolarCfg
 from ...misc.cam_utils import convert_pose_to_4x4, unproject_depth_map_to_point_map_batch
-from ...geometry.projection import homogenize_points, project_camera_space, transform_world2cam
 from .heads.pose_head import PoseHeadCfg
-from .local_entropy import compute_local_shannon_entropy
 
 inf = float('inf')
 
@@ -68,60 +65,28 @@ class EncoderNAS3RMCfg:
 
     use_swinir_sr: bool = True
     swinir_weight_path: str = "/space0/mengxl/NAS3R-master/pretrained_weights/001_classicalSR_DF2K_s64w8_SwinIR-M_x4.pth"
-    use_resunet_fusion: bool = True
-    use_anchor_feature_sampler: bool = False
-    use_anchor_feature_aggregator: bool = False
     anchor_feature_patch_size: int = 4
-    anchor_feature_max_anchors: int | None = None
     anchor_feature_patch_dim: int = 1024
     anchor_feature_num_views: int = 2
     anchor_feature_view_dim: int = 128
     anchor_feature_out_dim: int = 512
-    use_anchor_geometry_query: bool = False
     anchor_geometry_num_frequencies: int = 6
     anchor_geometry_knn: int = 8
     anchor_geometry_query_dim: int = 256
     anchor_geometry_hidden_dim: int = 512
     anchor_geometry_knn_chunk_size: int = 256
-    use_anchor_litept_fusion: bool = False
     anchor_litept_path: str = "/space0/mengxl/LitePT-main"
-    anchor_litept_use_full: bool = True
     anchor_litept_grid_size: float = 0.02
     anchor_litept_token_dim: int = 512
-    anchor_litept_output_dim: int = 128
-    anchor_litept_enc_channels: list[int] | None = None
-    anchor_litept_enc_num_head: list[int] | None = None
-    anchor_litept_dec_channels: list[int] | None = None
-    anchor_litept_dec_num_head: list[int] | None = None
-    anchor_litept_fallback_blocks: int = 2
-    anchor_litept_fallback_knn: int = 16
-    anchor_litept_fallback_chunk_size: int = 1024
-    use_anchor_gaussian_decoder: bool = True
     anchor_gaussian_decoder_hidden_dim: int = 512
     anchor_gaussians_per_anchor: int = 8
-    anchor_scaffold_scale_divisor: float = 2.4
-    anchor_scaffold_opacity_multiplier: float = 0.6
-    anchor_child_offset_radius: float = 0.75
-    anchor_child_ring_radius_beta: float = 0.2
-    anchor_child_scale_residual_range: float = 0.5
-    anchor_child_opacity_residual_range: float = 2.0
-    anchor_child_rotation_residual_range: float = 0.1
-    anchor_child_sh_residual_range: float = 0.1
-    entropy_num_gray_levels: int = 256
-    entropy_window_size: int = 9
+    anchor_scaffold_scale_divisor: float = 4.0
+    anchor_scaffold_opacity_multiplier: float = 1.0
 
     depth_activation: str = 'sigmoid'
 
     equal_fxfy: bool = True
     equal_view_intrinsics: bool = True
-
-
-def rearrange_head(feat, patch_size, H, W):
-    B = feat.shape[0]
-    feat = feat.transpose(-1, -2).view(B, -1, H // patch_size, W // patch_size)
-    feat = F.pixel_shuffle(feat, patch_size)  # B,D,H,W
-    feat = rearrange(feat, "b d h w -> b (h w) d")
-    return feat
 
 
 def flatten_gaussians(gaussians) -> Gaussians:
@@ -177,15 +142,11 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
         )
         self.resunet_token_fusion = (
             HiSplatResUnetTokenFusion(token_dim=self.backbone.dec_embed_dim)
-            if cfg.use_resunet_fusion
-            else None
         )
         self.anchor_feature_sampler = (
             AnchorFeatureSampler(
                 patch_size=cfg.anchor_feature_patch_size,
             )
-            if cfg.use_anchor_feature_sampler
-            else None
         )
         self.anchor_feature_aggregator = (
             AnchorFeatureAggregator(
@@ -194,8 +155,6 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
                 view_dim=cfg.anchor_feature_view_dim,
                 out_dim=cfg.anchor_feature_out_dim,
             )
-            if cfg.use_anchor_feature_aggregator
-            else None
         )
         self.anchor_geometry_encoder = (
             AnchorGeometryEncoder(
@@ -205,8 +164,6 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
                 hidden_dim=cfg.anchor_geometry_hidden_dim,
                 knn_chunk_size=cfg.anchor_geometry_knn_chunk_size,
             )
-            if cfg.use_anchor_geometry_query
-            else None
         )
         self.anchor_litept_fusion = (
             AnchorLitePTFusion(
@@ -214,107 +171,24 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
                 geometry_dim=cfg.anchor_geometry_query_dim,
                 token_dim=cfg.anchor_litept_token_dim,
                 litept_path=cfg.anchor_litept_path,
-                use_full_litept=cfg.anchor_litept_use_full,
+                use_full_litept=True,
                 litept_grid_size=cfg.anchor_litept_grid_size,
-                litept_output_dim=cfg.anchor_litept_output_dim,
-                litept_enc_channels=tuple(
-                    cfg.anchor_litept_enc_channels
-                    or [64, 128, 256, 384, 504]
-                ),
-                litept_enc_num_head=tuple(
-                    cfg.anchor_litept_enc_num_head
-                    or [4, 8, 8, 16, 28]
-                ),
-                litept_dec_channels=tuple(
-                    cfg.anchor_litept_dec_channels
-                    or [128, 128, 256, 384]
-                ),
-                litept_dec_num_head=tuple(
-                    cfg.anchor_litept_dec_num_head
-                    or [8, 8, 8, 12]
-                ),
-                fallback_blocks=cfg.anchor_litept_fallback_blocks,
-                fallback_knn=cfg.anchor_litept_fallback_knn,
-                fallback_chunk_size=cfg.anchor_litept_fallback_chunk_size,
+                litept_output_dim=128,
+                litept_enc_channels=(64, 128, 256, 384, 504),
+                litept_enc_num_head=(4, 8, 8, 16, 28),
+                litept_dec_channels=(128, 128, 256, 384),
+                litept_dec_num_head=(8, 8, 8, 12),
+                fallback_blocks=0,
             )
-            if cfg.use_anchor_litept_fusion
-            else None
         )
         self.anchor_gaussian_decoder = (
             AnchorGaussianResidualDecoder(
                 token_dim=cfg.anchor_litept_token_dim,
                 gaussians_per_anchor=cfg.anchor_gaussians_per_anchor,
                 sh_degree=cfg.gaussian_adapter.sh_degree,
-                offset_radius=cfg.anchor_child_offset_radius,
-                ring_radius_beta=cfg.anchor_child_ring_radius_beta,
-                scale_residual_range=cfg.anchor_child_scale_residual_range,
-                opacity_residual_range=cfg.anchor_child_opacity_residual_range,
-                rotation_residual_range=cfg.anchor_child_rotation_residual_range,
-                sh_residual_range=cfg.anchor_child_sh_residual_range,
                 hidden_dim=cfg.anchor_gaussian_decoder_hidden_dim,
             )
-            if cfg.use_anchor_gaussian_decoder
-            else None
         )
-
-    def _sample_child_entropy_from_source_view(
-        self,
-        child_means: torch.Tensor,
-        entropy_map: torch.Tensor,
-        extrinsics: torch.Tensor,
-        intrinsics: torch.Tensor,
-        num_views: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        b, num_anchors, num_children, _ = child_means.shape
-        if num_anchors % num_views != 0:
-            raise ValueError(
-                "Expected anchors to be grouped by source view, got "
-                f"{num_anchors} anchors and {num_views} views."
-            )
-        anchors_per_view = num_anchors // num_views
-        child_means = rearrange(
-            child_means,
-            "b (v r) k xyz -> b v (r k) xyz",
-            v=num_views,
-            r=anchors_per_view,
-        )
-
-        cam_points = transform_world2cam(
-            homogenize_points(child_means),
-            extrinsics[:, :, None],
-        )[..., :-1]
-        camera_depth = cam_points[..., -1]
-        projected_xy = project_camera_space(cam_points, intrinsics[:, :, None])
-        valid = (
-            (camera_depth > 1e-6)
-            & (projected_xy[..., 0] >= 0)
-            & (projected_xy[..., 0] <= 1)
-            & (projected_xy[..., 1] >= 0)
-            & (projected_xy[..., 1] <= 1)
-        )
-
-        sampled = F.grid_sample(
-            rearrange(entropy_map, "b v h w -> (b v) 1 h w"),
-            rearrange(projected_xy * 2 - 1, "b v m xy -> (b v) m () xy"),
-            mode="bilinear",
-            padding_mode="zeros",
-            align_corners=True,
-        )
-        sampled = rearrange(
-            sampled.squeeze(1).squeeze(-1),
-            "(b v) (r k) -> b (v r) k",
-            b=b,
-            v=num_views,
-            r=anchors_per_view,
-            k=num_children,
-        )
-        valid = rearrange(
-            valid,
-            "b v (r k) -> b (v r) k",
-            r=anchors_per_view,
-            k=num_children,
-        )
-        return sampled, valid
 
     def set_depth_head(self, output_mode, head_type, landscape_only, depth_mode, conf_mode):
         self.backbone.depth_mode = depth_mode
@@ -382,14 +256,8 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             self.swinir_upsampler(context_image)
             if self.swinir_upsampler is not None
             else context["image"]
-        )
-        sr_entropy = compute_local_shannon_entropy(
-            context_image_sr,
-            num_gray_levels=self.cfg.entropy_num_gray_levels,
-            window_size=self.cfg.entropy_window_size,
-        )
+        ) # (0，1)
 
-        device = context_image.device
         b, v_cxt, _, h, w = context_image.shape
 
         if target is not None:
@@ -410,12 +278,10 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             out = self.backbone(context_input)
 
         dec_feat, shape, images = out['dec_feat'], out['shape'], out['images']
-        fusion_features = None
-        if self.resunet_token_fusion is not None:
-            fusion_features = self.resunet_token_fusion(
-                context_image_sr[:, :v_cxt],
-                dec_feat[-1][:, :v_cxt],
-            )
+        fusion_features = self.resunet_token_fusion(
+            context_image_sr[:, :v_cxt],
+            dec_feat[-1][:, :v_cxt],
+        )
 
         with torch.amp.autocast('cuda', enabled=False):
             all_other_params = []
@@ -478,14 +344,13 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
         depth_all = [all_depth_res_i['depth'] for all_depth_res_i in all_depth_res]
         depth_all = torch.stack(depth_all, dim=1).squeeze(-1)  # [b, v, h, w]
         depths_per_view = depth_all
-        if fusion_features is not None:
-            fusion_features["combined256"] = (
-                self.resunet_token_fusion.build_combined_256(
-                    fusion_features,
-                    context_image_sr[:, :v_cxt],
-                    depths_per_view,
-                )
+        fusion_features["combined256"] = (
+            self.resunet_token_fusion.build_combined_256(
+                fusion_features,
+                context_image_sr[:, :v_cxt],
+                depths_per_view,
             )
+        )
 
         context_extrinsics = pred_extrinsics[:, :v_cxt] if self.cfg.estimating_pose else context["extrinsics"]
         context_intrinsics = pred_intrinsics[:, :v_cxt] if self.cfg.estimating_focal else context["intrinsics"]
@@ -510,83 +375,51 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             self.map_pdf_to_opacity(densities, global_step),
             rearrange(gaussian_params[..., 1:], "b v r srf c -> b v r srf () c"),
         )
-        anchor_feature_samples = None
-        anchor_features = None
-        anchor_litept_output = None
-        anchor_child_output = None
-        anchor_geometry_query = None
-        anchor_spacing = None
-        anchors = None
-        if self.anchor_feature_sampler is not None or self.anchor_geometry_encoder is not None:
-            anchors = rearrange(depth_to_pts_all.squeeze(-2), "b v r xyz -> b (v r) xyz")
-            if self.cfg.anchor_feature_max_anchors is not None:
-                anchors = anchors[:, :self.cfg.anchor_feature_max_anchors]
+        anchors = rearrange(depth_to_pts_all.squeeze(-2), "b v r xyz -> b (v r) xyz")
 
-        if self.anchor_feature_sampler is not None:
-            if fusion_features is None or "combined256" not in fusion_features:
-                raise RuntimeError("Anchor feature sampling requires use_resunet_fusion=True.")
+        anchor_feature_samples = self.anchor_feature_sampler(
+            anchors,
+            fusion_features["combined256"],
+            context_extrinsics,
+            context_intrinsics,
+        )
+        anchor_features = self.anchor_feature_aggregator(anchor_feature_samples)
 
-            anchor_feature_samples = self.anchor_feature_sampler(
-                anchors,
-                fusion_features["combined256"],
-                context_extrinsics,
-                context_intrinsics,
-            )
-            if self.anchor_feature_aggregator is not None:
-                anchor_features = self.anchor_feature_aggregator(anchor_feature_samples)
-        if self.anchor_geometry_encoder is not None:
-            geometry_encoding = self.anchor_geometry_encoder(anchors)
-            anchor_geometry_query = geometry_encoding.query
-            anchor_spacing = geometry_encoding.spacing
-        if self.anchor_litept_fusion is not None:
-            if anchor_features is None:
-                raise RuntimeError(
-                    "Anchor LitePT fusion requires use_anchor_feature_aggregator=True."
-                )
-            if anchor_geometry_query is None:
-                raise RuntimeError(
-                    "Anchor LitePT fusion requires use_anchor_geometry_query=True."
-                )
-            anchor_litept_output = self.anchor_litept_fusion(
-                anchors,
-                anchor_features,
-                anchor_geometry_query,
-            )
+        geometry_encoding = self.anchor_geometry_encoder(anchors)
+        anchor_geometry_query = geometry_encoding.query
+        anchor_spacing = geometry_encoding.spacing
+
+        anchor_litept_output = self.anchor_litept_fusion(
+            anchors,
+            anchor_features,
+            anchor_geometry_query,
+        )
         scaffold_gaussians = scale_gaussian_scaffold(
             flatten_gaussians(gaussians),
             scale_divisor=self.cfg.anchor_scaffold_scale_divisor,
             opacity_multiplier=self.cfg.anchor_scaffold_opacity_multiplier,
         )
-        final_gaussians = scaffold_gaussians
-        if self.anchor_gaussian_decoder is not None:
-            if anchor_litept_output is None:
-                raise RuntimeError(
-                    "Anchor Gaussian decoder requires use_anchor_litept_fusion=True."
-                )
-            if anchors is None or anchor_spacing is None:
-                raise RuntimeError(
-                    "Anchor Gaussian decoder requires anchor geometry encoding."
-                )
-            if scaffold_gaussians.means.shape[1] != anchors.shape[1]:
-                raise RuntimeError(
-                    "Anchor Gaussian decoder expects one scaffold Gaussian per anchor, "
-                    f"got {scaffold_gaussians.means.shape[1]} Gaussians and "
-                    f"{anchors.shape[1]} anchors."
-                )
-            anchor_child_output = self.anchor_gaussian_decoder(
-                anchor_litept_output,
-                anchors,
-                scaffold_gaussians,
-                anchor_spacing,
-                context_extrinsics,
+        if scaffold_gaussians.means.shape[1] != anchors.shape[1]:
+            raise RuntimeError(
+                "Anchor Gaussian decoder expects one scaffold Gaussian per anchor, "
+                f"got {scaffold_gaussians.means.shape[1]} Gaussians and "
+                f"{anchors.shape[1]} anchors."
             )
-            final_gaussians = anchor_child_output["gaussians"]
+        anchor_child_output = self.anchor_gaussian_decoder(
+            anchor_litept_output,
+            anchors,
+            scaffold_gaussians,
+            anchor_spacing,
+            context_extrinsics,
+            context_intrinsics,
+            context_image_sr.shape[-2:],
+        )
+        final_gaussians = anchor_child_output["gaussians"]
 
         # Dump visualizations if needed.
         if visualization_dump is not None:
             visualization_dump["depth"] = depths_per_view
-            if fusion_features is not None:
-                visualization_dump["fusion_features"] = fusion_features
+            visualization_dump["fusion_features"] = fusion_features
 
             visualization_dump["scales"] = rearrange(
                 gaussians.scales, "b v r srf spp xyz -> b (v r srf spp) xyz"
@@ -602,25 +435,7 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             )  # (b, v, h, w, 1, 1)
 
         encoder_output = dict()
-        encoder_output["sr_entropy"] = sr_entropy
         encoder_output["context_lr_depth"] = depths_per_view
-        if fusion_features is not None:
-            encoder_output["fusion_features"] = fusion_features
-        if anchor_feature_samples is not None:
-            encoder_output["anchor_feature_samples"] = anchor_feature_samples
-        if anchor_features is not None:
-            encoder_output["anchor_features"] = anchor_features
-        if anchor_litept_output is not None:
-            encoder_output["anchor_litept_features"] = anchor_litept_output
-        if anchor_child_output is not None:
-            encoder_output["anchor_child_offsets"] = anchor_child_output["offsets"]
-            encoder_output["anchor_child_raw_opacity"] = anchor_child_output["raw_opacity"]
-            encoder_output["anchor_child_opacities"] = anchor_child_output["opacities"]
-        if anchors is not None:
-            encoder_output["anchors"] = anchors
-        if anchor_geometry_query is not None:
-            encoder_output["anchor_geometry_query"] = anchor_geometry_query
-            encoder_output["anchor_spacing"] = anchor_spacing
 
         encoder_output["gaussians"] = final_gaussians
 

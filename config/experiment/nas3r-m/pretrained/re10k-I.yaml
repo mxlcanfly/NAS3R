@@ -53,7 +53,7 @@ optimizer:
 
 data_loader:
   train:
-    batch_size: 16
+    batch_size: 32
 
 trainer:
   max_steps: 75000

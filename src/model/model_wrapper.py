@@ -208,6 +208,24 @@ class ModelWrapper(LightningModule):
             checkpoint_dir = Path(self.trainer.default_root_dir) / "checkpoints"
         return Path(checkpoint_dir) / "debug_train" / f"step_{self.global_step:0>6}"
 
+    def _debug_panel(self, image: Tensor, label: str) -> Tensor:
+        image = image.detach().float().clip(0, 1)
+        return add_label(add_border(image, 2, 0), label, font_size=18)
+
+    def _debug_error_map(self, error: Tensor, color_map: str = "magma") -> Tensor:
+        error = error.detach().float()
+        finite = torch.isfinite(error)
+        if not finite.any():
+            normalized = torch.zeros_like(error)
+        else:
+            valid = error[finite]
+            scale = valid.quantile(0.99).clamp_min(1e-6)
+            normalized = (error / scale).nan_to_num().clip(0, 1)
+        return apply_color_map_to_image(normalized, color_map)
+
+    def _debug_rgb_error(self, pred: Tensor, gt: Tensor) -> Tensor:
+        return self._debug_error_map((pred.detach() - gt.detach()).abs().mean(dim=0))
+
     @torch.no_grad()
     def _save_training_debug_outputs(
             self,
@@ -228,14 +246,51 @@ class ModelWrapper(LightningModule):
             return
 
         debug_dir = self._training_debug_dir()
-        pred = output.color[0, 0].detach()
-        gt = target_gt[0, 0].detach()
-        depth = vis_depth_map(output.depth[0, 0].detach())
-        comparison_rows = [hcat(pred, gt, depth)]
+        debug_dir.mkdir(exist_ok=True, parents=True)
+        num_context_views = context_extrinsics.shape[1]
+
+        rendered_rows = []
+        for view_idx in range(output.color.shape[1]):
+            if self.train_cfg.training_context and view_idx < num_context_views:
+                view_label = f"context view {view_idx}"
+            else:
+                target_idx = view_idx - num_context_views if self.train_cfg.training_context else view_idx
+                view_label = f"target view {target_idx}"
+
+            row_panels = [
+                self._debug_panel(target_gt[0, view_idx], f"{view_label} GT RGB"),
+                self._debug_panel(output.color[0, view_idx], f"{view_label} rendered RGB"),
+                self._debug_panel(
+                    self._debug_rgb_error(output.color[0, view_idx], target_gt[0, view_idx]),
+                    f"{view_label} RGB abs error",
+                ),
+            ]
+            if output.depth is not None:
+                row_panels.append(
+                    self._debug_panel(
+                        vis_depth_map(output.depth[0, view_idx].detach()),
+                        f"{view_label} rendered depth",
+                    )
+                )
+            rendered_rows.append(hcat(*row_panels, align="top"))
+
+        comparison_sections = []
+        if rendered_rows:
+            rendered_section = add_label(
+                vcat(*rendered_rows, align="left"),
+                "Rendered supervision views",
+                font_size=22,
+            )
+            comparison_sections.append(rendered_section)
 
         if "context_lr_depth" in encoder_output:
             if self.train_cfg.training_context:
-                context_rendered_depth = output.depth[:, :context_extrinsics.shape[1]]
+                context_rendered_depth = (
+                    output.depth[:, :context_extrinsics.shape[1]]
+                    if output.depth is not None
+                    else None
+                )
+                context_rendered_color = output.color[:, :context_extrinsics.shape[1]]
             else:
                 context_output = self.decoder.forward(
                     gaussians,
@@ -247,25 +302,76 @@ class ModelWrapper(LightningModule):
                     depth_mode=self.train_cfg.depth_mode,
                 )
                 context_rendered_depth = context_output.depth
+                context_rendered_color = context_output.color
 
-            lr_depth_up = F.interpolate(
-                rearrange(
-                    encoder_output["context_lr_depth"][0].detach(),
-                    "v h w -> v () h w",
-                ),
-                size=context_rendered_depth.shape[-2:],
-                mode="bilinear",
-                align_corners=False,
-            ).squeeze(1)
-            for view_idx in range(context_extrinsics.shape[1]):
-                comparison_rows.append(
-                    hcat(
-                        vis_depth_map(lr_depth_up[view_idx]),
-                        vis_depth_map(context_rendered_depth[0, view_idx].detach()),
+            if context_rendered_depth is not None:
+                lr_depth_up = F.interpolate(
+                    rearrange(
+                        encoder_output["context_lr_depth"][0].detach(),
+                        "v h w -> v () h w",
+                    ),
+                    size=context_rendered_depth.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                ).squeeze(1)
+
+                context_depth_rows = []
+                for view_idx in range(context_extrinsics.shape[1]):
+                    depth_error = (context_rendered_depth[0, view_idx].detach() - lr_depth_up[view_idx]).abs()
+                    context_depth_rows.append(
+                        hcat(
+                            self._debug_panel(
+                                vis_depth_map(lr_depth_up[view_idx]),
+                                f"context view {view_idx} LR depth upsampled",
+                            ),
+                            self._debug_panel(
+                                vis_depth_map(context_rendered_depth[0, view_idx].detach()),
+                                f"context view {view_idx} rendered depth",
+                            ),
+                            self._debug_panel(
+                                self._debug_error_map(depth_error, "magma"),
+                                f"context view {view_idx} depth abs error",
+                            ),
+                            align="top",
+                        )
                     )
+                context_depth_section = add_label(
+                    vcat(*context_depth_rows, align="left"),
+                    "Context depth consistency",
+                    font_size=22,
                 )
+                comparison_sections.append(context_depth_section)
 
-        save_image(add_border(vcat(*comparison_rows)), debug_dir / "comparison.png")
+            if context_rendered_color is not None:
+                context_rgb_rows = []
+                for view_idx in range(context_extrinsics.shape[1]):
+                    context_gt = batch["context"]["image"][0, view_idx]
+                    context_rgb_rows.append(
+                        hcat(
+                            self._debug_panel(context_gt, f"context view {view_idx} GT RGB"),
+                            self._debug_panel(
+                                context_rendered_color[0, view_idx],
+                                f"context view {view_idx} rendered RGB",
+                            ),
+                            self._debug_panel(
+                                self._debug_rgb_error(context_rendered_color[0, view_idx], context_gt),
+                                f"context view {view_idx} RGB abs error",
+                            ),
+                            align="top",
+                        ),
+                    )
+                context_rgb_section = add_label(
+                    vcat(*context_rgb_rows, align="left"),
+                    "Context RGB render check",
+                    font_size=22,
+                )
+                save_image(add_border(context_rgb_section), debug_dir / "context_render_rgb.png")
+
+        if comparison_sections:
+            save_image(
+                add_border(vcat(*comparison_sections, align="left")),
+                debug_dir / "comparison.png",
+            )
 
         for view_idx in range(context_extrinsics.shape[1]):
             export_ply(
