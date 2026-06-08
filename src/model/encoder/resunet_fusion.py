@@ -226,8 +226,6 @@ class HiSplatResUnetTokenFusion(nn.Module):
         token_map = self.proj(token_map)
         token_map = self.upsampler0(token_map)
         token_map = self.upsampler1(token_map)
-        if token_map.shape[-2:] != (16, 16):
-            token_map = F.interpolate(token_map, size=(16, 16), mode="bilinear", align_corners=False)
         return token_map
 
     def forward(self, images: torch.Tensor, tokens: torch.Tensor) -> dict[str, torch.Tensor]:
