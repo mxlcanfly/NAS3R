@@ -59,6 +59,9 @@ anchor_feature_patch_dim: 2304
 anchor_feature_num_views: 2
 anchor_feature_view_dim: 128
 anchor_feature_out_dim: 512
+entropy_num_gray_levels: 256
+entropy_window_size: 9
+entropy_topk_ratio: 0.4
 
 # q_geo = MLP([Fourier(anchor_xyz), log(local_knn_spacing)])
 anchor_geometry_num_frequencies: 6
@@ -77,3 +80,6 @@ anchor_gaussian_decoder_hidden_dim: 512
 anchor_gaussians_per_anchor: 8
 anchor_scaffold_scale_divisor: 4.0
 anchor_scaffold_opacity_multiplier: 1.0
+anchor_opacity_modulator_hidden_dim: 32
+anchor_opacity_initial_parent_weight: 0.8
+anchor_child_camera_offset_beta: 0.1

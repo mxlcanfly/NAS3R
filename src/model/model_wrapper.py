@@ -91,7 +91,7 @@ class TrainCfg:
 
     pretrain_camera_head: bool = False
     refine_only: bool = False
-    depth_consistency_weight: float = 0.0
+    depth_smoothness_weight: float = 0.0
     debug_save_every_n_steps: int = 0
 
 
@@ -169,6 +169,8 @@ class ModelWrapper(LightningModule):
         self.encoder = encoder
         self.encoder_visualizer = encoder_visualizer
         self.decoder = decoder
+        if hasattr(self.encoder, "set_context_renderer"):
+            self.encoder.set_context_renderer(self.decoder)
         self.data_shim = get_data_shim(self.encoder)
         self.losses = nn.ModuleList(losses)
 
@@ -384,40 +386,77 @@ class ModelWrapper(LightningModule):
                 debug_dir / f"context_view{view_idx}_gaussians.ply",
             )
 
-    def _depth_consistency_loss(
+    def _depth_smoothness_loss(
             self,
             rendered_depth: Tensor,
-            lr_depth: Tensor,
+            reference_image: Tensor,
             near: Tensor,
             far: Tensor,
     ) -> Tensor:
         if rendered_depth is None:
-            raise RuntimeError("Depth consistency requires decoder output.depth.")
+            raise RuntimeError("Depth smoothness requires decoder output.depth.")
 
-        target_depth = F.interpolate(
-            rearrange(lr_depth.detach(), "b v h w -> (b v) () h w"),
-            size=rendered_depth.shape[-2:],
-            mode="bilinear",
-            align_corners=False,
-        )
-        target_depth = rearrange(
-            target_depth.squeeze(1),
-            "(b v) h w -> b v h w",
-            b=rendered_depth.shape[0],
-            v=rendered_depth.shape[1],
-        )
+        b, v, h, w = rendered_depth.shape
+        if reference_image.shape[-2:] != (h, w):
+            reference_image = F.interpolate(
+                rearrange(reference_image, "b v c h w -> (b v) c h w"),
+                size=(h, w),
+                mode="bilinear",
+                align_corners=False,
+            )
+            reference_image = rearrange(
+                reference_image,
+                "(b v) c h w -> b v c h w",
+                b=b,
+                v=v,
+            )
 
         near = near[..., None, None]
         far = far[..., None, None]
         valid = (
-            torch.isfinite(target_depth)
-            & torch.isfinite(rendered_depth)
-            & (target_depth > near)
-            & (target_depth < far)
+            torch.isfinite(rendered_depth)
+            & (rendered_depth > near)
+            & (rendered_depth < far)
         )
         if not valid.any():
             return rendered_depth.new_zeros(())
-        return F.l1_loss(rendered_depth[valid], target_depth[valid])
+
+        inverse_depth = torch.where(
+            valid,
+            rendered_depth.clamp_min(1e-6).reciprocal(),
+            torch.zeros_like(rendered_depth),
+        )
+        valid_count = valid.sum(dim=(-2, -1), keepdim=True).clamp_min(1)
+        mean_inverse_depth = (
+            inverse_depth.sum(dim=(-2, -1), keepdim=True) / valid_count
+        ).clamp_min(1e-6)
+        inverse_depth = inverse_depth / mean_inverse_depth
+
+        depth_dx = (inverse_depth[..., :, 1:] - inverse_depth[..., :, :-1]).abs()
+        depth_dy = (inverse_depth[..., 1:, :] - inverse_depth[..., :-1, :]).abs()
+        image_dx = (
+            reference_image[..., :, 1:] - reference_image[..., :, :-1]
+        ).abs().mean(dim=2)
+        image_dy = (
+            reference_image[..., 1:, :] - reference_image[..., :-1, :]
+        ).abs().mean(dim=2)
+
+        valid_dx = valid[..., :, 1:] & valid[..., :, :-1]
+        valid_dy = valid[..., 1:, :] & valid[..., :-1, :]
+        weighted_dx = depth_dx * torch.exp(-10 * image_dx)
+        weighted_dy = depth_dy * torch.exp(-10 * image_dy)
+
+        loss_x = (
+            weighted_dx[valid_dx].mean()
+            if valid_dx.any()
+            else rendered_depth.new_zeros(())
+        )
+        loss_y = (
+            weighted_dy[valid_dy].mean()
+            if valid_dy.any()
+            else rendered_depth.new_zeros(())
+        )
+        return loss_x + loss_y
 
     def training_step(self, batch, batch_idx):
         # combine batch from different dataloaders
@@ -529,8 +568,7 @@ class ModelWrapper(LightningModule):
                 total_loss += loss
 
         if (
-                self.train_cfg.depth_consistency_weight > 0
-                and "context_lr_depth" in encoder_output
+                self.train_cfg.depth_smoothness_weight > 0
         ):
             if self.train_cfg.training_context:
                 context_rendered_depth = output.depth[:, :v_cxt]
@@ -546,18 +584,18 @@ class ModelWrapper(LightningModule):
                 )
                 context_rendered_depth = context_output.depth
 
-            depth_consistency_loss = self._depth_consistency_loss(
+            depth_smoothness_loss = self._depth_smoothness_loss(
                 context_rendered_depth,
-                encoder_output["context_lr_depth"],
+                context_image,
                 batch["context"]["near"],
                 batch["context"]["far"],
             )
-            depth_consistency_loss = (
-                self.train_cfg.depth_consistency_weight
-                * depth_consistency_loss
+            depth_smoothness_loss = (
+                self.train_cfg.depth_smoothness_weight
+                * depth_smoothness_loss
             )
-            self.log("loss/depth_consistency", depth_consistency_loss)
-            total_loss += depth_consistency_loss
+            self.log("loss/depth_smoothness", depth_smoothness_loss)
+            total_loss += depth_smoothness_loss
 
         self.log("loss/total", total_loss)
 
@@ -1231,6 +1269,7 @@ class ModelWrapper(LightningModule):
                 "anchor_feature_aggregator",
                 "anchor_geometry_encoder",
                 "anchor_litept_fusion",
+                "anchor_opacity_modulator",
                 "anchor_gaussian_decoder",
             )
             for name, param in self.named_parameters():
@@ -1260,6 +1299,7 @@ class ModelWrapper(LightningModule):
                         "anchor_feature_aggregator",
                         "anchor_geometry_encoder",
                         "anchor_litept_fusion",
+                        "anchor_opacity_modulator",
                         "anchor_gaussian_decoder",
                     ]
                 ):

@@ -1,3 +1,4 @@
+import math
 from copy import deepcopy
 from dataclasses import dataclass
 from typing import Literal, Optional
@@ -14,6 +15,7 @@ from ...dataset.shims.normalize_shim import apply_normalize_shim, normalize_imag
 from ...dataset.types import BatchedExample, DataShim
 from ..super_resolution import FrozenSwinIRUpsampler
 from ..types import Gaussians
+from ..decoder.decoder import Decoder
 from .anchor_feature_sampler import AnchorFeatureAggregator, AnchorFeatureSampler
 from .anchor_geometry_encoder import AnchorGeometryEncoder
 from .anchor_gaussian_decoder import (
@@ -21,13 +23,14 @@ from .anchor_gaussian_decoder import (
     scale_gaussian_scaffold,
 )
 from .anchor_litept_fusion import AnchorLitePTFusion
+from .anchor_opacity_modulator import AnchorOpacityModulator
+from .local_entropy import compute_local_shannon_entropy
 from .resunet_fusion import HiSplatResUnetTokenFusion
 from .backbone import BackboneCfg, get_backbone
 from .common.gaussian_adapter import GaussianAdapter, GaussianAdapterCfg, UnifiedGaussianAdapter
 from .encoder import Encoder
 from .visualization.encoder_visualizer_epipolar_cfg import EncoderVisualizerEpipolarCfg
 from ...misc.cam_utils import convert_pose_to_4x4, unproject_depth_map_to_point_map_batch
-from ...geometry.projection import homogenize_points, project_camera_space, transform_world2cam
 from .heads.pose_head import PoseHeadCfg
 
 inf = float('inf')
@@ -73,6 +76,9 @@ class EncoderNAS3RMCfg:
     anchor_feature_num_views: int = 2
     anchor_feature_view_dim: int = 128
     anchor_feature_out_dim: int = 512
+    entropy_num_gray_levels: int = 256
+    entropy_window_size: int = 9
+    entropy_topk_ratio: float = 0.2
     anchor_geometry_num_frequencies: int = 6
     anchor_geometry_knn: int = 8
     anchor_geometry_query_dim: int = 256
@@ -85,6 +91,9 @@ class EncoderNAS3RMCfg:
     anchor_gaussians_per_anchor: int = 8
     anchor_scaffold_scale_divisor: float = 2.4
     anchor_scaffold_opacity_multiplier: float = 0.6
+    anchor_opacity_modulator_hidden_dim: int = 32
+    anchor_opacity_initial_parent_weight: float = 0.8
+    anchor_child_camera_offset_beta: float = 0.1
 
     depth_activation: str = 'sigmoid'
 
@@ -111,12 +120,66 @@ def flatten_gaussians(gaussians) -> Gaussians:
     )
 
 
+def gather_gaussians(
+    gaussians: Gaussians,
+    indices: torch.Tensor,
+) -> Gaussians:
+    def gather(values: torch.Tensor) -> torch.Tensor:
+        index = indices.view(
+            *indices.shape,
+            *((1,) * (values.ndim - indices.ndim)),
+        )
+        return torch.gather(
+            values,
+            dim=1,
+            index=index.expand(-1, -1, *values.shape[2:]),
+        )
+
+    return Gaussians(
+        means=gather(gaussians.means),
+        covariances=gather(gaussians.covariances),
+        rotations=gather(gaussians.rotations),
+        scales=gather(gaussians.scales),
+        harmonics=gather(gaussians.harmonics),
+        opacities=gather(gaussians.opacities),
+    )
+
+
+def replace_gaussian_opacities(
+    gaussians: Gaussians,
+    opacities: torch.Tensor,
+) -> Gaussians:
+    return Gaussians(
+        means=gaussians.means,
+        covariances=gaussians.covariances,
+        rotations=gaussians.rotations,
+        scales=gaussians.scales,
+        harmonics=gaussians.harmonics,
+        opacities=opacities,
+    )
+
+
+def concatenate_gaussians(first: Gaussians, second: Gaussians) -> Gaussians:
+    return Gaussians(
+        means=torch.cat((first.means, second.means), dim=1),
+        covariances=torch.cat(
+            (first.covariances, second.covariances),
+            dim=1,
+        ),
+        rotations=torch.cat((first.rotations, second.rotations), dim=1),
+        scales=torch.cat((first.scales, second.scales), dim=1),
+        harmonics=torch.cat((first.harmonics, second.harmonics), dim=1),
+        opacities=torch.cat((first.opacities, second.opacities), dim=1),
+    )
+
+
 class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
     backbone: nn.Module
     gaussian_adapter: GaussianAdapter
 
     def __init__(self, cfg: EncoderNAS3RMCfg) -> None:
         super().__init__(cfg)
+        self._context_renderer: Decoder | None = None
 
         self.backbone = get_backbone(cfg.backbone, 3)
 
@@ -192,73 +255,95 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
                 fallback_blocks=0,
             )
         )
+        self.anchor_opacity_modulator = AnchorOpacityModulator(
+            hidden_dim=cfg.anchor_opacity_modulator_hidden_dim,
+            initial_parent_weight=cfg.anchor_opacity_initial_parent_weight,
+        )
         self.anchor_gaussian_decoder = (
             AnchorGaussianResidualDecoder(
                 token_dim=cfg.anchor_litept_token_dim,
                 gaussians_per_anchor=cfg.anchor_gaussians_per_anchor,
                 sh_degree=cfg.gaussian_adapter.sh_degree,
                 hidden_dim=cfg.anchor_gaussian_decoder_hidden_dim,
+                camera_offset_beta=cfg.anchor_child_camera_offset_beta,
             )
         )
 
-    def _sample_child_entropy_from_source_view(
-        self,
-        child_means: torch.Tensor,
-        entropy_map: torch.Tensor,
-        extrinsics: torch.Tensor,
-        intrinsics: torch.Tensor,
-        num_views: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        b, num_anchors, num_children, _ = child_means.shape
-        if num_anchors % num_views != 0:
-            raise ValueError(
-                "Expected anchors to be grouped by source view, got "
-                f"{num_anchors} anchors and {num_views} views."
-            )
-        anchors_per_view = num_anchors // num_views
-        child_means = rearrange(
-            child_means,
-            "b (v r) k xyz -> b v (r k) xyz",
-            v=num_views,
-            r=anchors_per_view,
-        )
+    def set_context_renderer(self, renderer: Decoder) -> None:
+        # Keep a non-registered reference so the shared decoder is not duplicated
+        # in this module's state_dict.
+        object.__setattr__(self, "_context_renderer", renderer)
 
-        cam_points = transform_world2cam(
-            homogenize_points(child_means),
-            extrinsics[:, :, None],
-        )[..., :-1]
-        camera_depth = cam_points[..., -1]
-        projected_xy = project_camera_space(cam_points, intrinsics[:, :, None])
-        valid = (
-            (camera_depth > 1e-6)
-            & (projected_xy[..., 0] >= 0)
-            & (projected_xy[..., 0] <= 1)
-            & (projected_xy[..., 1] >= 0)
-            & (projected_xy[..., 1] <= 1)
+    @staticmethod
+    def _pool_view_map(
+        view_map: torch.Tensor,
+        output_size: tuple[int, int],
+    ) -> torch.Tensor:
+        b, v = view_map.shape[:2]
+        pooled = F.adaptive_avg_pool2d(
+            rearrange(view_map, "b v h w -> (b v) 1 h w"),
+            output_size=output_size,
         )
+        return rearrange(pooled, "(b v) 1 h w -> b v h w", b=b, v=v)
 
-        sampled = F.grid_sample(
-            rearrange(entropy_map, "b v h w -> (b v) 1 h w"),
-            rearrange(projected_xy * 2 - 1, "b v m xy -> (b v) m () xy"),
-            mode="bilinear",
-            padding_mode="zeros",
-            align_corners=True,
+    @staticmethod
+    def _normalize_view_map(view_map: torch.Tensor) -> torch.Tensor:
+        flat = view_map.flatten(start_dim=2)
+        value_min = flat.amin(dim=-1, keepdim=True)
+        value_range = (
+            flat.amax(dim=-1, keepdim=True) - value_min
+        ).clamp_min(1e-6)
+        return ((flat - value_min) / value_range).view_as(view_map)
+
+    @staticmethod
+    def _select_densification_anchors(
+        score: torch.Tensor,
+        points_by_view: torch.Tensor,
+        topk_ratio: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        b, v, h, w = score.shape
+        num_pixels = h * w
+        num_selected = max(
+            1,
+            min(num_pixels, math.ceil(num_pixels * topk_ratio)),
         )
-        sampled = rearrange(
-            sampled.squeeze(1).squeeze(-1),
-            "(b v) (r k) -> b (v r) k",
-            b=b,
-            v=num_views,
-            r=anchors_per_view,
-            k=num_children,
+        local_indices = score.flatten(start_dim=2).topk(
+            k=num_selected,
+            dim=-1,
+            largest=True,
+            sorted=True,
+        ).indices
+
+        mask = torch.zeros(
+            b,
+            v,
+            num_pixels,
+            device=score.device,
+            dtype=torch.bool,
         )
-        valid = rearrange(
-            valid,
-            "b v (r k) -> b (v r) k",
-            r=anchors_per_view,
-            k=num_children,
+        mask.scatter_(2, local_indices, True)
+
+        view_offsets = (
+            torch.arange(v, device=score.device) * num_pixels
+        )[None, :, None]
+        global_indices = rearrange(
+            local_indices + view_offsets,
+            "b v k -> b (v k)",
         )
-        return sampled, valid
+        flat_points = rearrange(
+            points_by_view,
+            "b v r xyz -> b (v r) xyz",
+        )
+        selected_points = torch.gather(
+            flat_points,
+            dim=1,
+            index=global_indices[..., None].expand(-1, -1, 3),
+        )
+        return (
+            rearrange(mask, "b v (h w) -> b v h w", h=h, w=w),
+            global_indices,
+            selected_points,
+        )
 
     def set_depth_head(self, output_mode, head_type, landscape_only, depth_mode, conf_mode):
         self.backbone.depth_mode = depth_mode
@@ -328,8 +413,17 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             else context["image"]
         ) # (0，1)
 
-        device = context_image.device
         b, v_cxt, _, h, w = context_image.shape
+        with torch.no_grad():
+            context_sr_entropy = compute_local_shannon_entropy(
+                context_image_sr[:, :v_cxt],
+                num_gray_levels=self.cfg.entropy_num_gray_levels,
+                window_size=self.cfg.entropy_window_size,
+            )
+            context_lr_entropy = self._pool_view_map(
+                context_sr_entropy,
+                (h, w),
+            )
 
         if target is not None:
             v_tgt = target_image.shape[1]
@@ -446,6 +540,44 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             self.map_pdf_to_opacity(densities, global_step),
             rearrange(gaussian_params[..., 1:], "b v r srf c -> b v r srf () c"),
         )
+        lr_gaussians = flatten_gaussians(gaussians)
+        densification_anchor_mask = None
+        densification_anchor_indices = None
+        densification_anchors = None
+        entropy_score = None
+        render_error_score = None
+        if self._context_renderer is not None:
+            with torch.no_grad():
+                lr_render_output = self._context_renderer.forward(
+                    lr_gaussians,
+                    context_extrinsics,
+                    context_intrinsics,
+                    context["near"],
+                    context["far"],
+                    context_image_sr.shape[-2:],
+                    depth_mode=None,
+                )
+                lr_sr_render = lr_render_output.color.detach()
+                lr_sr_abs_error = (
+                    context_image_sr[:, :v_cxt].detach() - lr_sr_render
+                ).abs().mean(dim=2)
+                lr_render_error = self._pool_view_map(
+                    lr_sr_abs_error,
+                    (h, w),
+                )
+                entropy_score = self._normalize_view_map(context_lr_entropy)
+                render_error_score = self._normalize_view_map(lr_render_error)
+                densification_score = entropy_score * render_error_score
+                (
+                    densification_anchor_mask,
+                    densification_anchor_indices,
+                    densification_anchors,
+                ) = self._select_densification_anchors(
+                    densification_score,
+                    depth_to_pts_all.squeeze(-2),
+                    self.cfg.entropy_topk_ratio,
+                )
+
         anchors = rearrange(depth_to_pts_all.squeeze(-2), "b v r xyz -> b (v r) xyz")
 
         anchor_feature_samples = self.anchor_feature_sampler(
@@ -466,7 +598,7 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             anchor_geometry_query,
         )
         scaffold_gaussians = scale_gaussian_scaffold(
-            flatten_gaussians(gaussians),
+            lr_gaussians,
             scale_divisor=self.cfg.anchor_scaffold_scale_divisor,
             opacity_multiplier=self.cfg.anchor_scaffold_opacity_multiplier,
         )
@@ -476,16 +608,96 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
                 f"got {scaffold_gaussians.means.shape[1]} Gaussians and "
                 f"{anchors.shape[1]} anchors."
             )
-        anchor_child_output = self.anchor_gaussian_decoder(
-            anchor_litept_output,
-            anchors,
-            scaffold_gaussians,
-            anchor_spacing,
-            context_extrinsics,
-            context_intrinsics,
-            context_image_sr.shape[-2:],
-        )
-        final_gaussians = anchor_child_output["gaussians"]
+        if densification_anchor_indices is None:
+            anchor_child_output = self.anchor_gaussian_decoder(
+                anchor_litept_output,
+                anchors,
+                scaffold_gaussians,
+                anchor_spacing,
+                context_extrinsics,
+                context_intrinsics,
+                context_image_sr.shape[-2:],
+            )
+            final_gaussians = anchor_child_output["gaussians"]
+        else:
+            selected_tokens = torch.gather(
+                anchor_litept_output,
+                dim=1,
+                index=densification_anchor_indices[..., None].expand(
+                    -1,
+                    -1,
+                    anchor_litept_output.shape[-1],
+                ),
+            )
+            selected_spacing = torch.gather(
+                anchor_spacing,
+                dim=1,
+                index=densification_anchor_indices[..., None],
+            )
+            selected_parent_gaussians = gather_gaussians(
+                lr_gaussians,
+                densification_anchor_indices,
+            )
+            selected_scaffold_gaussians = gather_gaussians(
+                scaffold_gaussians,
+                densification_anchor_indices,
+            )
+
+            selected_entropy = torch.gather(
+                rearrange(entropy_score, "b v h w -> b (v h w)"),
+                dim=1,
+                index=densification_anchor_indices,
+            )
+            selected_render_error = torch.gather(
+                rearrange(render_error_score, "b v h w -> b (v h w)"),
+                dim=1,
+                index=densification_anchor_indices,
+            )
+            selected_parent_weight = self.anchor_opacity_modulator(
+                selected_entropy,
+                selected_render_error,
+                selected_parent_gaussians.opacities,
+            )
+
+            parent_weights = torch.ones_like(lr_gaussians.opacities).scatter(
+                1,
+                densification_anchor_indices,
+                selected_parent_weight,
+            )
+            modulated_lr_gaussians = replace_gaussian_opacities(
+                lr_gaussians,
+                lr_gaussians.opacities * parent_weights,
+            )
+
+            transferred_opacity = (
+                selected_parent_gaussians.opacities
+                * (1 - selected_parent_weight)
+            ).clamp(0, 1 - 1e-6)
+            child_base_opacity = 1 - (
+                1 - transferred_opacity
+            ).pow(1 / self.cfg.anchor_gaussians_per_anchor)
+            selected_scaffold_gaussians = replace_gaussian_opacities(
+                selected_scaffold_gaussians,
+                child_base_opacity,
+            )
+
+            source_view_indices = (
+                densification_anchor_indices // (h * w)
+            )
+            anchor_child_output = self.anchor_gaussian_decoder(
+                selected_tokens,
+                densification_anchors,
+                selected_scaffold_gaussians,
+                selected_spacing,
+                context_extrinsics,
+                context_intrinsics,
+                context_image_sr.shape[-2:],
+                source_view_indices=source_view_indices,
+            )
+            final_gaussians = concatenate_gaussians(
+                modulated_lr_gaussians,
+                anchor_child_output["gaussians"],
+            )
 
         # Dump visualizations if needed.
         if visualization_dump is not None:
@@ -507,6 +719,12 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
 
         encoder_output = dict()
         encoder_output["context_lr_depth"] = depths_per_view
+        if densification_anchors is not None:
+            encoder_output["densification_anchor_mask"] = densification_anchor_mask
+            encoder_output[
+                "densification_anchor_indices"
+            ] = densification_anchor_indices
+            encoder_output["densification_anchors"] = densification_anchors
 
         encoder_output["gaussians"] = final_gaussians
 

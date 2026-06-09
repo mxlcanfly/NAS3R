@@ -14,10 +14,12 @@ class AnchorGaussianResidualDecoder(nn.Module):
         gaussians_per_anchor: int = 8,
         sh_degree: int = 4,
         hidden_dim: int = 256,
+        camera_offset_beta: float = 0.1,
         **_: object,
     ) -> None:
         super().__init__()
         self.gaussians_per_anchor = gaussians_per_anchor
+        self.camera_offset_beta = camera_offset_beta
         self.sh_dim = (sh_degree + 1) ** 2
         self.raw_dim = 3 + 3 + 1 + 4 + 3 * self.sh_dim
 
@@ -50,6 +52,7 @@ class AnchorGaussianResidualDecoder(nn.Module):
         extrinsics: torch.Tensor | None = None,
         intrinsics: torch.Tensor | None = None,
         image_shape: tuple[int, int] | torch.Size | None = None,
+        source_view_indices: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor | Gaussians]:
         b, n, _ = tokens.shape
         raw = self.head(tokens)
@@ -79,8 +82,33 @@ class AnchorGaussianResidualDecoder(nn.Module):
         )
         if anchor_spacing is None:
             anchor_spacing = torch.ones_like(anchors[..., :1])
+        camera_offset = torch.zeros_like(initial_child_means)
+        if extrinsics is not None and source_view_indices is not None:
+            camera_centers = extrinsics[..., :3, 3]
+            source_camera_centers = torch.gather(
+                camera_centers,
+                dim=1,
+                index=source_view_indices[..., None].expand(-1, -1, 3),
+            )
+            direction_to_camera = F.normalize(
+                source_camera_centers - anchors,
+                dim=-1,
+            )
+            child_factors = torch.linspace(
+                1 / self.gaussians_per_anchor,
+                1,
+                self.gaussians_per_anchor,
+                device=anchors.device,
+                dtype=anchors.dtype,
+            )
+            camera_offset = (
+                direction_to_camera[:, :, None]
+                * anchor_spacing[:, :, None]
+                * child_factors[None, None, :, None]
+                * self.camera_offset_beta
+            )
         geometry_offset = anchor_spacing[:, :, None, :] * raw_offset
-        child_means = initial_child_means + geometry_offset
+        child_means = initial_child_means + camera_offset + geometry_offset
 
         parent_scales = parent_gaussians.scales[:, :, None]
         child_scales = parent_scales + raw_scale

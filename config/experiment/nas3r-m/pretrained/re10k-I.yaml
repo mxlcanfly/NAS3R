@@ -68,7 +68,7 @@ checkpointing:
 train:
   training_context: false
   refine_only: true
-  depth_consistency_weight: 0.1
+  depth_smoothness_weight: 0.1
   debug_save_every_n_steps: 500
 
 
