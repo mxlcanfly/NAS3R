@@ -3,9 +3,10 @@ import torch.nn as nn
 from einops import rearrange, repeat
 
 from .common.gaussians import build_covariance
+from .pointmlp_aggregator import PointMLPAggregator
 
 
-class GaussianMLPRefiner(nn.Module):
+class GaussianPointMLPRefiner(nn.Module):
     def __init__(
         self,
         feature_channels: int = 32,
@@ -31,14 +32,11 @@ class GaussianMLPRefiner(nn.Module):
             nn.LayerNorm(proj_channels),
             nn.GELU(),
         )
-        self.feature_mlp = nn.Sequential(
-            nn.Linear(proj_channels, proj_channels),
-            nn.LayerNorm(proj_channels),
-            nn.GELU(),
-            nn.Linear(proj_channels, proj_channels),
-            nn.LayerNorm(proj_channels),
-            nn.GELU(),
-            nn.Linear(proj_channels, proj_channels),
+        self.pointmlp = PointMLPAggregator(
+            channels=proj_channels,
+            k_neighbors=16,
+            anchor_stride=8,
+            num_blocks=2,
         )
 
         out_channels = 3 + 3 + 1 + 4 + self.sh_dim
@@ -122,7 +120,16 @@ class GaussianMLPRefiner(nn.Module):
             num_gaussians_per_pixel,
         )
         projected_feature = self.proj(flat_feature.float())
-        refined_feature = projected_feature + self.feature_mlp(projected_feature)
+        refined_feature = self.pointmlp(
+            projected_feature,
+            means,
+            b,
+            v,
+            h,
+            w,
+            means.shape[3],
+            means.shape[4],
+        )
         delta = self.delta_head(refined_feature)
         delta = rearrange(
             delta,
