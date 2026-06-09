@@ -55,7 +55,7 @@ optimizer:
 
 data_loader:
   train:
-    batch_size: 8
+    batch_size: 6
 
 trainer:
   max_steps: 75001
@@ -70,6 +70,7 @@ checkpointing:
 
 train:
   training_context: false
+  debug_save_every_n_steps: 500
   freeze_backbone: true
   freeze_depth_head: true
   freeze_gaussian_param_head: true

@@ -158,13 +158,17 @@ class ResUnet(nn.Module):
                 raise ValueError("dino_feature is required when ResUnet is initialized with dino_dim.")
             dino_feature_list = []
             for i in range(len(self.up_dino_cnn)):
-                dino_feature_i = self.up_dino_cnn[i](
-                    F.interpolate(
+                target_size = feature_list[len(feature_list) - i - 2].shape[-2:]
+                resized_dino_feature = dino_feature
+                if dino_feature.shape[-2:] != target_size:
+                    resized_dino_feature = F.interpolate(
                         dino_feature,
-                        size=feature_list[len(feature_list) - i - 2].shape[-2:],
+                        size=target_size,
                         mode="bilinear",
                         align_corners=False,
                     )
+                dino_feature_i = self.up_dino_cnn[i](
+                    resized_dino_feature
                 )
                 dino_feature_list.append(dino_feature_i)
         out_feature = self.decoder(feature_list, dino_feature_list)

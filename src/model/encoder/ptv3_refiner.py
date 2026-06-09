@@ -30,6 +30,7 @@ class GaussianLitePTRefiner(nn.Module):
         self,
         litept_path: str = "/space0/mengxl/LitePT-main",
         feature_channels: int = 32,
+        error_feature_channels: int = 256,
         proj_channels: int = 64,
         hidden_channels: int = 128,
         grid_size: float = 0.02,
@@ -39,7 +40,15 @@ class GaussianLitePTRefiner(nn.Module):
         LitePT = _load_litept(litept_path)
         self.grid_size = grid_size
         self.sh_dim = 3 * ((sh_degree + 1) ** 2)
-        self.raw_feature_channels = feature_channels + 3 + 1 + 3 + 3 + 3
+        self.gaussian_feature_channels = 3 + 3 + 4 + 1 + self.sh_dim
+        self.raw_feature_channels = (
+            feature_channels
+            + error_feature_channels
+            + 3
+            + 1
+            + 3
+            + self.gaussian_feature_channels
+        )
 
         self.proj = nn.Sequential(
             nn.Linear(self.raw_feature_channels, proj_channels),
@@ -54,48 +63,54 @@ class GaussianLitePTRefiner(nn.Module):
         )
 
         out_channels = 3 + 3 + 1 + 4 + self.sh_dim
-        layers = []
-        mlp_in = proj_channels + 3
-        for _ in range(4):
-            layers.extend([nn.Linear(mlp_in, hidden_channels), nn.GELU()])
-            mlp_in = hidden_channels
-        layers.append(nn.Linear(hidden_channels, out_channels))
-        self.delta_head = nn.Sequential(*layers)
+        self.delta_head = nn.Sequential(
+            nn.Linear(proj_channels, hidden_channels),
+            nn.GELU(),
+            nn.Linear(hidden_channels, hidden_channels),
+            nn.GELU(),
+            nn.Linear(hidden_channels, hidden_channels),
+            nn.GELU(),
+            nn.Linear(hidden_channels, out_channels),
+        )
         nn.init.zeros_(self.delta_head[-1].weight)
         nn.init.zeros_(self.delta_head[-1].bias)
 
     def _flatten_inputs(
         self,
         fusion_feature: torch.Tensor,
+        feature_error: torch.Tensor,
         render_error: torch.Tensor,
         tr_error_map: torch.Tensor,
-        point_map: torch.Tensor,
-        ray_direction: torch.Tensor,
         context_image: torch.Tensor,
+        gaussian_feature: torch.Tensor,
+        num_gaussians_per_pixel: int,
     ) -> torch.Tensor:
-        return torch.cat(
+        image_feature = torch.cat(
             [
                 rearrange(fusion_feature, "b v c h w -> (b v h w) c"),
+                rearrange(feature_error, "b v c h w -> (b v h w) c"),
                 rearrange(render_error, "b v c h w -> (b v h w) c"),
                 rearrange(tr_error_map, "b v c h w -> (b v h w) c"),
-                rearrange(point_map, "b v h w xyz -> (b v h w) xyz"),
-                rearrange(ray_direction, "b v h w xyz -> (b v h w) xyz"),
                 rearrange(context_image, "b v c h w -> (b v h w) c"),
             ],
             dim=-1,
         )
+        image_feature = repeat(
+            image_feature,
+            "n c -> (n r) c",
+            r=num_gaussians_per_pixel,
+        )
+        return torch.cat([image_feature, gaussian_feature], dim=-1)
 
     def _aggregate_features(
         self,
         projected_feature: torch.Tensor,
-        point_map: torch.Tensor,
+        gaussian_means: torch.Tensor,
         b: int,
-        v: int,
-        h: int,
-        w: int,
     ) -> torch.Tensor:
-        coord = rearrange(point_map, "b v h w xyz -> (b v h w) xyz").float()
-        offset = torch.arange(1, b + 1, device=coord.device, dtype=torch.long) * (v * h * w)
+        coord = rearrange(gaussian_means, "b ... xyz -> (b ...) xyz").float()
+        points_per_batch = coord.shape[0] // b
+        offset = torch.arange(1, b + 1, device=coord.device, dtype=torch.long) * points_per_batch
         point = self.litept(
             {
                 "coord": coord,
@@ -116,42 +131,52 @@ class GaussianLitePTRefiner(nn.Module):
     def forward(
         self,
         fusion_feature: torch.Tensor,
+        feature_error: torch.Tensor,
         render_error: torch.Tensor,
         tr_error_map: torch.Tensor,
-        point_map: torch.Tensor,
-        context_extrinsics: torch.Tensor,
         context_image: torch.Tensor,
         gaussians,
     ):
         b, v, _, h, w = fusion_feature.shape
-        camera_center = context_extrinsics[..., :3, 3].unsqueeze(-2).unsqueeze(-2)
-        ray_direction = point_map - camera_center
-        ray_direction = ray_direction / ray_direction.norm(dim=-1, keepdim=True).clamp_min(1e-6)
-        flat_feature = self._flatten_inputs(
-            fusion_feature,
-            render_error,
-            tr_error_map,
-            point_map,
-            ray_direction,
-            context_image,
-        )
-        projected_feature = self.proj(flat_feature.float())
-        refined_feature = self._aggregate_features(projected_feature, point_map, b, v, h, w)
-        image_feature = rearrange(context_image, "b v c h w -> (b v h w) c").float()
-        delta = self.delta_head(torch.cat([refined_feature, image_feature], dim=-1))
-        delta = rearrange(delta, "(b v h w) c -> b v (h w) c", b=b, v=v, h=h, w=w)
-
         means = gaussians.means
         scales = gaussians.scales
         rotations = gaussians.rotations
         harmonics = gaussians.harmonics
         opacities = gaussians.opacities
-
         num_gaussians_per_pixel = means.shape[3] * means.shape[4]
-        delta = repeat(delta, "b v hw c -> b v hw r c", r=num_gaussians_per_pixel)
+
+        gaussian_feature = torch.cat(
+            [
+                means,
+                scales,
+                rotations,
+                opacities.unsqueeze(-1),
+                rearrange(harmonics, "... rgb sh -> ... (rgb sh)"),
+            ],
+            dim=-1,
+        )
+        gaussian_feature = rearrange(
+            gaussian_feature,
+            "b v hw s spp c -> (b v hw s spp) c",
+        )
+        flat_feature = self._flatten_inputs(
+            fusion_feature,
+            feature_error,
+            render_error,
+            tr_error_map,
+            context_image,
+            gaussian_feature,
+            num_gaussians_per_pixel,
+        )
+        projected_feature = self.proj(flat_feature.float())
+        refined_feature = self._aggregate_features(projected_feature, means, b)
+        delta = self.delta_head(refined_feature)
         delta = rearrange(
             delta,
-            "b v hw (s spp) c -> b v hw s spp c",
+            "(b v hw s spp) c -> b v hw s spp c",
+            b=b,
+            v=v,
+            hw=h * w,
             s=means.shape[3],
             spp=means.shape[4],
         )

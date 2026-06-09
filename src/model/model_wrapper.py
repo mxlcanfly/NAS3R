@@ -90,6 +90,7 @@ class TrainCfg:
     random_drop_target_views: bool = False
 
     pretrain_camera_head: bool = False
+    debug_save_every_n_steps: int = 500
 
 
 def dropout_context_views(v_cxt):
@@ -138,6 +139,60 @@ class ModelWrapper(LightningModule):
     encoder: nn.Module
     encoder_visualizer: Optional[EncoderVisualizer]
     decoder: Decoder
+
+    @rank_zero_only
+    def _save_refine_comparison(
+        self,
+        target_gt: Tensor,
+        render_before: Tensor,
+        render_after: Tensor,
+    ) -> None:
+        checkpoint_dir = Path(self.trainer.checkpoint_callback.dirpath)
+        save_dir = (
+            checkpoint_dir
+            / "debug_train"
+            / f"step_{self.global_step:06d}"
+        )
+
+        target_gt = target_gt[0].detach().float().clamp(0, 1)
+        render_before = render_before[0].detach().float().clamp(0, 1)
+        render_after = render_after[0].detach().float().clamp(0, 1)
+        error_before = (render_before - target_gt).abs().mean(dim=1)
+        error_after = (render_after - target_gt).abs().mean(dim=1)
+
+        shared_error_max = torch.quantile(
+            torch.cat([error_before.flatten(), error_after.flatten()]),
+            0.99,
+        ).clamp_min(1e-6)
+        error_before_vis = apply_color_map_to_image(
+            error_before / shared_error_max,
+        )
+        error_after_vis = apply_color_map_to_image(
+            error_after / shared_error_max,
+        )
+
+        rows = []
+        for view_idx in range(target_gt.shape[0]):
+            rows.append(
+                hcat(
+                    add_label(target_gt[view_idx], "Target GT"),
+                    add_label(render_before[view_idx], "Before refine"),
+                    add_label(render_after[view_idx], "After refine"),
+                    add_label(
+                        error_before_vis[view_idx],
+                        "Before absolute error",
+                    ),
+                    add_label(
+                        error_after_vis[view_idx],
+                        "After absolute error",
+                    ),
+                )
+            )
+
+        save_image(
+            add_border(vcat(*rows)),
+            save_dir / "comparison.png",
+        )
     losses: nn.ModuleList
     optimizer_cfg: OptimizerCfg
     test_cfg: TestCfg
@@ -287,9 +342,19 @@ class ModelWrapper(LightningModule):
             self.global_rank == 0
             and self.global_step % self.train_cfg.print_log_every_n_steps == 0
         )
+        should_save_debug = (
+            self.global_rank == 0
+            and self.global_step > 0
+            and self.train_cfg.debug_save_every_n_steps > 0
+            and self.global_step % self.train_cfg.debug_save_every_n_steps == 0
+        )
         mean_psnr_before_refine = None
         psnr_refine_gain = None
-        if should_print and "gaussians_before_refine" in encoder_output:
+        output_before_refine = None
+        if (
+            (should_print or should_save_debug)
+            and "gaussians_before_refine" in encoder_output
+        ):
             with torch.no_grad():
                 output_before_refine = self.decoder.forward(
                     encoder_output["gaussians_before_refine"],
@@ -314,6 +379,13 @@ class ModelWrapper(LightningModule):
 
             self.log("train/psnr_before_refine", mean_psnr_before_refine)
             self.log("train/psnr_refine_gain", psnr_refine_gain)
+
+        if should_save_debug and output_before_refine is not None:
+            self._save_refine_comparison(
+                target_gt,
+                output_before_refine.color,
+                output.color,
+            )
 
         # Compute and log loss.
         for loss_fn in self.losses:
