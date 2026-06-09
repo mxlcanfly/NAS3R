@@ -5,12 +5,6 @@ import torch.nn.functional as F
 
 from ..types import Gaussians
 from .common.gaussians import build_covariance
-from ...geometry.projection import (
-    homogenize_points,
-    transform_cam2world,
-    transform_world2cam,
-    project_camera_space,
-)
 
 
 class AnchorGaussianResidualDecoder(nn.Module):
@@ -35,8 +29,17 @@ class AnchorGaussianResidualDecoder(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, gaussians_per_anchor * self.raw_dim),
         )
-        nn.init.zeros_(self.head[-1].weight)
-        nn.init.zeros_(self.head[-1].bias)
+        self._initialize_head()
+
+    def _initialize_head(self) -> None:
+        output = self.head[-1]
+        nn.init.zeros_(output.weight)
+        nn.init.zeros_(output.bias)
+        for child_idx in range(self.gaussians_per_anchor):
+            offset_start = child_idx * self.raw_dim
+            offset_end = offset_start + 3
+            nn.init.normal_(output.weight[offset_start:offset_end], mean=0.0, std=1e-3)
+            nn.init.normal_(output.bias[offset_start:offset_end], mean=0.0, std=1e-3)
 
     def forward(
         self,
@@ -68,12 +71,11 @@ class AnchorGaussianResidualDecoder(nn.Module):
         cursor += 4
         raw_sh = raw[..., cursor:cursor + 3 * self.sh_dim]
 
-        initial_child_means = self._initialize_child_means_from_sr_grid(
-            anchors,
-            extrinsics,
-            intrinsics,
-            image_shape,
+        initial_child_means = anchors[:, :, None].expand(
+            -1,
+            -1,
             self.gaussians_per_anchor,
+            -1,
         )
         if anchor_spacing is None:
             anchor_spacing = torch.ones_like(anchors[..., :1])
@@ -113,111 +115,6 @@ class AnchorGaussianResidualDecoder(nn.Module):
         return {
             "gaussians": child_gaussians,
         }
-
-    def _initialize_child_means_from_sr_grid(
-        self,
-        anchors: torch.Tensor,
-        extrinsics: torch.Tensor | None,
-        intrinsics: torch.Tensor | None,
-        image_shape: tuple[int, int] | torch.Size | None,
-        num_children: int,
-    ) -> torch.Tensor:
-        if extrinsics is None or intrinsics is None or image_shape is None:
-            return anchors[:, :, None].expand(-1, -1, num_children, -1)
-
-        b, num_views = extrinsics.shape[:2]
-        num_anchors = anchors.shape[1]
-        if num_anchors % num_views != 0:
-            raise ValueError(
-                "SR-grid child initialization expects anchors grouped by source "
-                f"view, got {num_anchors} anchors and {num_views} views."
-            )
-
-        anchors_per_view = num_anchors // num_views
-        anchors_by_view = rearrange(
-            anchors,
-            "b (v r) xyz -> b v r xyz",
-            v=num_views,
-            r=anchors_per_view,
-        )
-
-        cam_points = transform_world2cam(
-            homogenize_points(anchors_by_view),
-            extrinsics[:, :, None],
-        )[..., :-1]
-        camera_depth = cam_points[..., -1].clamp_min(1e-6)
-        projected_xy = project_camera_space(cam_points, intrinsics[:, :, None])
-
-        target_h, target_w = int(image_shape[-2]), int(image_shape[-1])
-        pixel_scale = torch.tensor(
-            (target_w, target_h),
-            device=anchors.device,
-            dtype=anchors.dtype,
-        )
-
-        grid_y, grid_x = torch.meshgrid(
-            torch.arange(4, device=anchors.device, dtype=anchors.dtype),
-            torch.arange(4, device=anchors.device, dtype=anchors.dtype),
-            indexing="ij",
-        )
-        grid_offsets = torch.stack((grid_x, grid_y), dim=-1).reshape(16, 2) - 1.5
-
-        generator = None
-        if not self.training:
-            generator = torch.Generator(device=anchors.device)
-            generator.manual_seed(0)
-
-        if num_children <= 16:
-            noise = torch.rand(
-                b,
-                num_views,
-                anchors_per_view,
-                16,
-                device=anchors.device,
-                generator=generator,
-            )
-            cell_index = noise.argsort(dim=-1)[..., :num_children]
-        else:
-            repeats = (num_children + 15) // 16
-            cell_index = torch.arange(
-                16,
-                device=anchors.device,
-            ).repeat(repeats)[:num_children]
-            cell_index = cell_index.view(1, 1, 1, num_children).expand(
-                b,
-                num_views,
-                anchors_per_view,
-                num_children,
-            )
-
-        cell_offsets = grid_offsets[cell_index]
-        jitter = torch.rand(
-            cell_offsets.shape,
-            device=cell_offsets.device,
-            dtype=cell_offsets.dtype,
-            generator=generator,
-        ) - 0.5
-        pixel_offsets = cell_offsets + jitter
-        child_xy = projected_xy[..., None, :] + pixel_offsets / pixel_scale
-        child_xy = child_xy.clamp(0, 1)
-
-        child_xy_h = homogenize_points(child_xy)
-        ray_directions = torch.einsum(
-            "...ij,...j->...i",
-            intrinsics[:, :, None, None].inverse(),
-            child_xy_h,
-        )
-        child_cam_points = ray_directions * camera_depth[..., None, None]
-        child_world_points = transform_cam2world(
-            homogenize_points(child_cam_points),
-            extrinsics[:, :, None, None],
-        )[..., :-1]
-
-        return rearrange(
-            child_world_points,
-            "b v r k xyz -> b (v r) k xyz",
-        )
-
 
 def scale_gaussian_scaffold(
     gaussians: Gaussians,
