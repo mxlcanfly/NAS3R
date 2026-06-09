@@ -91,6 +91,7 @@ class TrainCfg:
 
     pretrain_camera_head: bool = False
     refine_only: bool = False
+    lr_gaussian_supervision_weight: float = 1.0
     depth_smoothness_weight: float = 0.0
     debug_save_every_n_steps: int = 0
 
@@ -520,6 +521,7 @@ class ModelWrapper(LightningModule):
         total_loss = 0
 
         gaussians = encoder_output["gaussians"]
+        lr_gaussians = encoder_output.get("lr_gaussians")
         # Determine decoder inputs
         extrinsics = target_extrinsics if not self.train_cfg.training_context else torch.cat(
             [context_extrinsics, target_extrinsics], dim=1)
@@ -532,7 +534,7 @@ class ModelWrapper(LightningModule):
         target_gt = target_image if not self.train_cfg.training_context else torch.cat(
             [context_image, target_image], dim=1)
 
-        # Run decoder
+        # Render the final LR+SR Gaussian representation.
         output = self.decoder.forward(
             gaussians,
             extrinsics,
@@ -542,6 +544,20 @@ class ModelWrapper(LightningModule):
             (h, w),
             depth_mode=self.train_cfg.depth_mode,
         )
+        lr_output = None
+        if (
+                lr_gaussians is not None
+                and self.train_cfg.lr_gaussian_supervision_weight > 0
+        ):
+            lr_output = self.decoder.forward(
+                lr_gaussians,
+                extrinsics,
+                intrinsics,
+                near,
+                far,
+                (h, w),
+                depth_mode=None,
+            )
         self._save_training_debug_outputs(
             batch,
             output,
@@ -559,13 +575,33 @@ class ModelWrapper(LightningModule):
             rearrange(output.color, "b v c h w -> (b v) c h w"),
         )
         self.log(f"train/psnr", psnr.mean())
+        if lr_output is not None:
+            lr_psnr = compute_psnr(
+                rearrange(target_gt, "b v c h w -> (b v) c h w"),
+                rearrange(lr_output.color, "b v c h w -> (b v) c h w"),
+            )
+            self.log("train/lr_psnr", lr_psnr.mean())
 
-        # Compute and log loss.
+        # Supervise the final LR+SR Gaussians.
         for loss_fn in self.losses:
             if loss_fn.name in ['mse', 'lpips']:
                 loss = loss_fn.forward(output.color, target_gt, gaussians, self.global_step)
-                self.log(f"loss/{loss_fn.name}", loss)
+                self.log(f"loss/final_{loss_fn.name}", loss)
                 total_loss += loss
+
+                if lr_output is not None:
+                    lr_loss = loss_fn.forward(
+                        lr_output.color,
+                        target_gt,
+                        lr_gaussians,
+                        self.global_step,
+                    )
+                    lr_loss = (
+                        self.train_cfg.lr_gaussian_supervision_weight
+                        * lr_loss
+                    )
+                    self.log(f"loss/lr_{loss_fn.name}", lr_loss)
+                    total_loss += lr_loss
 
         if (
                 self.train_cfg.depth_smoothness_weight > 0
@@ -1271,6 +1307,8 @@ class ModelWrapper(LightningModule):
                 "anchor_litept_fusion",
                 "anchor_opacity_modulator",
                 "anchor_gaussian_decoder",
+                "gaussian_param_head",
+                "gaussian_param_head2",
             )
             for name, param in self.named_parameters():
                 param.requires_grad = any(keyword in name for keyword in trainable_keywords)

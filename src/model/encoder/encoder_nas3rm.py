@@ -719,6 +719,7 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
 
         encoder_output = dict()
         encoder_output["context_lr_depth"] = depths_per_view
+        encoder_output["lr_gaussians"] = lr_gaussians
         if densification_anchors is not None:
             encoder_output["densification_anchor_mask"] = densification_anchor_mask
             encoder_output[
