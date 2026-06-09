@@ -20,7 +20,7 @@ from ..types import Gaussians
 from .backbone import Backbone, BackboneCfg, get_backbone
 from .common.gaussian_adapter import GaussianAdapter, GaussianAdapterCfg, UnifiedGaussianAdapter
 from .encoder import Encoder
-from .ptv3_refiner import GaussianLitePTRefiner
+from .ptv3_refiner import GaussianMLPRefiner
 from .resnet_feature_error import ResNet18FeatureErrorEncoder
 from .resunet_fusion import ImageNetResUnetFeatureExtractor
 from .visualization.encoder_visualizer_epipolar_cfg import EncoderVisualizerEpipolarCfg
@@ -123,8 +123,8 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             if self.cfg.use_resunet_feature_extractor
             else None
         )
-        self.litept_refiner = (
-            GaussianLitePTRefiner(sh_degree=self.cfg.gaussian_adapter.sh_degree)
+        self.mlp_refiner = (
+            GaussianMLPRefiner(sh_degree=self.cfg.gaussian_adapter.sh_degree)
             if self.cfg.use_resunet_feature_extractor and self.cfg.use_context_render_error
             else None
         )
@@ -362,14 +362,14 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             tr_error_map = reder_tr_map - context_tr_map
             encoder_output["context_tr_error_map"] = tr_error_map
 
-            if self.litept_refiner is not None and resunet_feature_256 is not None:
+            if self.mlp_refiner is not None and resunet_feature_256 is not None:
                 error_features = self.feature_error_encoder(
                     torch.cat([context_render, context_image_rgb], dim=0),
                 )
                 rendered_feature, input_feature = error_features.chunk(2, dim=0)
                 feature_error = rendered_feature - input_feature
                 encoder_output["context_feature_error"] = feature_error
-                gaussians = self.litept_refiner(
+                gaussians = self.mlp_refiner(
                     resunet_feature_256["context"],
                     feature_error,
                     encoder_output["context_render_error"],

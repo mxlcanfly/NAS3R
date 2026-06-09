@@ -1,6 +1,3 @@
-from pathlib import Path
-import sys
-
 import torch
 import torch.nn as nn
 from einops import rearrange, repeat
@@ -8,37 +5,16 @@ from einops import rearrange, repeat
 from .common.gaussians import build_covariance
 
 
-def _load_litept(litept_path: str):
-    root = Path(litept_path)
-    if (root / "litept").exists():
-        litept_root = root
-    else:
-        litept_root = root / "LitePT-main"
-    if str(litept_root) not in sys.path:
-        sys.path.insert(0, str(litept_root))
-    try:
-        from litept.model import LitePT
-    except Exception as exc:
-        raise ImportError(
-            f"Failed to import LitePT from {litept_root}. Please check LitePT dependencies."
-        ) from exc
-    return LitePT
-
-
-class GaussianLitePTRefiner(nn.Module):
+class GaussianMLPRefiner(nn.Module):
     def __init__(
         self,
-        litept_path: str = "/space0/mengxl/LitePT-main",
         feature_channels: int = 32,
         error_feature_channels: int = 256,
         proj_channels: int = 64,
         hidden_channels: int = 128,
-        grid_size: float = 0.02,
         sh_degree: int = 0,
     ) -> None:
         super().__init__()
-        LitePT = _load_litept(litept_path)
-        self.grid_size = grid_size
         self.sh_dim = 3 * ((sh_degree + 1) ** 2)
         self.gaussian_feature_channels = 3 + 3 + 4 + 1 + self.sh_dim
         self.raw_feature_channels = (
@@ -55,11 +31,14 @@ class GaussianLitePTRefiner(nn.Module):
             nn.LayerNorm(proj_channels),
             nn.GELU(),
         )
-        self.litept = LitePT(in_channels=proj_channels)
-        self.litept_out_proj = nn.Sequential(
-            nn.Linear(72, proj_channels),
+        self.feature_mlp = nn.Sequential(
+            nn.Linear(proj_channels, proj_channels),
             nn.LayerNorm(proj_channels),
             nn.GELU(),
+            nn.Linear(proj_channels, proj_channels),
+            nn.LayerNorm(proj_channels),
+            nn.GELU(),
+            nn.Linear(proj_channels, proj_channels),
         )
 
         out_channels = 3 + 3 + 1 + 4 + self.sh_dim
@@ -102,32 +81,6 @@ class GaussianLitePTRefiner(nn.Module):
         )
         return torch.cat([image_feature, gaussian_feature], dim=-1)
 
-    def _aggregate_features(
-        self,
-        projected_feature: torch.Tensor,
-        gaussian_means: torch.Tensor,
-        b: int,
-    ) -> torch.Tensor:
-        coord = rearrange(gaussian_means, "b ... xyz -> (b ...) xyz").float()
-        points_per_batch = coord.shape[0] // b
-        offset = torch.arange(1, b + 1, device=coord.device, dtype=torch.long) * points_per_batch
-        point = self.litept(
-            {
-                "coord": coord,
-                "grid_size": torch.tensor(self.grid_size, device=coord.device, dtype=coord.dtype),
-                "feat": projected_feature.float(),
-                "offset": offset,
-            }
-        )
-        litept_feat = point.feat
-        if litept_feat.shape[0] != projected_feature.shape[0]:
-            if "inverse" not in point:
-                raise RuntimeError(
-                    "LitePT returned downsampled features without inverse indices."
-                )
-            litept_feat = litept_feat[point.inverse]
-        return projected_feature + self.litept_out_proj(litept_feat.float())
-
     def forward(
         self,
         fusion_feature: torch.Tensor,
@@ -169,7 +122,7 @@ class GaussianLitePTRefiner(nn.Module):
             num_gaussians_per_pixel,
         )
         projected_feature = self.proj(flat_feature.float())
-        refined_feature = self._aggregate_features(projected_feature, means, b)
+        refined_feature = projected_feature + self.feature_mlp(projected_feature)
         delta = self.delta_head(refined_feature)
         delta = rearrange(
             delta,
