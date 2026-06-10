@@ -573,7 +573,7 @@ class ModelWrapper(LightningModule):
 
         if self.test_cfg.save_image:
             for index, pred in zip(batch["target"]["index"][0], rgb_pred):
-                save_image(pred, path / scene / f"color/{index:0>6}.png")
+                save_image(pred, path / scene / f"color_no_error/{index:0>6}.png")
 
         if self.test_cfg.save_video:
             frame_str = "_".join([str(x.item()) for x in batch["context"]["index"][0]])

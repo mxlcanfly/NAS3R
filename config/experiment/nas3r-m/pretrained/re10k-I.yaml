@@ -27,7 +27,8 @@ model:
     estimating_focal: false
     depth_activation: 'sigmoid'
     use_resunet_feature_extractor: true
-    use_context_render_error: true
+    use_context_render_error: false
+    use_litept_refiner: true
 
     pose_head:
       pose_init_t: true

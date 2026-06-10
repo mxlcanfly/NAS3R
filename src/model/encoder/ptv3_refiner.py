@@ -30,7 +30,6 @@ class GaussianLitePTRefiner(nn.Module):
         self,
         litept_path: str = "/space0/mengxl/LitePT-main",
         feature_channels: int = 32,
-        error_feature_channels: int = 256,
         proj_channels: int = 64,
         hidden_channels: int = 128,
         grid_size: float = 0.02,
@@ -43,8 +42,6 @@ class GaussianLitePTRefiner(nn.Module):
         self.gaussian_feature_channels = 3 + 3 + 4 + 1 + self.sh_dim
         self.raw_feature_channels = (
             feature_channels
-            + error_feature_channels
-            + 3
             + 1
             + 3
             + self.gaussian_feature_channels
@@ -78,9 +75,7 @@ class GaussianLitePTRefiner(nn.Module):
     def _flatten_inputs(
         self,
         fusion_feature: torch.Tensor,
-        feature_error: torch.Tensor,
-        render_error: torch.Tensor,
-        tr_error_map: torch.Tensor,
+        gradient_error: torch.Tensor,
         context_image: torch.Tensor,
         gaussian_feature: torch.Tensor,
         num_gaussians_per_pixel: int,
@@ -88,9 +83,7 @@ class GaussianLitePTRefiner(nn.Module):
         image_feature = torch.cat(
             [
                 rearrange(fusion_feature, "b v c h w -> (b v h w) c"),
-                rearrange(feature_error, "b v c h w -> (b v h w) c"),
-                rearrange(render_error, "b v c h w -> (b v h w) c"),
-                rearrange(tr_error_map, "b v c h w -> (b v h w) c"),
+                rearrange(gradient_error, "b v c h w -> (b v h w) c"),
                 rearrange(context_image, "b v c h w -> (b v h w) c"),
             ],
             dim=-1,
@@ -131,9 +124,7 @@ class GaussianLitePTRefiner(nn.Module):
     def forward(
         self,
         fusion_feature: torch.Tensor,
-        feature_error: torch.Tensor,
-        render_error: torch.Tensor,
-        tr_error_map: torch.Tensor,
+        gradient_error: torch.Tensor,
         context_image: torch.Tensor,
         gaussians,
     ):
@@ -161,9 +152,7 @@ class GaussianLitePTRefiner(nn.Module):
         )
         flat_feature = self._flatten_inputs(
             fusion_feature,
-            feature_error,
-            render_error,
-            tr_error_map,
+            gradient_error,
             context_image,
             gaussian_feature,
             num_gaussians_per_pixel,

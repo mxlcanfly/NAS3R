@@ -21,7 +21,6 @@ from .backbone import Backbone, BackboneCfg, get_backbone
 from .common.gaussian_adapter import GaussianAdapter, GaussianAdapterCfg, UnifiedGaussianAdapter
 from .encoder import Encoder
 from .ptv3_refiner import GaussianLitePTRefiner
-from .resnet_feature_error import ResNet18FeatureErrorEncoder
 from .resunet_fusion import ImageNetResUnetFeatureExtractor
 from .visualization.encoder_visualizer_epipolar_cfg import EncoderVisualizerEpipolarCfg
 from ...misc.cam_utils import camera_normalization, convert_pose_to_4x4, depth_projector, \
@@ -69,9 +68,7 @@ class EncoderNAS3RMCfg:
     equal_view_intrinsics: bool = True
     use_resunet_feature_extractor: bool = False
     use_context_render_error: bool = False
-    feature_error_weights_path: str = (
-        "/space0/mengxl/NoPoSplat-init/pretrained_weights/resnet18-5c106cde.pth"
-    )
+    use_litept_refiner: bool = False
 
 
 def rearrange_head(feat, patch_size, H, W):
@@ -125,12 +122,7 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
         )
         self.litept_refiner = (
             GaussianLitePTRefiner(sh_degree=self.cfg.gaussian_adapter.sh_degree)
-            if self.cfg.use_resunet_feature_extractor and self.cfg.use_context_render_error
-            else None
-        )
-        self.feature_error_encoder = (
-            ResNet18FeatureErrorEncoder(self.cfg.feature_error_weights_path)
-            if self.cfg.use_context_render_error
+            if self.cfg.use_resunet_feature_extractor and self.cfg.use_litept_refiner
             else None
         )
 
@@ -344,7 +336,11 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
         )
         encoder_output["gaussians_before_refine"] = encoder_gaussians
 
-        if self.cfg.use_context_render_error and self.decoder is not None:
+        if (
+            self.litept_refiner is not None
+            and resunet_feature_256 is not None
+            and self.decoder is not None
+        ):
             context_render = self.decoder.forward(
                 encoder_gaussians,
                 context_extrinsics,
@@ -354,37 +350,25 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
                 (h, w),
                 depth_mode=None,
             ).color
-            encoder_output["context_render"] = context_render
-            encoder_output["context_render_error"] = context_render - context_image_rgb
+            _, _, context_gradient = self.compute_gradient_map(context_image_rgb)
+            _, _, rendered_gradient = self.compute_gradient_map(context_render)
+            gradient_error = rendered_gradient - context_gradient
+            encoder_output["context_gradient_error"] = gradient_error
 
-            gt_grad_x, gt_grad_y, context_tr_map = self.compute_gradient_map(context["image"])
-            ren_grad_x, ren_grad_y, reder_tr_map = self.compute_gradient_map(context_render)
-            tr_error_map = reder_tr_map - context_tr_map
-            encoder_output["context_tr_error_map"] = tr_error_map
-
-            if self.litept_refiner is not None and resunet_feature_256 is not None:
-                error_features = self.feature_error_encoder(
-                    torch.cat([context_render, context_image_rgb], dim=0),
-                )
-                rendered_feature, input_feature = error_features.chunk(2, dim=0)
-                feature_error = rendered_feature - input_feature
-                encoder_output["context_feature_error"] = feature_error
-                gaussians = self.litept_refiner(
-                    resunet_feature_256["context"],
-                    feature_error,
-                    encoder_output["context_render_error"],
-                    tr_error_map,
-                    context_image_rgb,
-                    gaussians,
-                )
-                encoder_gaussians = Gaussians(
-                    rearrange(gaussians.means, "b v r srf spp xyz -> b (v r srf spp) xyz"),
-                    rearrange(gaussians.covariances, "b v r srf spp i j -> b (v r srf spp) i j"),
-                    rearrange(gaussians.rotations, "b v r srf spp i  -> b (v r srf spp) i "),
-                    rearrange(gaussians.scales, "b v r srf spp i  -> b (v r srf spp) i "),
-                    rearrange(gaussians.harmonics, "b v r srf spp c d_sh -> b (v r srf spp) c d_sh"),
-                    rearrange(gaussians.opacities, "b v r srf spp -> b (v r srf spp)"),
-                )
+            gaussians = self.litept_refiner(
+                resunet_feature_256["context"],
+                gradient_error,
+                context_image_rgb,
+                gaussians,
+            )
+            encoder_gaussians = Gaussians(
+                rearrange(gaussians.means, "b v r srf spp xyz -> b (v r srf spp) xyz"),
+                rearrange(gaussians.covariances, "b v r srf spp i j -> b (v r srf spp) i j"),
+                rearrange(gaussians.rotations, "b v r srf spp i  -> b (v r srf spp) i "),
+                rearrange(gaussians.scales, "b v r srf spp i  -> b (v r srf spp) i "),
+                rearrange(gaussians.harmonics, "b v r srf spp c d_sh -> b (v r srf spp) c d_sh"),
+                rearrange(gaussians.opacities, "b v r srf spp -> b (v r srf spp)"),
+            )
 
         encoder_output["gaussians"] = encoder_gaussians
 
