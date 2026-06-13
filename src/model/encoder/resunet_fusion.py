@@ -170,24 +170,28 @@ class HiSplatResUnetTokenFusion(nn.Module):
         token_ch: int = 64,
         feature_dims: tuple[int, int, int] = (32, 64, 128),
         norm_layer=nn.InstanceNorm2d,
+        build_condition_head: bool = True,
     ) -> None:
         super().__init__()
         self.resunet = ResUnet(dino_dim=token_ch, norm_layer=norm_layer, feature_dims=feature_dims)
-        combined_channels = feature_dims[0] + 3 + 1
-        condition_channels = 64
-        self.condition_regressor = nn.Sequential(
-            nn.Conv2d(combined_channels, condition_channels, 3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(condition_channels, condition_channels, 3, padding=1),
-        )
-        self.condition_proj = nn.Sequential(
-            nn.Conv2d(
-                combined_channels + condition_channels,
-                condition_channels,
-                1,
-            ),
-            nn.GELU(),
-        )
+        self.condition_regressor = None
+        self.condition_proj = None
+        if build_condition_head:
+            combined_channels = feature_dims[0] + 3 + 1
+            condition_channels = 64
+            self.condition_regressor = nn.Sequential(
+                nn.Conv2d(combined_channels, condition_channels, 3, padding=1),
+                nn.GELU(),
+                nn.Conv2d(condition_channels, condition_channels, 3, padding=1),
+            )
+            self.condition_proj = nn.Sequential(
+                nn.Conv2d(
+                    combined_channels + condition_channels,
+                    condition_channels,
+                    1,
+                ),
+                nn.GELU(),
+            )
         self.proj = nn.Sequential(
             nn.Conv2d(token_dim, token_ch * 4, 1),
             nn.BatchNorm2d(token_ch * 4),
@@ -221,6 +225,8 @@ class HiSplatResUnetTokenFusion(nn.Module):
         dino_feature = self.tokens_to_16x16(tokens)
         fused = self.resunet(images, dino_feature)
         return {
+            "64": rearrange(fused[0], "(b v) c h w -> b v c h w", b=b, v=v),
+            "128": rearrange(fused[1], "(b v) c h w -> b v c h w", b=b, v=v),
             "256": rearrange(fused[2], "(b v) c h w -> b v c h w", b=b, v=v),
         }
 
@@ -230,6 +236,10 @@ class HiSplatResUnetTokenFusion(nn.Module):
         sr_images: torch.Tensor,
         lr_depth: torch.Tensor,
     ) -> torch.Tensor:
+        if self.condition_regressor is None or self.condition_proj is None:
+            raise RuntimeError(
+                "build_combined_256 requires build_condition_head=True."
+            )
         cnn_feature_256 = fusion_features["256"]
         b, v, _, target_h, target_w = cnn_feature_256.shape
 

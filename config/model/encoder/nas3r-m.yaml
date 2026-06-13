@@ -54,32 +54,25 @@ equal_fxfy: true
 equal_view_intrinsics: true
 
 use_swinir_sr: true
-anchor_feature_patch_size: 6
-anchor_feature_patch_dim: 2304
-anchor_feature_num_views: 2
-anchor_feature_view_dim: 128
-anchor_feature_out_dim: 512
+swinir_weight_path: /space0/mengxl/NAS3R-master/pretrained_weights/001_classicalSR_DF2K_s64w8_SwinIR-M_x4.pth
+
 entropy_num_gray_levels: 256
 entropy_window_size: 9
-entropy_topk_ratio: 0.4
+entropy_points_per_view: 16384
 
-# q_geo = MLP([Fourier(anchor_xyz), log(local_knn_spacing)])
-anchor_geometry_num_frequencies: 6
-anchor_geometry_knn: 8
-anchor_geometry_query_dim: 256
-anchor_geometry_hidden_dim: 512
-anchor_geometry_knn_chunk_size: 256
+multiview_patch_size: 2
+multiview_depth_tolerance: 0.05
 
-# Fuse multi-view anchor features and geometric queries with LitePT-style point aggregation.
-anchor_litept_path: /space0/mengxl/LitePT-main
-anchor_litept_grid_size: 0.02
-anchor_litept_token_dim: 512
+geometry_num_frequencies: 6
+geometry_dim: 128
+visual_feature_dim: 256
+intrinsic_feature_dim: 64
+point_type_dim: 16
 
-# Decode local residual Gaussians from aggregated anchor tokens.
-anchor_gaussian_decoder_hidden_dim: 512
-anchor_gaussians_per_anchor: 8
-anchor_scaffold_scale_divisor: 4.0
-anchor_scaffold_opacity_multiplier: 1.0
-anchor_opacity_modulator_hidden_dim: 32
-anchor_opacity_initial_parent_weight: 0.8
-anchor_child_camera_offset_beta: 0.1
+litept_token_dim: 512
+gaussian_refiner_hidden_dim: 512
+
+# GaussianLens-style pixel Gaussians start from isotropic covariance, constant
+# opacity, and the RGB value of their sampled SR pixel.
+sr_initial_opacity: 0.05
+sr_initial_covariance: 0.02

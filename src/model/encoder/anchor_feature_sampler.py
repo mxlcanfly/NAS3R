@@ -11,7 +11,6 @@ from ...geometry.projection import homogenize_points, transform_world2cam, proje
 @dataclass
 class AnchorFeatureSamples:
     features: torch.Tensor
-    entropy: torch.Tensor | None
     valid_mask: torch.Tensor
     projected_xy: torch.Tensor
     camera_depth: torch.Tensor
@@ -66,7 +65,9 @@ class AnchorFeatureSampler(nn.Module):
         feature_map: torch.Tensor,
         extrinsics: torch.Tensor,
         intrinsics: torch.Tensor,
-        entropy_map: torch.Tensor | None = None,
+        depth_map: torch.Tensor | None = None,
+        source_view: torch.Tensor | None = None,
+        depth_tolerance: float = 0.05,
     ) -> AnchorFeatureSamples:
         b, num_views, channels, feat_h, feat_w = feature_map.shape
         num_anchors = anchors.shape[1]
@@ -77,12 +78,67 @@ class AnchorFeatureSampler(nn.Module):
             intrinsics,
         )
 
+        patch_radius = (self.patch_size - 1) / 2
+        x_margin = patch_radius / max(feat_w - 1, 1)
+        y_margin = patch_radius / max(feat_h - 1, 1)
+        patch_in_bounds = (
+            (projected_xy[..., 0] >= x_margin)
+            & (projected_xy[..., 0] <= 1 - x_margin)
+            & (projected_xy[..., 1] >= y_margin)
+            & (projected_xy[..., 1] <= 1 - y_margin)
+        )
+        valid_mask = valid_mask & patch_in_bounds
+
+        if depth_map is not None:
+            if depth_map.shape[:2] != (b, num_views):
+                raise ValueError(
+                    "depth_map and feature_map must have matching batch/view axes."
+                )
+            sampled_depth = F.grid_sample(
+                rearrange(depth_map, "b v h w -> (b v) 1 h w"),
+                rearrange(
+                    projected_xy * 2 - 1,
+                    "b v n xy -> (b v) n () xy",
+                ),
+                mode="bilinear",
+                padding_mode="zeros",
+                align_corners=True,
+            )
+            sampled_depth = rearrange(
+                sampled_depth,
+                "(b v) 1 n 1 -> b v n",
+                b=b,
+                v=num_views,
+            )
+            relative_depth_error = (
+                (camera_depth - sampled_depth).abs()
+                / sampled_depth.abs().clamp_min(1e-6)
+            )
+            depth_visible = (
+                sampled_depth.isfinite()
+                & (sampled_depth > 1e-6)
+                & (relative_depth_error <= depth_tolerance)
+            )
+            valid_mask = valid_mask & depth_visible
+
+        if source_view is not None:
+            if source_view.shape != (b, num_anchors):
+                raise ValueError(
+                    f"Expected source_view shape {(b, num_anchors)}, got "
+                    f"{tuple(source_view.shape)}."
+                )
+            source_mask = F.one_hot(
+                source_view,
+                num_classes=num_views,
+            ).permute(0, 2, 1).bool()
+            valid_mask = valid_mask | source_mask
+
         camera_depth_flat = rearrange(camera_depth, "b v n -> b n v")
         valid_mask_flat = rearrange(valid_mask, "b v n -> b n v")
 
         offsets = self._patch_offsets(feature_map.device, feature_map.dtype)
         pixel_scale = torch.tensor(
-            (feat_w, feat_h),
+            (max(feat_w - 1, 1), max(feat_h - 1, 1)),
             device=feature_map.device,
             dtype=feature_map.dtype,
         )
@@ -103,51 +159,9 @@ class AnchorFeatureSampler(nn.Module):
             v=num_views,
             n=num_anchors,
         )
-        sampled_entropy = None
-        if entropy_map is not None:
-            if entropy_map.ndim != 4:
-                raise ValueError(
-                    "Expected entropy_map with shape [B, V, H, W], "
-                    f"got {tuple(entropy_map.shape)}."
-                )
-            if entropy_map.shape[:2] != (b, num_views):
-                raise ValueError(
-                    "Expected entropy_map batch/view dimensions "
-                    f"{(b, num_views)}, got {tuple(entropy_map.shape[:2])}."
-                )
-            entropy_map = entropy_map.to(
-                device=feature_map.device,
-                dtype=feature_map.dtype,
-            ).unsqueeze(2)
-            if entropy_map.shape[-2:] != (feat_h, feat_w):
-                entropy_map = F.interpolate(
-                    rearrange(entropy_map, "b v c h w -> (b v) c h w"),
-                    size=(feat_h, feat_w),
-                    mode="bilinear",
-                    align_corners=False,
-                )
-            else:
-                entropy_map = rearrange(entropy_map, "b v c h w -> (b v) c h w")
-
-            sampled_entropy = F.grid_sample(
-                entropy_map,
-                patch_grid,
-                mode="bilinear",
-                padding_mode=self.padding_mode,
-                align_corners=True,
-            )
-            sampled_entropy = rearrange(
-                sampled_entropy,
-                "(b v) c n p -> b n v (p c)",
-                b=b,
-                v=num_views,
-                n=num_anchors,
-            )
-            sampled_features = torch.cat([sampled_features, sampled_entropy], dim=-1)
 
         return AnchorFeatureSamples(
             features=sampled_features,
-            entropy=sampled_entropy,
             valid_mask=valid_mask_flat,
             projected_xy=rearrange(projected_xy, "b v n xy -> b n v xy"),
             camera_depth=camera_depth_flat,

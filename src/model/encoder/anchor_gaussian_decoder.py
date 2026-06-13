@@ -14,34 +14,51 @@ class AnchorGaussianResidualDecoder(nn.Module):
         gaussians_per_anchor: int = 8,
         sh_degree: int = 4,
         hidden_dim: int = 256,
-        camera_offset_beta: float = 0.1,
+        image_feature_dim: int = 3,
         **_: object,
     ) -> None:
         super().__init__()
         self.gaussians_per_anchor = gaussians_per_anchor
-        self.camera_offset_beta = camera_offset_beta
+        self.image_feature_dim = image_feature_dim
         self.sh_dim = (sh_degree + 1) ** 2
-        self.raw_dim = 3 + 3 + 1 + 4 + 3 * self.sh_dim
+        self.attribute_dim = 3 + 1 + 4 + 3 * self.sh_dim
 
-        self.head = nn.Sequential(
+        attribute_input_dim = token_dim + image_feature_dim
+        self.offset_head = nn.Sequential(
             nn.LayerNorm(token_dim),
             nn.Linear(token_dim, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, gaussians_per_anchor * self.raw_dim),
+            nn.Linear(hidden_dim, gaussians_per_anchor * 3),
+        )
+        self.attribute_head = nn.Sequential(
+            nn.LayerNorm(attribute_input_dim),
+            nn.Linear(attribute_input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(
+                hidden_dim,
+                gaussians_per_anchor * self.attribute_dim,
+            ),
         )
         self._initialize_head()
 
     def _initialize_head(self) -> None:
-        output = self.head[-1]
-        nn.init.zeros_(output.weight)
-        nn.init.zeros_(output.bias)
-        for child_idx in range(self.gaussians_per_anchor):
-            offset_start = child_idx * self.raw_dim
-            offset_end = offset_start + 3
-            nn.init.normal_(output.weight[offset_start:offset_end], mean=0.0, std=1e-3)
-            nn.init.normal_(output.bias[offset_start:offset_end], mean=0.0, std=1e-3)
+        nn.init.normal_(self.offset_head[-1].weight, mean=0.0, std=1e-3)
+        nn.init.normal_(self.offset_head[-1].bias, mean=0.0, std=1e-3)
+        nn.init.zeros_(self.attribute_head[-1].weight)
+        nn.init.zeros_(self.attribute_head[-1].bias)
+        # attribute layout per child: scale(3) | opacity(1) | rotation(4) | sh(...)
+        #
+        # opacity: bias = -2.0 so children start at sigmoid(logit(0.5) - 2) ≈ 0.12
+        #          instead of inheriting parent opacity (~0.5).  With K=8 co-located
+        #          children, parent opacity 0.5 gives combined alpha ≈ 0.998; 0.12
+        #          reduces this to a manageable ~0.67.
+        with torch.no_grad():
+            for k in range(self.gaussians_per_anchor):
+                self.attribute_head[-1].bias[k * self.attribute_dim + 3] = -2.0
 
     def forward(
         self,
@@ -49,82 +66,68 @@ class AnchorGaussianResidualDecoder(nn.Module):
         anchors: torch.Tensor,
         parent_gaussians: Gaussians,
         anchor_spacing: torch.Tensor | None = None,
-        extrinsics: torch.Tensor | None = None,
-        intrinsics: torch.Tensor | None = None,
-        image_shape: tuple[int, int] | torch.Size | None = None,
-        source_view_indices: torch.Tensor | None = None,
+        image_features: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor | Gaussians]:
         b, n, _ = tokens.shape
-        raw = self.head(tokens)
-        raw = rearrange(
-            raw,
-            "b n (k c) -> b n k c",
+        if image_features is None:
+            image_features = tokens.new_zeros(b, n, self.image_feature_dim)
+        if image_features.shape != (b, n, self.image_feature_dim):
+            raise ValueError(
+                "Expected image_features with shape "
+                f"{(b, n, self.image_feature_dim)}, got "
+                f"{tuple(image_features.shape)}."
+            )
+        attribute_tokens = torch.cat(
+            (
+                tokens,
+                image_features,
+            ),
+            dim=-1,
+        )
+        raw_offset = rearrange(
+            self.offset_head(tokens),
+            "b n (k xyz) -> b n k xyz",
             k=self.gaussians_per_anchor,
-            c=self.raw_dim,
+            xyz=3,
+        )
+        raw_attributes = rearrange(
+            self.attribute_head(attribute_tokens),
+            "b n (k attributes) -> b n k attributes",
+            k=self.gaussians_per_anchor,
+            attributes=self.attribute_dim,
         )
 
         cursor = 0
-        raw_offset = raw[..., cursor:cursor + 3]
+        raw_scale = raw_attributes[..., cursor:cursor + 3]
         cursor += 3
-        raw_scale = raw[..., cursor:cursor + 3]
-        cursor += 3
-        raw_opacity = raw[..., cursor:cursor + 1].squeeze(-1)
+        raw_opacity = raw_attributes[..., cursor:cursor + 1].squeeze(-1)
         cursor += 1
-        raw_rotation = raw[..., cursor:cursor + 4]
+        raw_rotation = raw_attributes[..., cursor:cursor + 4]
         cursor += 4
-        raw_sh = raw[..., cursor:cursor + 3 * self.sh_dim]
+        raw_sh = raw_attributes[..., cursor:cursor + 3 * self.sh_dim]
 
-        initial_child_means = anchors[:, :, None].expand(
-            -1,
-            -1,
-            self.gaussians_per_anchor,
-            -1,
-        )
         if anchor_spacing is None:
             anchor_spacing = torch.ones_like(anchors[..., :1])
-        camera_offset = torch.zeros_like(initial_child_means)
-        if extrinsics is not None and source_view_indices is not None:
-            camera_centers = extrinsics[..., :3, 3]
-            source_camera_centers = torch.gather(
-                camera_centers,
-                dim=1,
-                index=source_view_indices[..., None].expand(-1, -1, 3),
-            )
-            direction_to_camera = F.normalize(
-                source_camera_centers - anchors,
-                dim=-1,
-            )
-            child_factors = torch.linspace(
-                1 / self.gaussians_per_anchor,
-                1,
-                self.gaussians_per_anchor,
-                device=anchors.device,
-                dtype=anchors.dtype,
-            )
-            camera_offset = (
-                direction_to_camera[:, :, None]
-                * anchor_spacing[:, :, None]
-                * child_factors[None, None, :, None]
-                * self.camera_offset_beta
-            )
         geometry_offset = anchor_spacing[:, :, None, :] * raw_offset
-        child_means = initial_child_means + camera_offset + geometry_offset
+        child_means = anchors[:, :, None] + geometry_offset
 
-        parent_scales = parent_gaussians.scales[:, :, None]
-        child_scales = parent_scales + raw_scale
-        child_scales = child_scales.clamp_min(1e-6)
+        # Detach parent attributes so SR-branch gradients don't flow back into
+        # the LR backbone — mirrors the resplat design (all prev_* are detached).
+        parent_rotations = parent_gaussians.rotations.detach()[:, :, None]
+        parent_scales = parent_gaussians.scales.detach()[:, :, None]
 
-        parent_rotations = parent_gaussians.rotations[:, :, None]
+        child_scales = (parent_scales + raw_scale).clamp(1e-6, 0.3)
+
         child_rotations = parent_rotations + raw_rotation
         child_rotations = F.normalize(child_rotations, dim=-1)
 
-        parent_opacity = parent_gaussians.opacities[:, :, None].clamp(1e-6, 1 - 1e-6)
+        parent_opacity = parent_gaussians.opacities.detach()[:, :, None].clamp(1e-6, 1 - 1e-6)
         child_opacities = torch.sigmoid(
             torch.logit(parent_opacity)
             + raw_opacity
         )
 
-        parent_harmonics = parent_gaussians.harmonics[:, :, None]
+        parent_harmonics = parent_gaussians.harmonics.detach()[:, :, None]
         child_harmonics = parent_harmonics + rearrange(
             raw_sh,
             "b n k (rgb sh) -> b n k rgb sh",
@@ -142,17 +145,26 @@ class AnchorGaussianResidualDecoder(nn.Module):
         )
         return {
             "gaussians": child_gaussians,
+            "offsets": raw_offset,
+            "world_offsets": geometry_offset,
         }
 
 def scale_gaussian_scaffold(
     gaussians: Gaussians,
     scale_divisor: float = 4.0,
     opacity_multiplier: float = 1.0,
-) -> Gaussians:
+    preserve_original: bool = False,
+) -> Gaussians | tuple[Gaussians, Gaussians]:
+    """Scale down Gaussian scaffold while optionally preserving the original values.
+
+    The original Gaussian scales and rotations can be used later to constrain
+    offsets or rotation updates before the scaffold is reduced.
+    """
+    original_gaussians = gaussians
     scales = gaussians.scales / scale_divisor
     opacities = (gaussians.opacities * opacity_multiplier).clamp(0, 1)
     covariances = build_covariance(scales, gaussians.rotations)
-    return Gaussians(
+    scaled_gaussians = Gaussians(
         means=gaussians.means,
         covariances=covariances,
         rotations=gaussians.rotations,
@@ -160,3 +172,6 @@ def scale_gaussian_scaffold(
         harmonics=gaussians.harmonics,
         opacities=opacities,
     )
+    if preserve_original:
+        return scaled_gaussians, original_gaussians
+    return scaled_gaussians

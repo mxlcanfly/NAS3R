@@ -10,6 +10,7 @@ from lightning.pytorch.callbacks import Callback
 from jaxtyping import install_import_hook
 from lightning.pytorch import Trainer
 from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
+from lightning.pytorch.loggers import TensorBoardLogger
 from lightning.pytorch.loggers.wandb import WandbLogger
 from lightning.pytorch.plugins.environments import SLURMEnvironment
 from omegaconf import DictConfig, OmegaConf
@@ -124,6 +125,14 @@ def train(cfg_dict: DictConfig):
             wandb.run.log_code("src")
     else:
         logger = LocalLogger()
+
+    tensorboard_logger = TensorBoardLogger(
+        save_dir=output_dir,
+        name="tensorboard",
+        version="",
+        default_hp_metric=False,
+    )
+    logger = [logger, tensorboard_logger]
 
     # Set up checkpointing.
     callbacks.append(

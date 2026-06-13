@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Protocol, runtime_checkable, Any, Dict
+from typing import Optional, Protocol, runtime_checkable
 
 import moviepy.editor as mpy
 import torch
@@ -8,16 +8,13 @@ import wandb
 from einops import pack, rearrange, repeat
 from jaxtyping import Float
 from lightning.pytorch import LightningModule
+from lightning.pytorch.loggers import TensorBoardLogger
 from lightning.pytorch.loggers.wandb import WandbLogger
 from lightning.pytorch.utilities import rank_zero_only
 from tabulate import tabulate
-from torch import Tensor, nn, optim
+from torch import Tensor, nn
 import json
 import numpy as np
-import cv2
-import os
-import time
-import torch.nn.functional as F
 
 from ..dataset.data_module import get_data_shim
 from ..dataset.types import BatchedExample
@@ -30,7 +27,7 @@ from ..misc.image_io import prep_image, save_image, save_video
 from ..misc.LocalLogger import LOG_PATH, LocalLogger
 from ..misc.nn_module_tools import convert_to_buffer
 from ..misc.step_tracker import StepTracker
-from ..misc.utils import vis_depth_map, confidence_map, get_overlap_tag
+from ..misc.utils import get_overlap_tag, vis_depth_map
 from .ply_export import export_ply
 from ..visualization.annotation import add_label
 from ..visualization.camera_trajectory.interpolation import (
@@ -41,14 +38,13 @@ from ..visualization.camera_trajectory.wobble import (
     generate_wobble,
     generate_wobble_transformation,
 )
-from ..visualization.color_map import apply_color_map_to_image
 from ..visualization.layout import add_border, hcat, vcat
-from ..visualization.validation_in_3d import render_cameras, render_projections, render_cameras_es
 from .decoder.decoder import Decoder, DepthRenderingMode
 from .encoder import Encoder
 from .encoder.visualization.encoder_visualizer import EncoderVisualizer
+from .types import Gaussians
 from ..misc.intrinsics_utils import estimate_intrinsics
-from ..evaluation.metrics import compute_pose_error, compute_pose_error_for_batch
+from ..evaluation.metrics import compute_pose_error_for_batch
 from ..misc.cam_utils import pose_auc
 
 
@@ -90,10 +86,7 @@ class TrainCfg:
     random_drop_target_views: bool = False
 
     pretrain_camera_head: bool = False
-    refine_only: bool = False
-    lr_gaussian_supervision_weight: float = 1.0
-    depth_smoothness_weight: float = 0.0
-    debug_save_every_n_steps: int = 0
+    debug_save_every_n_steps: int = 500
 
 
 def dropout_context_views(v_cxt):
@@ -170,8 +163,6 @@ class ModelWrapper(LightningModule):
         self.encoder = encoder
         self.encoder_visualizer = encoder_visualizer
         self.decoder = decoder
-        if hasattr(self.encoder, "set_context_renderer"):
-            self.encoder.set_context_renderer(self.decoder)
         self.data_shim = get_data_shim(self.encoder)
         self.losses = nn.ModuleList(losses)
 
@@ -196,268 +187,123 @@ class ModelWrapper(LightningModule):
 
         self.ckpt_path = None
 
-    def _image_key(self, views: dict) -> str:
-        if getattr(self.encoder.cfg, "name", None) == "nas3r-m" and "image_lr" in views:
-            return "image_lr"
-        return "image"
-
-    def _images(self, views: dict) -> Tensor:
-        return views[self._image_key(views)]
-
-    def _training_debug_dir(self) -> Path:
-        checkpoint_callback = getattr(self.trainer, "checkpoint_callback", None)
-        checkpoint_dir = getattr(checkpoint_callback, "dirpath", None)
-        if checkpoint_dir is None:
-            checkpoint_dir = Path(self.trainer.default_root_dir) / "checkpoints"
-        return Path(checkpoint_dir) / "debug_train" / f"step_{self.global_step:0>6}"
-
-    def _debug_panel(self, image: Tensor, label: str) -> Tensor:
-        image = image.detach().float().clip(0, 1)
-        return add_label(add_border(image, 2, 0), label, font_size=18)
-
-    def _debug_error_map(self, error: Tensor, color_map: str = "magma") -> Tensor:
-        error = error.detach().float()
-        finite = torch.isfinite(error)
-        if not finite.any():
-            normalized = torch.zeros_like(error)
-        else:
-            valid = error[finite]
-            scale = valid.quantile(0.99).clamp_min(1e-6)
-            normalized = (error / scale).nan_to_num().clip(0, 1)
-        return apply_color_map_to_image(normalized, color_map)
-
-    def _debug_rgb_error(self, pred: Tensor, gt: Tensor) -> Tensor:
-        return self._debug_error_map((pred.detach() - gt.detach()).abs().mean(dim=0))
-
-    @torch.no_grad()
-    def _save_training_debug_outputs(
-            self,
-            batch: BatchedExample,
-            output,
-            gaussians,
-            target_gt: Tensor,
-            context_extrinsics: Tensor,
-            context_intrinsics: Tensor,
-            encoder_output: dict,
-            image_shape: tuple[int, int],
+    def _log_gaussian_distributions(
+        self,
+        gaussian_groups: dict[str, Gaussians],
     ) -> None:
-        if self.global_rank != 0:
+        interval = self.train_cfg.debug_save_every_n_steps
+        if (
+            interval <= 0
+            or self.global_rank != 0
+            or self.global_step % interval != 0
+        ):
             return
-        if self.train_cfg.debug_save_every_n_steps <= 0:
+
+        tensorboard_logger = next(
+            (
+                logger
+                for logger in self.loggers
+                if isinstance(logger, TensorBoardLogger)
+            ),
+            None,
+        )
+        if tensorboard_logger is None:
             return
-        if self.global_step % self.train_cfg.debug_save_every_n_steps != 0:
+
+        writer = tensorboard_logger.experiment
+        max_histogram_values = 200_000
+        for group_name, gaussians in gaussian_groups.items():
+            scales = gaussians.scales.detach().float().reshape(-1, 3)
+            opacities = gaussians.opacities.detach().float().reshape(-1)
+            if scales.shape[0] > max_histogram_values:
+                sample_step = max(
+                    scales.shape[0] // max_histogram_values,
+                    1,
+                )
+                scales = scales[::sample_step][:max_histogram_values]
+            if opacities.shape[0] > max_histogram_values:
+                sample_step = max(
+                    opacities.shape[0] // max_histogram_values,
+                    1,
+                )
+                opacities = opacities[::sample_step][:max_histogram_values]
+
+            scales = scales.cpu()
+            opacities = opacities.cpu()
+            for hist_name, hist_values in (
+                ("scale_x", scales[:, 0]),
+                ("scale_y", scales[:, 1]),
+                ("scale_z", scales[:, 2]),
+                ("scale_norm", scales.norm(dim=-1)),
+                ("opacity", opacities),
+            ):
+                writer.add_histogram(
+                    f"gaussians/{group_name}/{hist_name}",
+                    hist_values,
+                    self.global_step,
+                )
+            for stat_name, stat_val in (
+                ("scale_mean", scales.mean()),
+                ("scale_std", scales.std()),
+                ("scale_max", scales.max()),
+                ("opacity_mean", opacities.mean()),
+                ("opacity_std", opacities.std()),
+                ("opacity_min", opacities.min()),
+                ("opacity_max", opacities.max()),
+            ):
+                writer.add_scalar(
+                    f"gaussians/{group_name}/{stat_name}",
+                    stat_val,
+                    self.global_step,
+                )
+
+    def _save_training_debug(
+        self,
+        target_gt: Tensor,
+        joint_output,
+        gaussian_groups: dict[str, Gaussians],
+        reference_extrinsics: Tensor,
+        target_view_index: int,
+    ) -> None:
+        interval = self.train_cfg.debug_save_every_n_steps
+        if (
+            interval <= 0
+            or self.global_rank != 0
+            or self.global_step % interval != 0
+        ):
             return
 
-        debug_dir = self._training_debug_dir()
-        debug_dir.mkdir(exist_ok=True, parents=True)
-        num_context_views = context_extrinsics.shape[1]
+        checkpoint_dir = Path(self.trainer.checkpoint_callback.dirpath)
+        debug_dir = (
+            checkpoint_dir
+            / "debug_train"
+            / f"step_{self.global_step:06d}"
+        )
+        debug_dir.mkdir(parents=True, exist_ok=True)
 
-        rendered_rows = []
-        for view_idx in range(output.color.shape[1]):
-            if self.train_cfg.training_context and view_idx < num_context_views:
-                view_label = f"context view {view_idx}"
-            else:
-                target_idx = view_idx - num_context_views if self.train_cfg.training_context else view_idx
-                view_label = f"target view {target_idx}"
+        target_image = target_gt[0, target_view_index].detach()
+        joint_image = joint_output.color[0, target_view_index].detach()
+        joint_depth = vis_depth_map(
+            joint_output.depth[0, target_view_index].detach()
+        )
 
-            row_panels = [
-                self._debug_panel(target_gt[0, view_idx], f"{view_label} GT RGB"),
-                self._debug_panel(output.color[0, view_idx], f"{view_label} rendered RGB"),
-                self._debug_panel(
-                    self._debug_rgb_error(output.color[0, view_idx], target_gt[0, view_idx]),
-                    f"{view_label} RGB abs error",
-                ),
-            ]
-            if output.depth is not None:
-                row_panels.append(
-                    self._debug_panel(
-                        vis_depth_map(output.depth[0, view_idx].detach()),
-                        f"{view_label} rendered depth",
-                    )
-                )
-            rendered_rows.append(hcat(*row_panels, align="top"))
+        comparison = hcat(
+            add_label(target_image, "Target RGB"),
+            add_label(joint_image, "LR + SR Gaussian Render"),
+            add_label(joint_depth, "LR + SR Rendered Depth"),
+        )
+        save_image(add_border(comparison), debug_dir / "comparison.png")
 
-        comparison_sections = []
-        if rendered_rows:
-            rendered_section = add_label(
-                vcat(*rendered_rows, align="left"),
-                "Rendered supervision views",
-                font_size=22,
-            )
-            comparison_sections.append(rendered_section)
-
-        if "context_lr_depth" in encoder_output:
-            if self.train_cfg.training_context:
-                context_rendered_depth = (
-                    output.depth[:, :context_extrinsics.shape[1]]
-                    if output.depth is not None
-                    else None
-                )
-                context_rendered_color = output.color[:, :context_extrinsics.shape[1]]
-            else:
-                context_output = self.decoder.forward(
-                    gaussians,
-                    context_extrinsics,
-                    context_intrinsics,
-                    batch["context"]["near"],
-                    batch["context"]["far"],
-                    image_shape,
-                    depth_mode=self.train_cfg.depth_mode,
-                )
-                context_rendered_depth = context_output.depth
-                context_rendered_color = context_output.color
-
-            if context_rendered_depth is not None:
-                lr_depth_up = F.interpolate(
-                    rearrange(
-                        encoder_output["context_lr_depth"][0].detach(),
-                        "v h w -> v () h w",
-                    ),
-                    size=context_rendered_depth.shape[-2:],
-                    mode="bilinear",
-                    align_corners=False,
-                ).squeeze(1)
-
-                context_depth_rows = []
-                for view_idx in range(context_extrinsics.shape[1]):
-                    depth_error = (context_rendered_depth[0, view_idx].detach() - lr_depth_up[view_idx]).abs()
-                    context_depth_rows.append(
-                        hcat(
-                            self._debug_panel(
-                                vis_depth_map(lr_depth_up[view_idx]),
-                                f"context view {view_idx} LR depth upsampled",
-                            ),
-                            self._debug_panel(
-                                vis_depth_map(context_rendered_depth[0, view_idx].detach()),
-                                f"context view {view_idx} rendered depth",
-                            ),
-                            self._debug_panel(
-                                self._debug_error_map(depth_error, "magma"),
-                                f"context view {view_idx} depth abs error",
-                            ),
-                            align="top",
-                        )
-                    )
-                context_depth_section = add_label(
-                    vcat(*context_depth_rows, align="left"),
-                    "Context depth consistency",
-                    font_size=22,
-                )
-                comparison_sections.append(context_depth_section)
-
-            if context_rendered_color is not None:
-                context_rgb_rows = []
-                for view_idx in range(context_extrinsics.shape[1]):
-                    context_gt = batch["context"]["image"][0, view_idx]
-                    context_rgb_rows.append(
-                        hcat(
-                            self._debug_panel(context_gt, f"context view {view_idx} GT RGB"),
-                            self._debug_panel(
-                                context_rendered_color[0, view_idx],
-                                f"context view {view_idx} rendered RGB",
-                            ),
-                            self._debug_panel(
-                                self._debug_rgb_error(context_rendered_color[0, view_idx], context_gt),
-                                f"context view {view_idx} RGB abs error",
-                            ),
-                            align="top",
-                        ),
-                    )
-                context_rgb_section = add_label(
-                    vcat(*context_rgb_rows, align="left"),
-                    "Context RGB render check",
-                    font_size=22,
-                )
-                save_image(add_border(context_rgb_section), debug_dir / "context_render_rgb.png")
-
-        if comparison_sections:
-            save_image(
-                add_border(vcat(*comparison_sections, align="left")),
-                debug_dir / "comparison.png",
-            )
-
-        for view_idx in range(context_extrinsics.shape[1]):
+        for group_name, gaussians in gaussian_groups.items():
             export_ply(
-                context_extrinsics[0, view_idx].detach(),
+                reference_extrinsics.detach(),
                 gaussians.means[0].detach(),
                 gaussians.scales[0].detach(),
                 gaussians.rotations[0].detach(),
                 gaussians.harmonics[0].detach(),
                 gaussians.opacities[0].detach(),
-                debug_dir / f"context_view{view_idx}_gaussians.ply",
+                debug_dir / f"{group_name}_gaussians.ply",
             )
-
-    def _depth_smoothness_loss(
-            self,
-            rendered_depth: Tensor,
-            reference_image: Tensor,
-            near: Tensor,
-            far: Tensor,
-    ) -> Tensor:
-        if rendered_depth is None:
-            raise RuntimeError("Depth smoothness requires decoder output.depth.")
-
-        b, v, h, w = rendered_depth.shape
-        if reference_image.shape[-2:] != (h, w):
-            reference_image = F.interpolate(
-                rearrange(reference_image, "b v c h w -> (b v) c h w"),
-                size=(h, w),
-                mode="bilinear",
-                align_corners=False,
-            )
-            reference_image = rearrange(
-                reference_image,
-                "(b v) c h w -> b v c h w",
-                b=b,
-                v=v,
-            )
-
-        near = near[..., None, None]
-        far = far[..., None, None]
-        valid = (
-            torch.isfinite(rendered_depth)
-            & (rendered_depth > near)
-            & (rendered_depth < far)
-        )
-        if not valid.any():
-            return rendered_depth.new_zeros(())
-
-        inverse_depth = torch.where(
-            valid,
-            rendered_depth.clamp_min(1e-6).reciprocal(),
-            torch.zeros_like(rendered_depth),
-        )
-        valid_count = valid.sum(dim=(-2, -1), keepdim=True).clamp_min(1)
-        mean_inverse_depth = (
-            inverse_depth.sum(dim=(-2, -1), keepdim=True) / valid_count
-        ).clamp_min(1e-6)
-        inverse_depth = inverse_depth / mean_inverse_depth
-
-        depth_dx = (inverse_depth[..., :, 1:] - inverse_depth[..., :, :-1]).abs()
-        depth_dy = (inverse_depth[..., 1:, :] - inverse_depth[..., :-1, :]).abs()
-        image_dx = (
-            reference_image[..., :, 1:] - reference_image[..., :, :-1]
-        ).abs().mean(dim=2)
-        image_dy = (
-            reference_image[..., 1:, :] - reference_image[..., :-1, :]
-        ).abs().mean(dim=2)
-
-        valid_dx = valid[..., :, 1:] & valid[..., :, :-1]
-        valid_dy = valid[..., 1:, :] & valid[..., :-1, :]
-        weighted_dx = depth_dx * torch.exp(-10 * image_dx)
-        weighted_dy = depth_dy * torch.exp(-10 * image_dy)
-
-        loss_x = (
-            weighted_dx[valid_dx].mean()
-            if valid_dx.any()
-            else rendered_depth.new_zeros(())
-        )
-        loss_y = (
-            weighted_dy[valid_dy].mean()
-            if valid_dy.any()
-            else rendered_depth.new_zeros(())
-        )
-        return loss_x + loss_y
 
     def training_step(self, batch, batch_idx):
         # combine batch from different dataloaders
@@ -480,9 +326,19 @@ class ModelWrapper(LightningModule):
         if self.train_cfg.random_drop_context_views:
             v_cxt = batch["context"]["image"].shape[1]
             selected_indices = dropout_context_views(v_cxt)
-            for key in ["image", "image_lr", "intrinsics", "extrinsics", "index", "near", "far"]:
-                if key in batch["context"]:
-                    batch["context"][key] = batch["context"][key][:, selected_indices]
+            context_keys = [
+                "image",
+                "image_lr",
+                "intrinsics",
+                "extrinsics",
+                "index",
+                "near",
+                "far",
+            ]
+            for key in context_keys:
+                if key not in batch["context"]:
+                    continue
+                batch["context"][key] = batch["context"][key][:, selected_indices]
 
         if self.train_cfg.random_drop_target_views:
             v_tgt = batch["target"]["image"].shape[1]
@@ -490,19 +346,17 @@ class ModelWrapper(LightningModule):
             for key in batch["target"].keys():
                 batch["target"][key] = batch["target"][key][:, selected_indices]
 
-        target_image = batch["target"]["image"]
-        context_image = batch["context"]["image"]
-        b, v_tgt, _, h, w = target_image.shape
+        b, v_tgt, _, h, w = batch["target"]["image"].shape
         v_cxt = batch["context"]["image"].shape[1]
 
         # Run the model.
         visualization_dump = {}
         encoder_output = self.encoder(batch["context"], self.global_step, visualization_dump=visualization_dump,
-                                      target=batch["target"] if self.encoder.cfg.estimating_pose else None)
+                                      target=batch["target"] if self.encoder.cfg.estimating_pose else None,
+                                      gaussian_renderer=self.decoder.forward)
 
         if self.encoder.cfg.estimating_pose:
-            pred_extrinsics, pred_extrinsics_cwt = encoder_output['extrinsics']['c'], encoder_output['extrinsics'][
-                'cwt']
+            pred_extrinsics_cwt = encoder_output["extrinsics"]["cwt"]
             target_extrinsics = pred_extrinsics_cwt[:, v_cxt:]
             context_extrinsics = pred_extrinsics_cwt[:, :v_cxt]
         else:
@@ -519,9 +373,8 @@ class ModelWrapper(LightningModule):
             context_intrinsics = batch["context"]["intrinsics"]
 
         total_loss = 0
-
         gaussians = encoder_output["gaussians"]
-        lr_gaussians = encoder_output.get("lr_gaussians")
+        lr_gaussians = encoder_output["lr_gaussians"]
         # Determine decoder inputs
         extrinsics = target_extrinsics if not self.train_cfg.training_context else torch.cat(
             [context_extrinsics, target_extrinsics], dim=1)
@@ -531,11 +384,11 @@ class ModelWrapper(LightningModule):
             [batch["context"]["near"], batch["target"]["near"]], dim=1)
         far = batch["target"]["far"] if not self.train_cfg.training_context else torch.cat(
             [batch["context"]["far"], batch["target"]["far"]], dim=1)
-        target_gt = target_image if not self.train_cfg.training_context else torch.cat(
-            [context_image, target_image], dim=1)
+        target_gt = batch["target"]["image"] if not self.train_cfg.training_context else torch.cat(
+            [batch["context"]["image"], batch["target"]["image"]], dim=1)
 
-        # Render the final LR+SR Gaussian representation.
-        output = self.decoder.forward(
+        # Only the refined LR + entropy-guided SR union is supervised.
+        joint_output = self.decoder.forward(
             gaussians,
             extrinsics,
             intrinsics,
@@ -544,96 +397,39 @@ class ModelWrapper(LightningModule):
             (h, w),
             depth_mode=self.train_cfg.depth_mode,
         )
-        lr_output = None
-        if (
-                lr_gaussians is not None
-                and self.train_cfg.lr_gaussian_supervision_weight > 0
-        ):
-            lr_output = self.decoder.forward(
-                lr_gaussians,
-                extrinsics,
-                intrinsics,
-                near,
-                far,
-                (h, w),
-                depth_mode=None,
-            )
-        self._save_training_debug_outputs(
-            batch,
-            output,
-            gaussians,
-            target_gt,
-            context_extrinsics,
-            context_intrinsics,
-            encoder_output,
-            (h, w),
-        )
 
-        # Compute PSNR
-        psnr = compute_psnr(
-            rearrange(target_gt, "b v c h w -> (b v) c h w"),
-            rearrange(output.color, "b v c h w -> (b v) c h w"),
-        )
-        self.log(f"train/psnr", psnr.mean())
-        if lr_output is not None:
-            lr_psnr = compute_psnr(
-                rearrange(target_gt, "b v c h w -> (b v) c h w"),
-                rearrange(lr_output.color, "b v c h w -> (b v) c h w"),
-            )
-            self.log("train/lr_psnr", lr_psnr.mean())
+        target_gt_flat = rearrange(target_gt, "b v c h w -> (b v) c h w")
+        psnr = compute_psnr(target_gt_flat, rearrange(joint_output.color, "b v c h w -> (b v) c h w"))
+        self.log("train/psnr", psnr.mean())
 
-        # Supervise the final LR+SR Gaussians.
         for loss_fn in self.losses:
-            if loss_fn.name in ['mse', 'lpips']:
-                loss = loss_fn.forward(output.color, target_gt, gaussians, self.global_step)
-                self.log(f"loss/final_{loss_fn.name}", loss)
-                total_loss += loss
-
-                if lr_output is not None:
-                    lr_loss = loss_fn.forward(
-                        lr_output.color,
-                        target_gt,
-                        lr_gaussians,
-                        self.global_step,
-                    )
-                    lr_loss = (
-                        self.train_cfg.lr_gaussian_supervision_weight
-                        * lr_loss
-                    )
-                    self.log(f"loss/lr_{loss_fn.name}", lr_loss)
-                    total_loss += lr_loss
-
-        if (
-                self.train_cfg.depth_smoothness_weight > 0
-        ):
-            if self.train_cfg.training_context:
-                context_rendered_depth = output.depth[:, :v_cxt]
-            else:
-                context_output = self.decoder.forward(
-                    gaussians,
-                    context_extrinsics,
-                    context_intrinsics,
-                    batch["context"]["near"],
-                    batch["context"]["far"],
-                    (h, w),
-                    depth_mode=self.train_cfg.depth_mode,
-                )
-                context_rendered_depth = context_output.depth
-
-            depth_smoothness_loss = self._depth_smoothness_loss(
-                context_rendered_depth,
-                context_image,
-                batch["context"]["near"],
-                batch["context"]["far"],
+            if loss_fn.name not in ('mse', 'lpips'):
+                continue
+            loss = loss_fn.forward(
+                joint_output.color,
+                target_gt,
+                gaussians,
+                self.global_step,
             )
-            depth_smoothness_loss = (
-                self.train_cfg.depth_smoothness_weight
-                * depth_smoothness_loss
-            )
-            self.log("loss/depth_smoothness", depth_smoothness_loss)
-            total_loss += depth_smoothness_loss
+            self.log(f"loss/{loss_fn.name}", loss)
+            total_loss += loss
 
         self.log("loss/total", total_loss)
+        self._log_gaussian_distributions({
+            "lr": lr_gaussians,
+            "sr": encoder_output["sr_gaussians"],
+        })
+        target_view_index = v_cxt if self.train_cfg.training_context else 0
+        self._save_training_debug(
+            target_gt,
+            joint_output,
+            {
+                "lr": lr_gaussians,
+                "sr": encoder_output["sr_gaussians"],
+            },
+            context_extrinsics[0, 0],
+            target_view_index,
+        )
 
         if self.encoder.cfg.estimating_pose:
             context_rot_error, context_transl_error = compute_pose_error_for_batch(pred_extrinsics_cwt[:, v_cxt - 1],
@@ -670,8 +466,7 @@ class ModelWrapper(LightningModule):
 
     def test_step(self, batch, batch_idx):
         v_cxt = batch["context"]["image"].shape[1]
-        target_image = self._images(batch["target"])
-        b, v_tgt, _, h, w = target_image.shape
+        b, v_tgt, _, h, w = batch["target"]["image"].shape
         assert b == 1
 
         if batch_idx % 100 == 0:
@@ -692,11 +487,14 @@ class ModelWrapper(LightningModule):
                     "far": batch["target"]["far"][:, target_view:target_view + 1],
                 }
                 if "image_lr" in batch["target"]:
-                    target_data["image_lr"] = batch["target"]["image_lr"][:, target_view:target_view + 1]
+                    target_data["image_lr"] = batch["target"]["image_lr"][
+                        :, target_view:target_view + 1
+                    ]
 
                 with self.benchmarker.time("encoder"):
                     encoder_output = self.encoder(batch["context"], self.global_step,
-                                                  visualization_dump=visualization_dump, target=target_data)
+                                                  visualization_dump=visualization_dump, target=target_data,
+                                                  gaussian_renderer=self.decoder.forward)
 
                 pred_extrinsics_cwt = encoder_output['extrinsics']['cwt']
                 gaussians = encoder_output["gaussians"]
@@ -733,7 +531,12 @@ class ModelWrapper(LightningModule):
         else:
             # Render Gaussians.
             with self.benchmarker.time("encoder"):
-                encoder_output = self.encoder(batch["context"], self.global_step, visualization_dump=visualization_dump)
+                encoder_output = self.encoder(
+                    batch["context"],
+                    self.global_step,
+                    visualization_dump=visualization_dump,
+                    gaussian_renderer=self.decoder.forward,
+                )
 
             target_extrinsics = batch["target"]["extrinsics"]
 
@@ -762,7 +565,7 @@ class ModelWrapper(LightningModule):
             rgb_pred = output.color[0]  # (v, 3, h, w)
 
         (scene,) = batch["scene"]
-        rgb_gt = target_image[0]
+        rgb_gt = batch["target"]["image"][0]
 
         # compute scores
         if self.test_cfg.compute_scores:
@@ -821,7 +624,7 @@ class ModelWrapper(LightningModule):
 
         if self.test_cfg.save_compare:
             # Construct comparison image.
-            context_img = self._images(batch["context"])[0]
+            context_img = batch["context"]["image"][0]
             comparison = [
                 add_label(vcat(*context_img), "Context"),
                 add_label(vcat(*rgb_gt), "Target (Ground Truth)"),
@@ -835,9 +638,7 @@ class ModelWrapper(LightningModule):
         for param in self.encoder.parameters():
             param.requires_grad = False
 
-        target_image = self._images(target)
-        b, v, _, h, w = target_image.shape
-        device = target_image.device
+        b, v, _, h, w = target["image"].shape
         with torch.set_grad_enabled(True):
             if initial_extrinsics is not None:
                 extrinsics = nn.Parameter(initial_extrinsics)
@@ -871,7 +672,7 @@ class ModelWrapper(LightningModule):
                     total_loss = 0
                     for loss_fn in self.losses:
                         if loss_fn.name in ["mse", "lpips"]:
-                            loss = loss_fn.forward(output.color, target_image, gaussians, self.global_step)
+                            loss = loss_fn.forward(output.color, target["image"], gaussians, self.global_step)
                             total_loss = total_loss + loss
 
                     total_loss.backward()
@@ -942,9 +743,8 @@ class ModelWrapper(LightningModule):
             v_cxt = batch["context"]["image"].shape[1]
             selected_indices = dropout_context_views(v_cxt)
             # Apply selection to all context elements
-            for key in ["image", "image_lr", "intrinsics", "extrinsics", "index", "near", "far"]:
-                if key in batch["context"]:
-                    batch["context"][key] = batch["context"][key][:, selected_indices]
+            for key in ["image", "intrinsics", "extrinsics", "index", "near", "far"]:
+                batch["context"][key] = batch["context"][key][:, selected_indices]
 
         if self.train_cfg.random_drop_target_views:
             v_tgt = batch["target"]["image"].shape[1]
@@ -962,18 +762,16 @@ class ModelWrapper(LightningModule):
             )
 
         v_cxt = batch["context"]["image"].shape[1]
-        target_image = self._images(batch["target"])
-        context_image = self._images(batch["context"])
-        b, v_tgt, _, h, w = target_image.shape
+        b, v_tgt, _, h, w = batch["target"]["image"].shape
         assert b == 1
 
         visualization_dump = {}
         encoder_output = self.encoder(batch["context"], self.global_step, visualization_dump=visualization_dump,
-                                      target=batch["target"] if self.encoder.cfg.estimating_pose else None)
+                                      target=batch["target"] if self.encoder.cfg.estimating_pose else None,
+                                      gaussian_renderer=self.decoder.forward)
 
         if self.encoder.cfg.estimating_pose:
-            pred_extrinsics, pred_extrinsics_cwt = encoder_output['extrinsics']['c'], encoder_output['extrinsics'][
-                'cwt']
+            pred_extrinsics_cwt = encoder_output["extrinsics"]["cwt"]
             target_extrinsics = pred_extrinsics_cwt[:, v_cxt:]
             context_extrinsics = pred_extrinsics_cwt[:, :v_cxt]
         else:
@@ -1000,7 +798,7 @@ class ModelWrapper(LightningModule):
         intrinsics = torch.cat([context_intrinsics, target_intrinsics], dim=1)
         near = torch.cat([batch["context"]["near"], batch["target"]["near"]], dim=1)
         far = torch.cat([batch["context"]["far"], batch["target"]["far"]], dim=1)
-        target_gt = torch.cat([context_image, target_image], dim=1)
+        target_gt = torch.cat([batch["context"]["image"], batch["target"]["image"]], dim=1)
 
         # Run decoder
         output = self.decoder.forward(
@@ -1035,7 +833,7 @@ class ModelWrapper(LightningModule):
         self.log(f"val/context/ssim", ssim_val)
 
         # Construct comparison image.
-        context_img = context_image[0]
+        context_img = batch["context"]["image"][0]
         context_img_depth = vis_depth_map(visualization_dump["depth"][0])  # (v, h, w)
 
         comparison = hcat(
@@ -1160,12 +958,12 @@ class ModelWrapper(LightningModule):
     ) -> None:
         # Render probabilistic estimate of scene.
 
-        _, _, _, h, w = self._images(batch["context"]).shape
+        _, _, _, h, w = batch["context"]["image"].shape
         _, v_cxt, _, _ = batch["context"]["extrinsics"].shape
 
         visualization_dump = {}
         encoder_output = self.encoder(batch["context"], self.global_step, visualization_dump=visualization_dump,
-                                      target=None)
+                                      target=None, gaussian_renderer=self.decoder.forward)
         gaussians = encoder_output['gaussians']
 
         if self.encoder.cfg.estimating_pose:
@@ -1299,74 +1097,46 @@ class ModelWrapper(LightningModule):
                     print(f"Freezing: {name}")
 
     def configure_optimizers(self):
-        if self.train_cfg.refine_only:
-            trainable_keywords = (
-                "resunet_token_fusion",
-                "anchor_feature_aggregator",
-                "anchor_geometry_encoder",
-                "anchor_litept_fusion",
-                "anchor_opacity_modulator",
-                "anchor_gaussian_decoder",
-                "gaussian_param_head",
-                "gaussian_param_head2",
-            )
-            for name, param in self.named_parameters():
-                param.requires_grad = any(keyword in name for keyword in trainable_keywords)
-
         new_params, new_param_names = [], []
         pretrained_params, pretrained_param_names = [], []
-
-        has_pretrained_backbone = getattr(self.encoder.backbone.cfg, "pretrained", False)
-        has_pretrained_encoder_weights = bool(getattr(self.encoder.cfg, "pretrained_weights", ""))
-        if not (has_pretrained_backbone or has_pretrained_encoder_weights):
-            for name, param in self.named_parameters():
-                if not param.requires_grad:
-                    continue
+        new_module_names = (
+            "resunet_token_fusion",
+            "lr_visual_proj",
+            "sr_visual_proj",
+            "intrinsic_encoder",
+            "point_geometry_encoder",
+            "point_type_embedding",
+            "anchor_litept_fusion",
+            "gaussian_residual_refiner",
+        )
+        for name, param in self.named_parameters():
+            if not param.requires_grad:
+                continue
+            if any(module_name in name for module_name in new_module_names):
                 new_params.append(param)
                 new_param_names.append(name)
-        else:
-            for name, param in self.named_parameters():
-                if not param.requires_grad:
-                    continue
+            else:
+                pretrained_params.append(param)
+                pretrained_param_names.append(name)
 
-                # Newly added refinement modules are trained with the full LR.
-                if any(
-                    x in name
-                    for x in [
-                        "resunet_token_fusion",
-                        "anchor_feature_aggregator",
-                        "anchor_geometry_encoder",
-                        "anchor_litept_fusion",
-                        "anchor_opacity_modulator",
-                        "anchor_gaussian_decoder",
-                    ]
-                ):
-                    new_params.append(param)
-                    new_param_names.append(name)
-                    # print(name)
-
-                # Camera head logic
-                elif "camera_head" in name:
-                    if self.train_cfg.pretrain_camera_head:
-                        pretrained_params.append(param)
-                        pretrained_param_names.append(name)
-                    else:
-                        new_params.append(param)
-                        new_param_names.append(name)
-                else:
-                    pretrained_params.append(param)
-                    pretrained_param_names.append(name)
-
-        param_dicts = [
-            {
-                "params": new_params,
-                "lr": self.optimizer_cfg.lr,
-            },
-            {
-                "params": pretrained_params,
-                "lr": self.optimizer_cfg.lr * self.optimizer_cfg.backbone_lr_multiplier,
-            },
-        ]
+        param_dicts = []
+        if new_params:
+            param_dicts.append(
+                {
+                    "params": new_params,
+                    "lr": self.optimizer_cfg.lr,
+                }
+            )
+        if pretrained_params:
+            param_dicts.append(
+                {
+                    "params": pretrained_params,
+                    "lr": (
+                        self.optimizer_cfg.lr
+                        * self.optimizer_cfg.backbone_lr_multiplier
+                    ),
+                }
+            )
         optimizer = torch.optim.AdamW(param_dicts, lr=self.optimizer_cfg.lr, weight_decay=0.05, betas=(0.9, 0.95))
         warm_up_steps = self.optimizer_cfg.warm_up_steps
         warm_up = torch.optim.lr_scheduler.LinearLR(

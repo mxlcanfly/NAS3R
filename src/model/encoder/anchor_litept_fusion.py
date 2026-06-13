@@ -103,6 +103,7 @@ class AnchorLitePTFusion(nn.Module):
         self.use_full_litept = use_full_litept
         self.litept_grid_size = litept_grid_size
         self.last_litept_error: str | None = None
+        self.force_per_sample_litept = False
 
         self.input_proj = nn.Sequential(
             nn.Linear(feature_dim + geometry_dim, token_dim),
@@ -158,6 +159,94 @@ class AnchorLitePTFusion(nn.Module):
             dec_num_head=litept_dec_num_head,
         )
 
+    @staticmethod
+    def _is_spconv_int32_error(exc: Exception) -> bool:
+        message = str(exc).lower()
+        return (
+            "int32 range" in message
+            or "int_max assert" in message
+            or "your data exceed int32" in message
+        )
+
+    def _restore_litept_point_count(
+        self,
+        point,
+        input_count: int,
+    ) -> torch.Tensor:
+        litept_feat = point.feat
+        if litept_feat.shape[0] == input_count:
+            return litept_feat
+
+        inverse = getattr(point, "inverse", None)
+        if inverse is None:
+            inverse = getattr(point, "unpooling_inverse", None)
+        if inverse is None or inverse.shape[0] != input_count:
+            raise RuntimeError(
+                "LitePT changed point count but did not return a valid inverse "
+                f"mapping: feat={tuple(litept_feat.shape)}, inverse="
+                f"{None if inverse is None else tuple(inverse.shape)}, "
+                f"input_count={input_count}."
+            )
+        return litept_feat[inverse]
+
+    def _litept_input(
+        self,
+        coord: torch.Tensor,
+        feat: torch.Tensor,
+        offset: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        return {
+            "coord": coord,
+            "grid_size": torch.tensor(
+                self.litept_grid_size,
+                device=coord.device,
+                dtype=coord.dtype,
+            ),
+            "feat": feat,
+            "offset": offset,
+        }
+
+    def _run_litept_per_sample(
+        self,
+        anchors: torch.Tensor,
+        tokens: torch.Tensor,
+    ) -> torch.Tensor | None:
+        outputs = []
+        num_points = anchors.shape[1]
+        try:
+            for sample_anchors, sample_tokens in zip(
+                anchors,
+                tokens,
+                strict=True,
+            ):
+                coord = sample_anchors.float()
+                feat = sample_tokens.float()
+                point = self.litept(
+                    self._litept_input(
+                        coord,
+                        feat,
+                        torch.tensor(
+                            [num_points],
+                            device=coord.device,
+                            dtype=torch.long,
+                        ),
+                    )
+                )
+                litept_feat = self._restore_litept_point_count(
+                    point,
+                    num_points,
+                )
+                outputs.append(self.litept_out_proj(litept_feat.float()))
+        except Exception as exc:
+            self.last_litept_error = (
+                "Per-sample LitePT failed after batch splitting: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return None
+
+        self.last_litept_error = None
+        return torch.stack(outputs, dim=0)
+
     def _run_full_litept(
         self,
         anchors: torch.Tensor,
@@ -168,39 +257,34 @@ class AnchorLitePTFusion(nn.Module):
         if not anchors.is_cuda:
             return None
         b, n, _ = anchors.shape
+        if self.force_per_sample_litept:
+            return self._run_litept_per_sample(anchors, tokens)
+
         coord = rearrange(anchors, "b n c -> (b n) c").float()
         feat = rearrange(tokens, "b n c -> (b n) c").float()
         offset = torch.arange(1, b + 1, device=anchors.device, dtype=torch.long) * n
         try:
-            point = self.litept(
-                {
-                    "coord": coord,
-                    "grid_size": torch.tensor(
-                        self.litept_grid_size,
-                        device=anchors.device,
-                        dtype=coord.dtype,
-                    ),
-                    "feat": feat,
-                    "offset": offset,
-                }
+            point = self.litept(self._litept_input(coord, feat, offset))
+        except Exception as exc:
+            if b > 1 and self._is_spconv_int32_error(exc):
+                self.force_per_sample_litept = True
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                print(
+                    "LitePT batch input exceeded spconv's int32 limit; "
+                    "switching to per-sample LitePT execution."
+                )
+                return self._run_litept_per_sample(anchors, tokens)
+            self.last_litept_error = f"{type(exc).__name__}: {exc}"
+            return None
+        try:
+            litept_feat = self._restore_litept_point_count(
+                point,
+                feat.shape[0],
             )
         except Exception as exc:
             self.last_litept_error = f"{type(exc).__name__}: {exc}"
             return None
-        litept_feat = point.feat
-        if litept_feat.shape[0] != feat.shape[0]:
-            inverse = getattr(point, "inverse", None)
-            if inverse is None:
-                inverse = getattr(point, "unpooling_inverse", None)
-            if inverse is None or inverse.shape[0] != feat.shape[0]:
-                self.last_litept_error = (
-                    "LitePT changed point count but did not return a valid inverse "
-                    f"mapping: feat={tuple(litept_feat.shape)}, inverse="
-                    f"{None if inverse is None else tuple(inverse.shape)}, "
-                    f"input={tuple(feat.shape)}."
-                )
-                return None
-            litept_feat = litept_feat[inverse]
         self.last_litept_error = None
         return rearrange(
             self.litept_out_proj(litept_feat.float()),
