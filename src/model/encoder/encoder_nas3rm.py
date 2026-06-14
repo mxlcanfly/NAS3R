@@ -3,30 +3,26 @@ from dataclasses import dataclass
 from typing import Literal, Optional
 
 import torch
-import torch.nn.functional as F
 from einops import rearrange
-from jaxtyping import Float
 from torch import Tensor, nn
-import math
 
 from .backbone.croco.misc import transpose_to_landscape
 from .heads import head_factory, camera_head_factory
-from ...dataset.shims.bounds_shim import apply_bounds_shim
 from ...dataset.shims.normalize_shim import apply_normalize_shim, normalize_image
-from ...dataset.shims.patch_shim import apply_patch_shim
 from ...dataset.types import BatchedExample, DataShim
-from ...geometry.projection import get_world_rays, sample_image_grid
 from ..super_resolution import FrozenSwinIRUpsampler
 from ..types import Gaussians
-from .hr_lite_refiner import HRLiteGaussianGenerator
-from .ptv3_refiner import GaussianPTV3Refiner
 from .resunet_fusion import HiSplatResUnetTokenFusion
-from .backbone import Backbone, BackboneCfg, get_backbone
+from .multi_view_consistency import FeatureMultiViewConsistencyEstimator
+from .gaussian_transmittance import GaussianTransmittanceEstimator
+from .anchor_multiview_fusion import AnchorMultiViewFeatureFusion
+from .backbone import BackboneCfg, get_backbone
 from .common.gaussian_adapter import GaussianAdapter, GaussianAdapterCfg, UnifiedGaussianAdapter
 from .encoder import Encoder
 from .visualization.encoder_visualizer_epipolar_cfg import EncoderVisualizerEpipolarCfg
-from ...misc.cam_utils import camera_normalization, convert_pose_to_4x4, unproject_depth_map_to_point_map_batch
+from ...misc.cam_utils import convert_pose_to_4x4, unproject_depth_map_to_point_map_batch
 from .heads.pose_head import PoseHeadCfg
+from ...global_cfg import get_cfg
 
 inf = float('inf')
 
@@ -66,25 +62,34 @@ class EncoderNAS3RMCfg:
     use_swinir_sr: bool = True
     swinir_weight_path: str = "/space0/mengxl/NAS3R-master/pretrained_weights/001_classicalSR_DF2K_s64w8_SwinIR-M_x4.pth"
     use_resunet_fusion: bool = True
-    use_ptv3_refine: bool = True
-    use_hr_lite_refine: bool = True
-    ptv3_path: str = "/space0/mengxl"
-    ptv3_grid_size: float = 0.02
-    ptv3_refine_rotation: bool = False
-    ptv3_refine_sh: bool = False
-
+    unimatch_weights_path: str = (
+        "/space0/mengxl/NAS3R-master/pretrained_weights/"
+        "gmdepth-scale1-resumeflowthings-scannet-5d9d7964.pth"
+    )
+    use_multiview_consistency: bool = True
+    consistency_patch_size: int = 1
+    consistency_depth_relative_tolerance: float = 0.1
+    use_gaussian_transmittance: bool = True
+    gaussian_transmittance_chunk_size: int = 256
+    gaussian_transmittance_min_pixel_std: float = 0.3
+    use_anchor_multiview_fusion: bool = True
+    anchor_fusion_feature_dim: int = 128
+    anchor_fusion_geometry_dim: int = 128
+    anchor_fusion_geometry_num_frequencies: int = 6
+    anchor_fusion_hidden_dim: int = 128
+    anchor_fusion_occlusion_tau: float = 10.0
+    anchor_num_slots: int = 8
+    anchor_slot_dim: int = 32
+    use_anchor_feature_unet: bool = True
+    anchor_unet_base_dim: int = 128
+    anchor_unet_attention_blocks: int = 4
+    anchor_unet_num_heads: int = 4
+    anchor_offset_hidden_dim: int = 256
+    anchor_hr_feature_dim: int = 32
     depth_activation: str = 'sigmoid'
 
     equal_fxfy: bool = True
     equal_view_intrinsics: bool = True
-
-
-def rearrange_head(feat, patch_size, H, W):
-    B = feat.shape[0]
-    feat = feat.transpose(-1, -2).view(B, -1, H // patch_size, W // patch_size)
-    feat = F.pixel_shuffle(feat, patch_size)  # B,D,H,W
-    feat = rearrange(feat, "b d h w -> b (h w) d")
-    return feat
 
 
 def flatten_gaussians(gaussians) -> Gaussians:
@@ -95,17 +100,6 @@ def flatten_gaussians(gaussians) -> Gaussians:
         rearrange(gaussians.scales, "b v r srf spp i  -> b (v r srf spp) i "),
         rearrange(gaussians.harmonics, "b v r srf spp c d_sh -> b (v r srf spp) c d_sh"),
         rearrange(gaussians.opacities, "b v r srf spp -> b (v r srf spp)"),
-    )
-
-
-def concat_common_gaussians(ga, gb):
-    return type(ga)(
-        means=torch.cat([ga.means, gb.means], dim=2),
-        covariances=torch.cat([ga.covariances, gb.covariances], dim=2),
-        scales=torch.cat([ga.scales, gb.scales], dim=2),
-        rotations=torch.cat([ga.rotations, gb.rotations], dim=2),
-        harmonics=torch.cat([ga.harmonics, gb.harmonics], dim=2),
-        opacities=torch.cat([ga.opacities, gb.opacities], dim=2),
     )
 
 
@@ -154,29 +148,57 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             if cfg.use_resunet_fusion
             else None
         )
-        self.ptv3_refiner = (
-            GaussianPTV3Refiner(
-                ptv3_path=cfg.ptv3_path,
-                grid_size=cfg.ptv3_grid_size,
-                refine_rotation=cfg.ptv3_refine_rotation,
-                refine_sh=cfg.ptv3_refine_sh,
-                sh_degree=cfg.gaussian_adapter.sh_degree,
+        if (
+            self.resunet_token_fusion is not None
+            and get_cfg().mode == "train"
+            and cfg.unimatch_weights_path
+        ):
+            self.resunet_token_fusion.load_unimatch_encoder(
+                cfg.unimatch_weights_path
             )
-            if cfg.use_ptv3_refine
+        self.multiview_consistency = (
+            FeatureMultiViewConsistencyEstimator(
+                patch_size=cfg.consistency_patch_size,
+                depth_relative_tolerance=(
+                    cfg.consistency_depth_relative_tolerance
+                ),
+            )
+            if cfg.use_multiview_consistency
             else None
         )
-        self.hr_lite_refiner = (
-            HRLiteGaussianGenerator(
-                litept_path=cfg.ptv3_path,
-                grid_size=cfg.ptv3_grid_size,
-                sh_degree=cfg.gaussian_adapter.sh_degree,
-                scale_min=cfg.gaussian_adapter.gaussian_scale_min,
-                scale_max=cfg.gaussian_adapter.gaussian_scale_max,
+        self.gaussian_transmittance = (
+            GaussianTransmittanceEstimator(
+                target_chunk_size=cfg.gaussian_transmittance_chunk_size,
+                min_pixel_std=cfg.gaussian_transmittance_min_pixel_std,
             )
-            if cfg.use_hr_lite_refine
+            if cfg.use_gaussian_transmittance
             else None
         )
-
+        self.anchor_multiview_fusion = (
+            AnchorMultiViewFeatureFusion(
+                feature_dim=cfg.anchor_fusion_feature_dim,
+                geometry_dim=cfg.anchor_fusion_geometry_dim,
+                geometry_num_frequencies=(
+                    cfg.anchor_fusion_geometry_num_frequencies
+                ),
+                hidden_dim=cfg.anchor_fusion_hidden_dim,
+                occlusion_tau=cfg.anchor_fusion_occlusion_tau,
+                num_slots=cfg.anchor_num_slots,
+                slot_dim=cfg.anchor_slot_dim,
+                use_feature_unet=cfg.use_anchor_feature_unet,
+                unet_base_dim=cfg.anchor_unet_base_dim,
+                unet_attention_blocks=cfg.anchor_unet_attention_blocks,
+                unet_num_heads=cfg.anchor_unet_num_heads,
+                offset_hidden_dim=cfg.anchor_offset_hidden_dim,
+                hr_feature_dim=cfg.anchor_hr_feature_dim,
+                raw_gaussian_dim=self.gaussian_adapter.d_in,
+            )
+            if cfg.use_anchor_multiview_fusion
+            else None
+        )
+        self.child_gaussian_adapter = UnifiedGaussianAdapter(
+            cfg.gaussian_adapter
+        )
     def set_depth_head(self, output_mode, head_type, landscape_only, depth_mode, conf_mode):
         self.backbone.depth_mode = depth_mode
         self.backbone.conf_mode = conf_mode
@@ -214,9 +236,9 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
 
     def map_pdf_to_opacity(
             self,
-            pdf: Float[Tensor, " *batch"],
+            pdf: Tensor,
             global_step: int,
-    ) -> Float[Tensor, " *batch"]:
+    ) -> Tensor:
         # https://www.desmos.com/calculator/opvwti3ba9
         cfg = self.cfg.opacity_mapping
         x = cfg.initial + min(global_step / cfg.warm_up, 1) * (cfg.final - cfg.initial)
@@ -245,7 +267,6 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             else context["image"]
         )
 
-        device = context_image.device
         b, v_cxt, _, h, w = context_image.shape
 
         if target is not None:
@@ -358,67 +379,150 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             self.map_pdf_to_opacity(densities, global_step),
             rearrange(gaussian_params[..., 1:], "b v r srf c -> b v r srf () c"),
         )
-        if self.ptv3_refiner is not None:
-            if fusion_features is None:
-                raise RuntimeError("PTv3 refinement requires use_resunet_fusion=True.")
-            xy_ray, _ = sample_image_grid((h, w), device)
-            xy_ray = rearrange(xy_ray, "h w xy -> (h w) () xy")
-            ray_coords = xy_ray.unsqueeze(0).unsqueeze(0).repeat(b, v_cxt, 1, 1, 1)
-            ray_extrinsics = context_extrinsics.unsqueeze(2).unsqueeze(2)
-            ray_intrinsics = context_intrinsics.unsqueeze(2).unsqueeze(2)
-            _, ray_direction = get_world_rays(ray_coords, ray_extrinsics, ray_intrinsics)
-            ray_direction = rearrange(ray_direction, "b v (h w) () xyz -> b v h w xyz", h=h, w=w)
-            point_map = rearrange(point_map_from_depth, "(b v) h w xyz -> b v h w xyz", b=b, v=v_cxt)
-            gaussians = self.ptv3_refiner(
-                fusion_features["64"],
-                depth_all,
-                point_map,
-                context_image,
-                ray_direction,
-                gaussians,
-            )
-
         lr_gaussians = gaussians
+        (
+            _,
+            num_lr_views,
+            num_lr_rays,
+            num_lr_surfaces,
+            num_lr_samples_per_pixel,
+            _,
+        ) = lr_gaussians.means.shape
+        anchors = rearrange(
+            lr_gaussians.means,
+            "b v r srf spp xyz -> b (v r srf spp) xyz",
+        )
+        anchors_per_view = (
+            num_lr_rays * num_lr_surfaces * num_lr_samples_per_pixel
+        )
+        source_view_indices = torch.arange(
+            num_lr_views,
+            device=anchors.device,
+        ).view(1, num_lr_views, 1).expand(
+            b,
+            num_lr_views,
+            anchors_per_view,
+        )
+        source_view_indices = rearrange(
+            source_view_indices,
+            "b v n -> b (v n)",
+        )
 
-        if self.hr_lite_refiner is not None:
+        multiview_consistency = None
+        if self.multiview_consistency is not None:
             if fusion_features is None:
-                raise RuntimeError("HR Lite refinement requires use_resunet_fusion=True.")
-            fusion_hr = fusion_features["256"]
-            _, _, _, h_hr, w_hr = fusion_hr.shape
-            depth_hr = F.interpolate(
-                rearrange(depth_all, "b v h w -> (b v) 1 h w"),
-                size=(h_hr, w_hr),
-                mode="bilinear",
-                align_corners=False,
-            ).squeeze(1)
-            depth_hr = rearrange(depth_hr, "(b v) h w -> b v h w", b=b, v=v_cxt)
-
-            xy_hr, _ = sample_image_grid((h_hr, w_hr), device)
-            xy_hr = rearrange(xy_hr, "h w xy -> (h w) () xy")
-            ray_coords_hr = xy_hr.unsqueeze(0).unsqueeze(0).repeat(b, v_cxt, 1, 1, 1)
-            ray_extrinsics_hr = context_extrinsics.unsqueeze(2).unsqueeze(2)
-            ray_intrinsics_hr = context_intrinsics.unsqueeze(2).unsqueeze(2)
-
-            hr_gaussians = self.hr_lite_refiner(
-                fusion_hr,
-                depth_hr,
-                context_image_sr[:, :v_cxt],
-                ray_coords_hr,
-                ray_extrinsics_hr,
-                ray_intrinsics_hr,
-                context["near"][:, :v_cxt],
-                context["far"][:, :v_cxt],
-                global_step,
-                self.map_pdf_to_opacity,
+                raise RuntimeError(
+                    "Multi-view consistency requires use_resunet_fusion=True."
+                )
+            multiview_consistency = self.multiview_consistency(
+                anchors=anchors,
+                consistency_features=fusion_features["image_only_256"],
+                depths=depth_all,
+                extrinsics=context_extrinsics,
+                intrinsics=context_intrinsics,
+                source_view_indices=source_view_indices,
             )
-            gaussians = concat_common_gaussians(lr_gaussians, hr_gaussians)
+
+        gaussian_transmittance = None
+        if self.gaussian_transmittance is not None:
+            gaussian_transmittance = self.gaussian_transmittance(
+                means=anchors,
+                covariances=rearrange(
+                    lr_gaussians.covariances,
+                    "b v r srf spp i j -> b (v r srf spp) i j",
+                ),
+                opacities=rearrange(
+                    lr_gaussians.opacities,
+                    "b v r srf spp -> b (v r srf spp)",
+                ),
+                extrinsics=context_extrinsics,
+                intrinsics=context_intrinsics,
+                image_shape=context_image_sr.shape[-2:],
+            )
+        anchor_multiview_fusion = None
+        decoded_gaussians = None
+        if self.anchor_multiview_fusion is not None:
+            if fusion_features is None:
+                raise RuntimeError(
+                    "Anchor multi-view fusion requires use_resunet_fusion=True."
+                )
+            if multiview_consistency is None:
+                raise RuntimeError(
+                    "Anchor multi-view fusion requires "
+                    "use_multiview_consistency=True."
+                )
+            if gaussian_transmittance is None:
+                raise RuntimeError(
+                    "Anchor multi-view fusion requires "
+                    "use_gaussian_transmittance=True."
+                )
+            anchor_multiview_fusion = self.anchor_multiview_fusion(
+                anchors=anchors,
+                feature_map=fusion_features["64"],
+                extrinsics=context_extrinsics,
+                intrinsics=context_intrinsics,
+                source_view_indices=source_view_indices,
+                occlusion_delta=multiview_consistency.occlusion_delta,
+                occlusion_valid_mask=(
+                    multiview_consistency.occlusion_valid_mask
+                ),
+                transmittance=gaussian_transmittance.transmittance,
+                transmittance_valid_mask=(
+                    gaussian_transmittance.valid_mask
+                ),
+                consistency_weight=(
+                    multiview_consistency.per_view_consistency_weight
+                ),
+                consistency_valid_mask=(
+                    multiview_consistency.view_projection_valid
+                ),
+                anchor_grid_shape=(
+                    num_lr_views,
+                    h,
+                    w,
+                    num_lr_surfaces,
+                    num_lr_samples_per_pixel,
+                ),
+                hr_feature_map=fusion_features["256"],
+            )
+            decoded = self.child_gaussian_adapter(
+                means=anchor_multiview_fusion.child_means,
+                opacities=self.map_pdf_to_opacity(
+                    anchor_multiview_fusion.densities,
+                    global_step,
+                ),
+                raw_gaussians=anchor_multiview_fusion.raw_gaussians,
+            )
+            decoded_gaussians = Gaussians(
+                means=rearrange(
+                    decoded.means,
+                    "b n k xyz -> b (n k) xyz",
+                ),
+                covariances=rearrange(
+                    decoded.covariances,
+                    "b n k i j -> b (n k) i j",
+                ),
+                rotations=rearrange(
+                    decoded.rotations,
+                    "b n k q -> b (n k) q",
+                ),
+                scales=rearrange(
+                    decoded.scales,
+                    "b n k xyz -> b (n k) xyz",
+                ),
+                harmonics=rearrange(
+                    decoded.harmonics,
+                    "b n k rgb sh -> b (n k) rgb sh",
+                ),
+                opacities=rearrange(
+                    decoded.opacities,
+                    "b n k -> b (n k)",
+                ),
+            )
 
         # Dump visualizations if needed.
         if visualization_dump is not None:
             visualization_dump["depth"] = depths_per_view
-            if fusion_features is not None:
-                visualization_dump["fusion_features"] = fusion_features
-
             visualization_dump["scales"] = rearrange(
                 lr_gaussians.scales, "b v r srf spp xyz -> b (v r srf spp) xyz"
             )
@@ -433,11 +537,22 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             )  # (b, v, h, w, 1, 1)
 
         encoder_output = dict()
-        if fusion_features is not None:
-            encoder_output["fusion_features"] = fusion_features
-
         encoder_output["gaussians_lr"] = flatten_gaussians(lr_gaussians)
-        encoder_output["gaussians"] = flatten_gaussians(gaussians)
+        encoder_output["gaussians"] = (
+            decoded_gaussians
+            if decoded_gaussians is not None
+            else flatten_gaussians(lr_gaussians)
+        )
+        if anchor_multiview_fusion is not None:
+            encoder_output["child_means_for_grid_loss"] = rearrange(
+                decoded.means,
+                "b (v h w srf spp) k xyz -> b v h w srf spp k xyz",
+                v=num_lr_views,
+                h=h,
+                w=w,
+                srf=num_lr_surfaces,
+                spp=num_lr_samples_per_pixel,
+            )
 
         if self.cfg.estimating_pose:
             encoder_output['extrinsics'] = dict()

@@ -1,0 +1,4 @@
+child_grid:
+  weight: 0.01
+  apply_after_step: 0
+  expected_scale: 4

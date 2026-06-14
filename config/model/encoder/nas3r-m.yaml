@@ -31,6 +31,27 @@ apply_bounds_shim: true
 gs_params_head_type: dpt_gs
 pose_free: true
 pretrained_weights: ""
+unimatch_weights_path: "/space0/mengxl/NAS3R-master/pretrained_weights/gmdepth-scale1-resumeflowthings-scannet-5d9d7964.pth"
+use_multiview_consistency: true
+consistency_patch_size: 1
+consistency_depth_relative_tolerance: 0.1
+use_gaussian_transmittance: true
+gaussian_transmittance_chunk_size: 256
+gaussian_transmittance_min_pixel_std: 0.3
+use_anchor_multiview_fusion: true
+anchor_fusion_feature_dim: 128
+anchor_fusion_geometry_dim: 128
+anchor_fusion_geometry_num_frequencies: 6
+anchor_fusion_hidden_dim: 128
+anchor_fusion_occlusion_tau: 10.0
+anchor_num_slots: 8
+anchor_slot_dim: 32
+use_anchor_feature_unet: true
+anchor_unet_base_dim: 128
+anchor_unet_attention_blocks: 4
+anchor_unet_num_heads: 4
+anchor_offset_hidden_dim: 256
+anchor_hr_feature_dim: 32
 
 pose_make_baseline_1: false
 pose_make_relative: true

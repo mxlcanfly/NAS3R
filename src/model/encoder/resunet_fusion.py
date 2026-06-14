@@ -1,4 +1,6 @@
 import math
+from collections import OrderedDict
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -147,8 +149,13 @@ class ResUnet(nn.Module):
             ]
         )
 
-    def forward(self, x: torch.Tensor, dino_feature: torch.Tensor) -> list[torch.Tensor]:
+    def forward(
+        self,
+        x: torch.Tensor,
+        dino_feature: torch.Tensor,
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
         feature_list = self.encoder(x)
+        image_only_features = self.decoder(feature_list)
         dino_feature_list = []
         for i in range(len(self.up_dino_cnn)):
             dino_feature_i = self.up_dino_cnn[i](
@@ -160,8 +167,8 @@ class ResUnet(nn.Module):
                 )
             )
             dino_feature_list.append(dino_feature_i)
-        out_feature = self.decoder(feature_list, dino_feature_list)
-        return out_feature
+        fused_features = self.decoder(feature_list, dino_feature_list)
+        return fused_features, image_only_features
 
 
 class HiSplatResUnetTokenFusion(nn.Module):
@@ -200,6 +207,42 @@ class HiSplatResUnetTokenFusion(nn.Module):
             nn.SiLU(),
         )
 
+    def load_unimatch_encoder(self, checkpoint_path: str) -> None:
+        path = Path(checkpoint_path).expanduser()
+        if not path.is_file():
+            raise FileNotFoundError(f"UniMatch checkpoint not found: {path}")
+
+        print(f"==> Load compatible UniMatch weights into ResUNet encoder: {path}")
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+        pretrained = checkpoint.get("model", checkpoint)
+        encoder_state = self.resunet.encoder.state_dict()
+        updated_state_dict = {}
+        skipped_shape = {}
+
+        for key, value in pretrained.items():
+            if not key.startswith("backbone."):
+                continue
+
+            possible_key = ".".join(key.split(".")[1:])
+            if possible_key not in encoder_state:
+                continue
+            if encoder_state[possible_key].shape != value.shape:
+                skipped_shape[possible_key] = (
+                    tuple(value.shape),
+                    tuple(encoder_state[possible_key].shape),
+                )
+                continue
+            updated_state_dict[possible_key] = value
+
+        updated_state_dict = OrderedDict(updated_state_dict)
+        self.resunet.encoder.load_state_dict(updated_state_dict, strict=False)
+        print(
+            f"==> Loaded {len(updated_state_dict)} UniMatch tensors into "
+            f"ResUNet encoder; skipped {len(skipped_shape)} shape mismatches"
+        )
+        if updated_state_dict:
+            print(f"==> Loaded ResUNet keys: {list(updated_state_dict)}")
+
     def tokens_to_16x16(self, tokens: torch.Tensor) -> torch.Tensor:
         b, v, n, c = tokens.shape
         grid = int(math.sqrt(n))
@@ -218,8 +261,20 @@ class HiSplatResUnetTokenFusion(nn.Module):
         images = rearrange(images, "b v c h w -> (b v) c h w")
         images = (images.clamp(0, 1) - self.image_mean) / self.image_std
         dino_feature = self.tokens_to_16x16(tokens)
-        fused = self.resunet(images, dino_feature)
+        fused, image_only = self.resunet(images, dino_feature)
         return {
             "64": rearrange(fused[0], "(b v) c h w -> b v c h w", b=b, v=v),
             "256": rearrange(fused[2], "(b v) c h w -> b v c h w", b=b, v=v),
+            "image_only_64": rearrange(
+                image_only[0],
+                "(b v) c h w -> b v c h w",
+                b=b,
+                v=v,
+            ),
+            "image_only_256": rearrange(
+                image_only[2],
+                "(b v) c h w -> b v c h w",
+                b=b,
+                v=v,
+            ),
         }

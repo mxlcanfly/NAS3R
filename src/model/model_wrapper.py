@@ -1,22 +1,18 @@
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Protocol, runtime_checkable, Any, Dict
+from typing import Optional, Protocol, runtime_checkable
 
 import moviepy.editor as mpy
 import torch
 import wandb
 from einops import pack, rearrange, repeat
-from jaxtyping import Float
 from lightning.pytorch import LightningModule
 from lightning.pytorch.loggers.wandb import WandbLogger
 from lightning.pytorch.utilities import rank_zero_only
 from tabulate import tabulate
-from torch import Tensor, nn, optim
+from torch import Tensor, nn
 import json
 import numpy as np
-import cv2
-import os
-import time
 
 from ..dataset.data_module import get_data_shim
 from ..dataset.types import BatchedExample
@@ -29,7 +25,7 @@ from ..misc.image_io import prep_image, save_image, save_video
 from ..misc.LocalLogger import LOG_PATH, LocalLogger
 from ..misc.nn_module_tools import convert_to_buffer
 from ..misc.step_tracker import StepTracker
-from ..misc.utils import vis_depth_map, confidence_map, get_overlap_tag
+from ..misc.utils import vis_depth_map, get_overlap_tag
 from ..visualization.annotation import add_label
 from ..visualization.camera_trajectory.interpolation import (
     interpolate_extrinsics,
@@ -39,15 +35,13 @@ from ..visualization.camera_trajectory.wobble import (
     generate_wobble,
     generate_wobble_transformation,
 )
-from ..visualization.color_map import apply_color_map_to_image
 from ..visualization.layout import add_border, hcat, vcat
-from ..visualization.validation_in_3d import render_cameras, render_projections, render_cameras_es
 from .decoder.decoder import Decoder, DepthRenderingMode
 from .encoder import Encoder
 from .encoder.visualization.encoder_visualizer import EncoderVisualizer
 from .ply_export import export_ply
 from ..misc.intrinsics_utils import estimate_intrinsics
-from ..evaluation.metrics import compute_pose_error, compute_pose_error_for_batch
+from ..evaluation.metrics import compute_pose_error_for_batch
 from ..misc.cam_utils import pose_auc
 
 
@@ -127,10 +121,10 @@ def dropout_target_views(v, num_keep=None):
 class TrajectoryFn(Protocol):
     def __call__(
             self,
-            t: Float[Tensor, " t"],
+            t: Tensor,
     ) -> tuple[
-        Float[Tensor, "batch view 4 4"],  # extrinsics
-        Float[Tensor, "batch view 3 3"],  # intrinsics
+        Tensor,  # extrinsics
+        Tensor,  # intrinsics
     ]:
         pass
 
@@ -297,13 +291,14 @@ class ModelWrapper(LightningModule):
         v_cxt = batch["context"]["image"].shape[1]
 
         # Run the model.
-        visualization_dump = {}
-        encoder_output = self.encoder(batch["context"], self.global_step, visualization_dump=visualization_dump,
-                                      target=batch["target"] if self.encoder.cfg.estimating_pose else None)
+        encoder_output = self.encoder(
+            batch["context"],
+            self.global_step,
+            target=batch["target"] if self.encoder.cfg.estimating_pose else None,
+        )
 
         if self.encoder.cfg.estimating_pose:
-            pred_extrinsics, pred_extrinsics_cwt = encoder_output['extrinsics']['c'], encoder_output['extrinsics'][
-                'cwt']
+            pred_extrinsics_cwt = encoder_output['extrinsics']['cwt']
             target_extrinsics = pred_extrinsics_cwt[:, v_cxt:]
             context_extrinsics = pred_extrinsics_cwt[:, :v_cxt]
         else:
@@ -373,8 +368,8 @@ class ModelWrapper(LightningModule):
             rearrange(target_gt, "b v c h w -> (b v) c h w"),
             rearrange(output.color, "b v c h w -> (b v) c h w"),
         )
-        self.log(f"train/psnr", psnr.mean())
-        self.log(f"train/psnr_after_refine", psnr.mean())
+        self.log("train/psnr", psnr.mean())
+        self.log("train/psnr_after_refine", psnr.mean())
 
         if "gaussians_lr" in encoder_output and self.train_cfg.lr_gaussian_loss_weight > 0:
             output_lr = self.decoder.forward(
@@ -410,6 +405,42 @@ class ModelWrapper(LightningModule):
                 loss = loss_fn.forward(output.color, target_gt, gaussians, self.global_step)
                 self.log(f"loss/{loss_fn.name}", loss)
                 total_loss += loss
+            elif loss_fn.name == "child_grid":
+                if "child_means_for_grid_loss" not in encoder_output:
+                    raise RuntimeError(
+                        "Child-grid loss requires decoded anchor child Gaussians."
+                    )
+                child_means = encoder_output["child_means_for_grid_loss"]
+                context1_loss = loss_fn.forward(
+                    child_means[:, :1],
+                    context_extrinsics[:, :1],
+                    context_intrinsics[:, :1],
+                    context_image.shape[-2:],
+                    self.global_step,
+                )
+                self.log("loss/child_grid/context1", context1_loss)
+
+                if child_means.shape[1] > 1:
+                    context_others_loss = loss_fn.forward(
+                        child_means[:, 1:],
+                        context_extrinsics[:, 1:],
+                        context_intrinsics[:, 1:],
+                        context_image.shape[-2:],
+                        self.global_step,
+                    )
+                    context_others_loss = context_others_loss * (
+                        (child_means.shape[1] - 1) / child_means.shape[1]
+                    )
+                else:
+                    context_others_loss = context1_loss.new_zeros(())
+                self.log(
+                    "loss/child_grid/context_others",
+                    context_others_loss,
+                )
+
+                loss = context1_loss + context_others_loss
+                self.log("loss/child_grid", loss)
+                total_loss += loss
 
         self.log("loss/total", total_loss)
 
@@ -420,10 +451,10 @@ class ModelWrapper(LightningModule):
             target_rot_error, target_transl_error = compute_pose_error_for_batch(pred_extrinsics_cwt[:, v_cxt:],
                                                                                  batch["target"]["extrinsics"])
 
-            self.log(f"train/context_angular_error", context_rot_error)
-            self.log(f"train/context_transl_error", context_transl_error)
-            self.log(f"train/target_angular_error", target_rot_error)
-            self.log(f"train/target_transl_error", target_transl_error)
+            self.log("train/context_angular_error", context_rot_error)
+            self.log("train/context_transl_error", context_transl_error)
+            self.log("train/target_angular_error", target_rot_error)
+            self.log("train/target_transl_error", target_transl_error)
 
         if (
                 self.global_rank == 0
@@ -550,9 +581,9 @@ class ModelWrapper(LightningModule):
             all_metrics = {}
 
             all_metrics.update({
-                f"lpips": compute_lpips(rgb_gt, rgb_pred).mean(),
-                f"ssim": compute_ssim(rgb_gt, rgb_pred).mean(),
-                f"psnr": compute_psnr(rgb_gt, rgb_pred).mean(),
+                "lpips": compute_lpips(rgb_gt, rgb_pred).mean(),
+                "ssim": compute_ssim(rgb_gt, rgb_pred).mean(),
+                "psnr": compute_psnr(rgb_gt, rgb_pred).mean(),
             })
 
             if self.encoder.cfg.estimating_pose:
@@ -563,18 +594,18 @@ class ModelWrapper(LightningModule):
                 target_pose_error = torch.max(target_rot_error, target_transl_error)
                 context_pose_error = torch.max(context_rot_error, context_transl_error)
                 all_metrics.update({
-                    f"tgt_e_R": target_rot_error,
-                    f"tgt_e_t": target_transl_error,
-                    f"tgt_e_pose": target_pose_error,
-                    f"cxt_e_R": context_rot_error,
-                    f"cxt_e_t": context_transl_error,
-                    f"cxt_e_pose": context_pose_error,
+                    "tgt_e_R": target_rot_error,
+                    "tgt_e_t": target_transl_error,
+                    "tgt_e_pose": target_pose_error,
+                    "cxt_e_R": context_rot_error,
+                    "cxt_e_t": context_transl_error,
+                    "cxt_e_pose": context_pose_error,
                 })
 
             if scene not in self.test_step_outputs:
                 self.test_step_outputs[scene] = [overlap_tag]
-                self.test_step_outputs[scene] += [all_metrics[f'psnr'].item(), all_metrics[f'ssim'].item(),
-                                                  all_metrics[f'lpips'].item()]
+                self.test_step_outputs[scene] += [all_metrics['psnr'].item(), all_metrics['ssim'].item(),
+                                                  all_metrics['lpips'].item()]
 
             methods = ['ours']
 
@@ -615,7 +646,6 @@ class ModelWrapper(LightningModule):
 
         target_image = self._images(target)
         b, v, _, h, w = target_image.shape
-        device = target_image.device
         with torch.set_grad_enabled(True):
             if initial_extrinsics is not None:
                 extrinsics = nn.Parameter(initial_extrinsics)
@@ -673,7 +703,7 @@ class ModelWrapper(LightningModule):
             with open(self.test_cfg.output_path / name / "test_ckpt_path.txt", "w") as f:
                 f.write(f"{self.ckpt_path}\n")
 
-        with (self.test_cfg.output_path / name / f"scores_all.json").open("w") as f:
+        with (self.test_cfg.output_path / name / "scores_all.json").open("w") as f:
             json.dump(self.test_step_outputs, f, indent=2)
 
         def convert_tensors_to_values(metrics_dict):
@@ -681,11 +711,11 @@ class ModelWrapper(LightningModule):
                     metrics_dict.items()}
 
         running_metrics = convert_tensors_to_values(self.running_metrics)
-        with (self.test_cfg.output_path / name / f"scores_all_avg.json").open("w") as f:
+        with (self.test_cfg.output_path / name / "scores_all_avg.json").open("w") as f:
             json.dump(running_metrics, f, indent=2)
 
         running_metrics_sub = convert_tensors_to_values(self.running_metrics_sub)
-        with (self.test_cfg.output_path / name / f"scores_sub_avg.json").open("w") as f:
+        with (self.test_cfg.output_path / name / "scores_sub_avg.json").open("w") as f:
             json.dump(running_metrics_sub, f, indent=2)
 
         for item in ['R', 't', 'pose']:
@@ -750,8 +780,7 @@ class ModelWrapper(LightningModule):
                                       target=batch["target"] if self.encoder.cfg.estimating_pose else None)
 
         if self.encoder.cfg.estimating_pose:
-            pred_extrinsics, pred_extrinsics_cwt = encoder_output['extrinsics']['c'], encoder_output['extrinsics'][
-                'cwt']
+            pred_extrinsics_cwt = encoder_output['extrinsics']['cwt']
             target_extrinsics = pred_extrinsics_cwt[:, v_cxt:]
             context_extrinsics = pred_extrinsics_cwt[:, :v_cxt]
         else:
@@ -798,19 +827,19 @@ class ModelWrapper(LightningModule):
 
         # Target view metrics
         psnr = compute_psnr(rgb_gt[v_cxt:], rgb_pred[v_cxt:]).mean()
-        self.log(f"val/psnr", psnr)
+        self.log("val/psnr", psnr)
         lpips = compute_lpips(rgb_gt[v_cxt:], rgb_pred[v_cxt:]).mean()
-        self.log(f"val/lpips", lpips)
+        self.log("val/lpips", lpips)
         ssim_val = compute_ssim(rgb_gt[v_cxt:], rgb_pred[v_cxt:]).mean()
-        self.log(f"val/ssim", ssim_val)
+        self.log("val/ssim", ssim_val)
 
         # Context view metrics
         psnr = compute_psnr(rgb_gt[:v_cxt], rgb_pred[:v_cxt]).mean()
-        self.log(f"val/context/psnr", psnr)
+        self.log("val/context/psnr", psnr)
         lpips = compute_lpips(rgb_gt[:v_cxt], rgb_pred[:v_cxt]).mean()
-        self.log(f"val/context/lpips", lpips)
+        self.log("val/context/lpips", lpips)
         ssim_val = compute_ssim(rgb_gt[:v_cxt], rgb_pred[:v_cxt]).mean()
-        self.log(f"val/context/ssim", ssim_val)
+        self.log("val/context/ssim", ssim_val)
 
         # Construct comparison image.
         context_img = context_image[0]
@@ -820,8 +849,8 @@ class ModelWrapper(LightningModule):
             add_label(vcat(*context_img), "Context"),
             add_label(vcat(*context_img_depth), "Context Depth"),
             add_label(vcat(*rgb_gt), "Target (Ground Truth)"),
-            add_label(vcat(*rgb_pred), f"Prediction"),
-            add_label(vcat(*depth_pred), f"Depth")
+            add_label(vcat(*rgb_pred), "Prediction"),
+            add_label(vcat(*depth_pred), "Depth")
         )
 
         if self.encoder.cfg.estimating_pose:
@@ -831,10 +860,10 @@ class ModelWrapper(LightningModule):
             target_rot_error, target_transl_error = compute_pose_error_for_batch(pred_extrinsics_cwt[:, v_cxt:],
                                                                                  batch["target"]["extrinsics"])
 
-            self.log(f"val/context_angular_error", context_rot_error)
-            self.log(f"val/context_transl_error", context_transl_error)
-            self.log(f"val/target_angular_error", target_rot_error)
-            self.log(f"val/target_transl_error", target_transl_error)
+            self.log("val/context_angular_error", context_rot_error)
+            self.log("val/context_transl_error", context_transl_error)
+            self.log("val/target_angular_error", target_rot_error)
+            self.log("val/target_transl_error", target_transl_error)
 
         self.logger.log_image(
             "comparison",
@@ -1078,7 +1107,10 @@ class ModelWrapper(LightningModule):
 
     def configure_optimizers(self):
         if self.train_cfg.refine_only:
-            trainable_keywords = ["resunet_token_fusion", "ptv3_refiner", "hr_lite_refiner"]
+            trainable_keywords = [
+                "resunet_token_fusion",
+                "anchor_multiview_fusion",
+            ]
             if self.train_cfg.refine_train_gaussian_head:
                 trainable_keywords += ["gaussian_param_head"]
             trainable_keywords = tuple(trainable_keywords)
@@ -1102,7 +1134,15 @@ class ModelWrapper(LightningModule):
                     continue
 
                 # Heads that are always treated as new
-                if any(x in name for x in ["gaussian_param_head", "intrinsic_encoder", "resunet_token_fusion", "ptv3_refiner", "hr_lite_refiner"]):
+                if any(
+                    x in name
+                    for x in [
+                        "gaussian_param_head",
+                        "intrinsic_encoder",
+                        "resunet_token_fusion",
+                        "anchor_multiview_fusion",
+                    ]
+                ):
                     new_params.append(param)
                     new_param_names.append(name)
                     # print(name)
@@ -1168,7 +1208,7 @@ class ModelWrapper(LightningModule):
             if param.grad is not None:
                 if torch.isnan(param.grad).any():
                     self.log("nan_gradient_detected", True, on_step=True, on_epoch=False)
-                    print(f"Skipping update due to NaN gradient")
+                    print("Skipping update due to NaN gradient")
                     nan_detected = True
                     break
 

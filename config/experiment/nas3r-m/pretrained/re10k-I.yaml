@@ -5,7 +5,7 @@ defaults:
   - override /model/encoder: nas3r-m
   - override /model/encoder/backbone: masked_croco_multi
   - override /model/decoder: splatting_cuda
-  - override /loss: [mse, lpips]
+  - override /loss: [mse, lpips, child_grid]
 
 wandb:
   name: re10k
@@ -24,12 +24,8 @@ model:
     pretrained_weights:  "/space0/mengxl/NAS3R-master/outputs/exp_re10k/64in64/checkpoints/epoch_36-step_300000.ckpt" #"/space0/mengxl/NAS3R-master/pretrained_weights/naslr.ckpt" # "/space0/mengxl/NAS3R-master/pretrained_weights/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth"
 
 
-    estimating_focal: false 
+    estimating_focal: false
     depth_activation: 'sigmoid'
-    use_ptv3_refine: true
-    ptv3_path: /space0/mengxl
-    ptv3_grid_size: 0.02
-
     pose_head:
       pose_init_t: true
       use_homogeneous: false
@@ -49,7 +45,7 @@ dataset:
 
 
 optimizer:
-  lr: 1e-5
+  lr: 1e-4
   warm_up_steps: 1000
   backbone_lr_multiplier: 1.0
   min_lr_multiplier: 0.0
@@ -72,7 +68,7 @@ train:
   training_context: false
   refine_only: true
   refine_train_gaussian_head: false
-  lr_gaussian_loss_weight: 1.0
+  lr_gaussian_loss_weight: 0.0
 
 
 test:
