@@ -103,6 +103,26 @@ def flatten_gaussians(gaussians) -> Gaussians:
     )
 
 
+def gather_gaussians(gaussians: Gaussians, indices: Tensor) -> Gaussians:
+    def gather(values: Tensor) -> Tensor:
+        index = indices
+        for _ in range(values.ndim - 2):
+            index = index.unsqueeze(-1)
+        return values.gather(
+            1,
+            index.expand(-1, -1, *values.shape[2:]),
+        )
+
+    return Gaussians(
+        means=gather(gaussians.means),
+        covariances=gather(gaussians.covariances),
+        rotations=gather(gaussians.rotations),
+        scales=gather(gaussians.scales),
+        harmonics=gather(gaussians.harmonics),
+        opacities=gather(gaussians.opacities),
+    )
+
+
 class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
     backbone: nn.Module
     gaussian_adapter: GaussianAdapter
@@ -199,6 +219,237 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
         self.child_gaussian_adapter = UnifiedGaussianAdapter(
             cfg.gaussian_adapter
         )
+
+    def densify_prepared(
+        self,
+        encoder_output: dict,
+        parent_selection: Tensor,
+        global_step: int,
+    ) -> dict:
+        state = encoder_output.pop("_densification_state")
+        (
+            lr_gaussians,
+            anchors,
+            source_view_indices,
+            fusion_features,
+            depth_all,
+            context_extrinsics,
+            context_intrinsics,
+            context_image_shape,
+            anchor_grid_shape,
+        ) = state
+        b, num_parents = anchors.shape[:2]
+        parent_selection_flat = parent_selection.reshape(b, num_parents)
+
+        multiview_consistency = self.multiview_consistency(
+            anchors=anchors,
+            consistency_features=fusion_features["image_only_256"],
+            depths=depth_all,
+            extrinsics=context_extrinsics,
+            intrinsics=context_intrinsics,
+            source_view_indices=source_view_indices,
+        )
+        gaussian_transmittance = self.gaussian_transmittance(
+            means=anchors,
+            covariances=rearrange(
+                lr_gaussians.covariances,
+                "b v r srf spp i j -> b (v r srf spp) i j",
+            ),
+            opacities=rearrange(
+                lr_gaussians.opacities,
+                "b v r srf spp -> b (v r srf spp)",
+            ),
+            extrinsics=context_extrinsics,
+            intrinsics=context_intrinsics,
+            image_shape=context_image_shape,
+        )
+        fused = self.anchor_multiview_fusion(
+            anchors=anchors,
+            feature_map=fusion_features["64"],
+            extrinsics=context_extrinsics,
+            intrinsics=context_intrinsics,
+            source_view_indices=source_view_indices,
+            occlusion_delta=multiview_consistency.occlusion_delta,
+            occlusion_valid_mask=multiview_consistency.occlusion_valid_mask,
+            transmittance=gaussian_transmittance.transmittance,
+            transmittance_valid_mask=gaussian_transmittance.valid_mask,
+            consistency_weight=(
+                multiview_consistency.per_view_consistency_weight
+            ),
+            consistency_valid_mask=(
+                multiview_consistency.view_projection_valid
+            ),
+            anchor_grid_shape=anchor_grid_shape,
+            hr_feature_map=fusion_features["256"],
+            parent_selection=parent_selection_flat,
+        )
+        decoded = self.child_gaussian_adapter(
+            means=fused.child_means,
+            opacities=self.map_pdf_to_opacity(fused.densities, global_step),
+            raw_gaussians=fused.raw_gaussians,
+        )
+        selected_sr = Gaussians(
+            means=rearrange(decoded.means, "b n k xyz -> b (n k) xyz"),
+            covariances=rearrange(
+                decoded.covariances,
+                "b n k i j -> b (n k) i j",
+            ),
+            rotations=rearrange(decoded.rotations, "b n k q -> b (n k) q"),
+            scales=rearrange(decoded.scales, "b n k xyz -> b (n k) xyz"),
+            harmonics=rearrange(
+                decoded.harmonics,
+                "b n k rgb sh -> b (n k) rgb sh",
+            ),
+            opacities=rearrange(decoded.opacities, "b n k -> b (n k)"),
+        )
+
+        lr_flat = flatten_gaussians(lr_gaussians)
+        unselected_indices = torch.arange(
+            num_parents,
+            device=anchors.device,
+        )[None].expand(b, -1)[~parent_selection_flat].reshape(b, -1)
+        unselected_lr = gather_gaussians(lr_flat, unselected_indices)
+        encoder_output["gaussians"] = Gaussians(
+            means=torch.cat([unselected_lr.means, selected_sr.means], dim=1),
+            covariances=torch.cat(
+                [unselected_lr.covariances, selected_sr.covariances],
+                dim=1,
+            ),
+            rotations=torch.cat(
+                [unselected_lr.rotations, selected_sr.rotations],
+                dim=1,
+            ),
+            scales=torch.cat([unselected_lr.scales, selected_sr.scales], dim=1),
+            harmonics=torch.cat(
+                [unselected_lr.harmonics, selected_sr.harmonics],
+                dim=1,
+            ),
+            opacities=torch.cat(
+                [unselected_lr.opacities, selected_sr.opacities],
+                dim=1,
+            ),
+        )
+
+        num_slots = decoded.means.shape[2]
+        full_child_means = decoded.means.new_zeros(
+            b,
+            num_parents,
+            num_slots,
+            3,
+        )
+        full_child_means[parent_selection_flat] = decoded.means.reshape(
+            -1,
+            num_slots,
+            3,
+        )
+        v, h, w, srf, spp = anchor_grid_shape
+        encoder_output["child_means_for_grid_loss"] = rearrange(
+            full_child_means,
+            "b (v h w srf spp) k xyz -> b v h w srf spp k xyz",
+            v=v,
+            h=h,
+            w=w,
+            srf=srf,
+            spp=spp,
+        )
+        return encoder_output
+
+    def densify_from_render_error(
+        self,
+        encoder_output: dict,
+        decoder,
+        context_image: Tensor,
+        context_extrinsics: Tensor,
+        context_intrinsics: Tensor,
+        context_near: Tensor,
+        context_far: Tensor,
+        global_step: int,
+        budget_per_view: int,
+        temperature: float,
+        stochastic: bool,
+    ) -> tuple[dict, Tensor, Tensor]:
+        if temperature <= 0:
+            raise ValueError("Densification temperature must be positive.")
+
+        gaussians_lr = encoder_output["gaussians_lr"]
+        v, h, w, srf, spp = encoder_output["densification_grid_shape"]
+        with torch.no_grad():
+            lr_render = decoder.forward(
+                gaussians_lr,
+                context_extrinsics,
+                context_intrinsics,
+                context_near,
+                context_far,
+                context_image.shape[-2:],
+                depth_mode=None,
+            )
+            error_256 = (
+                lr_render.color - context_image
+            ).abs().mean(dim=2)
+            error_64 = torch.nn.functional.adaptive_avg_pool2d(
+                rearrange(error_256, "b v h w -> (b v) 1 h w"),
+                (h, w),
+            )
+            error_64 = rearrange(
+                error_64,
+                "(b v) 1 h w -> b v h w",
+                b=context_image.shape[0],
+                v=v,
+            )
+
+            parents_per_view = h * w * srf * spp
+            parent_score = error_64[..., None, None].expand(
+                -1,
+                -1,
+                -1,
+                -1,
+                srf,
+                spp,
+            ).reshape(context_image.shape[0], v, parents_per_view)
+            probability = torch.softmax(
+                parent_score / temperature,
+                dim=-1,
+            )
+            budget = min(budget_per_view, parents_per_view)
+            if stochastic and budget < parents_per_view:
+                selected_local = torch.multinomial(
+                    probability.reshape(-1, parents_per_view),
+                    budget,
+                    replacement=False,
+                ).reshape(context_image.shape[0], v, budget)
+            else:
+                selected_local = probability.topk(budget, dim=-1).indices
+
+            view_offsets = (
+                torch.arange(v, device=probability.device)
+                * parents_per_view
+            )[None, :, None]
+            selected_global = (
+                selected_local + view_offsets
+            ).reshape(context_image.shape[0], v * budget)
+            parent_selection = torch.zeros(
+                context_image.shape[0],
+                v * parents_per_view,
+                dtype=torch.bool,
+                device=probability.device,
+            )
+            parent_selection.scatter_(1, selected_global, True)
+            parent_selection = parent_selection.reshape(
+                context_image.shape[0],
+                v,
+                h,
+                w,
+                srf,
+                spp,
+            )
+
+        encoder_output = self.densify_prepared(
+            encoder_output,
+            parent_selection,
+            global_step,
+        )
+        return encoder_output, parent_selection, error_64.detach()
+
     def set_depth_head(self, output_mode, head_type, landscape_only, depth_mode, conf_mode):
         self.backbone.depth_mode = depth_mode
         self.backbone.conf_mode = conf_mode
@@ -258,6 +509,7 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             visualization_dump: Optional[dict] = None,
             target: Optional[dict] = None,
             warmup_pts3d: bool = False,
+            prepare_densification: bool = False,
     ):
         context_image = context.get("image_lr", context["image"])
         target_image = target.get("image_lr", target["image"]) if target is not None else None
@@ -407,6 +659,56 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             source_view_indices,
             "b v n -> b (v n)",
         )
+
+        if prepare_densification:
+            encoder_output = {
+                "gaussians_lr": flatten_gaussians(lr_gaussians),
+                "densification_grid_shape": (
+                    num_lr_views,
+                    h,
+                    w,
+                    num_lr_surfaces,
+                    num_lr_samples_per_pixel,
+                ),
+                "_densification_state": (
+                    lr_gaussians,
+                    anchors,
+                    source_view_indices,
+                    fusion_features,
+                    depth_all,
+                    context_extrinsics,
+                    context_intrinsics,
+                    context_image_sr.shape[-2:],
+                    (
+                        num_lr_views,
+                        h,
+                        w,
+                        num_lr_surfaces,
+                        num_lr_samples_per_pixel,
+                    ),
+                ),
+            }
+            if self.cfg.estimating_pose:
+                encoder_output["extrinsics"] = {
+                    "c": pred_extrinsics[:, :v_cxt],
+                }
+                if target is not None:
+                    encoder_output["extrinsics"]["cwt"] = pred_extrinsics
+            if self.cfg.estimating_focal:
+                encoder_output["intrinsics"] = {
+                    "c": pred_intrinsics[:, :v_cxt],
+                }
+                if target is not None:
+                    encoder_output["intrinsics"]["cwt"] = pred_intrinsics
+            if visualization_dump is not None:
+                visualization_dump["depth"] = depths_per_view
+                visualization_dump["means"] = rearrange(
+                    lr_gaussians.means,
+                    "b v (h w) srf spp xyz -> b v h w (srf spp) xyz",
+                    h=h,
+                    w=w,
+                )
+            return encoder_output
 
         multiview_consistency = None
         if self.multiview_consistency is not None:

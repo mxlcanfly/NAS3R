@@ -118,6 +118,7 @@ class AnchorMultiViewFeatureFusion(nn.Module):
         consistency_valid_mask: Tensor,
         anchor_grid_shape: tuple[int, int, int, int, int],
         hr_feature_map: Tensor,
+        parent_selection: Tensor | None = None,
     ) -> AnchorMultiViewFusionResult:
         samples = self.feature_sampler(
             anchors=anchors,
@@ -186,6 +187,42 @@ class AnchorMultiViewFeatureFusion(nn.Module):
             fused_feature = self.feature_unet(
                 fused_feature,
                 *anchor_grid_shape,
+            )
+        if parent_selection is not None:
+            if parent_selection.shape != anchors.shape[:2]:
+                raise ValueError(
+                    "parent_selection must match the anchor batch and point axes."
+                )
+            selected_per_batch = parent_selection.sum(dim=1)
+            if not torch.equal(
+                selected_per_batch,
+                selected_per_batch[:1].expand_as(selected_per_batch),
+            ):
+                raise ValueError(
+                    "Each batch item must select the same number of parents."
+                )
+            selected_indices = torch.arange(
+                anchors.shape[1],
+                device=anchors.device,
+            )[None].expand(anchors.shape[0], -1)[parent_selection].reshape(
+                anchors.shape[0],
+                -1,
+            )
+            anchors = anchors.gather(
+                1,
+                selected_indices[..., None].expand(-1, -1, 3),
+            )
+            fused_feature = fused_feature.gather(
+                1,
+                selected_indices[..., None].expand(
+                    -1,
+                    -1,
+                    fused_feature.shape[-1],
+                ),
+            )
+            source_view_indices = source_view_indices.gather(
+                1,
+                selected_indices,
             )
         slot_features = torch.cat(
             [

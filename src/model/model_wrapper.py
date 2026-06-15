@@ -86,6 +86,10 @@ class TrainCfg:
     refine_only: bool = False
     refine_train_gaussian_head: bool = False
     lr_gaussian_loss_weight: float = 1.0
+    densification_budget: int = 4096
+    densification_temperature: float = 0.2
+    train_lr_network_low_lr: bool = False
+    freeze_lr_except_gaussian_head: bool = False
 
 
 def dropout_context_views(v_cxt):
@@ -194,6 +198,23 @@ class ModelWrapper(LightningModule):
     def _images(self, views: dict) -> Tensor:
         return views[self._image_key(views)]
 
+    def _encode(
+            self,
+            context: dict,
+            visualization_dump: dict | None = None,
+            target: dict | None = None,
+    ) -> dict:
+        kwargs = {
+            "visualization_dump": visualization_dump,
+            "target": target,
+        }
+        if (
+            getattr(self.encoder.cfg, "name", None) == "nas3r-m"
+            and self.train_cfg.densification_budget > 0
+        ):
+            kwargs["prepare_densification"] = True
+        return self.encoder(context, self.global_step, **kwargs)
+
     def _run_output_dir(self) -> Path:
         checkpoint_callback = getattr(self.trainer, "checkpoint_callback", None)
         checkpoint_dir = getattr(checkpoint_callback, "dirpath", None)
@@ -206,6 +227,41 @@ class ModelWrapper(LightningModule):
             return Path(save_dir)
 
         return Path.cwd()
+
+    def _select_densified_gaussians(
+            self,
+            encoder_output: dict,
+            context_image: Tensor,
+            context_extrinsics: Tensor,
+            context_intrinsics: Tensor,
+            context_near: Tensor,
+            context_far: Tensor,
+            stochastic: bool,
+    ):
+        grid_shape = encoder_output.get("densification_grid_shape")
+        if grid_shape is None or self.train_cfg.densification_budget <= 0:
+            return encoder_output["gaussians_lr"], None, None, None
+        encoder_output, parent_selection, error_64 = (
+            self.encoder.densify_from_render_error(
+                encoder_output,
+                self.decoder,
+                context_image,
+                context_extrinsics,
+                context_intrinsics,
+                context_near,
+                context_far,
+                self.global_step,
+                self.train_cfg.densification_budget,
+                self.train_cfg.densification_temperature,
+                stochastic,
+            )
+        )
+        return (
+            encoder_output["gaussians"],
+            parent_selection,
+            error_64,
+            None,
+        )
 
     @rank_zero_only
     def _save_training_gaussian_debug(
@@ -291,9 +347,8 @@ class ModelWrapper(LightningModule):
         v_cxt = batch["context"]["image"].shape[1]
 
         # Run the model.
-        encoder_output = self.encoder(
+        encoder_output = self._encode(
             batch["context"],
-            self.global_step,
             target=batch["target"] if self.encoder.cfg.estimating_pose else None,
         )
 
@@ -316,7 +371,28 @@ class ModelWrapper(LightningModule):
 
         total_loss = 0
 
-        gaussians = encoder_output["gaussians"]
+        gaussians, parent_selection, error_64, _ = (
+            self._select_densified_gaussians(
+                encoder_output,
+                context_image,
+                context_extrinsics,
+                context_intrinsics,
+                batch["context"]["near"],
+                batch["context"]["far"],
+                stochastic=self.training,
+            )
+        )
+        if error_64 is not None:
+            self.log("train/densification_error_mean", error_64.mean())
+            self.log("train/densification_error_max", error_64.amax())
+            self.log(
+                "train/densified_parent_count_total",
+                parent_selection.sum(dim=(1, 2, 3, 4, 5)).float().mean(),
+            )
+            self.log(
+                "train/densified_parent_count_per_view",
+                parent_selection.sum(dim=(2, 3, 4, 5)).float().mean(),
+            )
         # Determine decoder inputs
         extrinsics = target_extrinsics if not self.train_cfg.training_context else torch.cat(
             [context_extrinsics, target_extrinsics], dim=1)
@@ -417,6 +493,7 @@ class ModelWrapper(LightningModule):
                     context_intrinsics[:, :1],
                     context_image.shape[-2:],
                     self.global_step,
+                    parent_selection=parent_selection[:, :1],
                 )
                 self.log("loss/child_grid/context1", context1_loss)
 
@@ -427,6 +504,7 @@ class ModelWrapper(LightningModule):
                         context_intrinsics[:, 1:],
                         context_image.shape[-2:],
                         self.global_step,
+                        parent_selection=parent_selection[:, 1:],
                     )
                     context_others_loss = context_others_loss * (
                         (child_means.shape[1] - 1) / child_means.shape[1]
@@ -504,18 +582,33 @@ class ModelWrapper(LightningModule):
                     target_data["image_lr"] = batch["target"]["image_lr"][:, target_view:target_view + 1]
 
                 with self.benchmarker.time("encoder"):
-                    encoder_output = self.encoder(batch["context"], self.global_step,
-                                                  visualization_dump=visualization_dump, target=target_data)
+                    encoder_output = self._encode(
+                        batch["context"],
+                        visualization_dump=visualization_dump,
+                        target=target_data,
+                    )
 
                 pred_extrinsics_cwt = encoder_output['extrinsics']['cwt']
-                gaussians = encoder_output["gaussians"]
+                context_extrinsics = pred_extrinsics_cwt[:, :v_cxt]
 
                 if self.encoder.cfg.estimating_focal:
                     pred_intrinsics_cwt = encoder_output['intrinsics']['cwt']
                     target_intrinsics = pred_intrinsics_cwt[:, v_cxt:]
+                    context_intrinsics = pred_intrinsics_cwt[:, :v_cxt]
                     # print("estimate focal", target_intrinsics[0,0,0,0]*w, "gt focal", batch["target"]["intrinsics"][0,target_view,0,0]*w)
                 else:
                     target_intrinsics = target_data["intrinsics"]
+                    context_intrinsics = batch["context"]["intrinsics"]
+
+                gaussians, _, _, _ = self._select_densified_gaussians(
+                    encoder_output,
+                    batch["context"]["image"],
+                    context_extrinsics,
+                    context_intrinsics,
+                    batch["context"]["near"],
+                    batch["context"]["far"],
+                    stochastic=False,
+                )
 
                 if self.test_cfg.align_pose:
                     output, updated_extrinsics = self.test_step_align(target_data, gaussians, target_intrinsics,
@@ -542,7 +635,10 @@ class ModelWrapper(LightningModule):
         else:
             # Render Gaussians.
             with self.benchmarker.time("encoder"):
-                encoder_output = self.encoder(batch["context"], self.global_step, visualization_dump=visualization_dump)
+                encoder_output = self._encode(
+                    batch["context"],
+                    visualization_dump=visualization_dump,
+                )
 
             target_extrinsics = batch["target"]["extrinsics"]
 
@@ -553,7 +649,21 @@ class ModelWrapper(LightningModule):
             else:
                 target_intrinsics = batch["target"]["intrinsics"]
 
-            gaussians = encoder_output['gaussians']
+            context_extrinsics = batch["context"]["extrinsics"]
+            context_intrinsics = (
+                encoder_output["intrinsics"]["c"]
+                if self.encoder.cfg.estimating_focal
+                else batch["context"]["intrinsics"]
+            )
+            gaussians, _, _, _ = self._select_densified_gaussians(
+                encoder_output,
+                batch["context"]["image"],
+                context_extrinsics,
+                context_intrinsics,
+                batch["context"]["near"],
+                batch["context"]["far"],
+                stochastic=False,
+            )
 
             # align the target pose
             if self.test_cfg.align_pose:
@@ -776,8 +886,11 @@ class ModelWrapper(LightningModule):
         assert b == 1
 
         visualization_dump = {}
-        encoder_output = self.encoder(batch["context"], self.global_step, visualization_dump=visualization_dump,
-                                      target=batch["target"] if self.encoder.cfg.estimating_pose else None)
+        encoder_output = self._encode(
+            batch["context"],
+            visualization_dump=visualization_dump,
+            target=batch["target"] if self.encoder.cfg.estimating_pose else None,
+        )
 
         if self.encoder.cfg.estimating_pose:
             pred_extrinsics_cwt = encoder_output['extrinsics']['cwt']
@@ -800,7 +913,15 @@ class ModelWrapper(LightningModule):
             target_intrinsics = batch["target"]["intrinsics"]
             context_intrinsics = batch["context"]["intrinsics"]
 
-        gaussians = encoder_output['gaussians']
+        gaussians, _, _, _ = self._select_densified_gaussians(
+            encoder_output,
+            batch["context"]["image"],
+            context_extrinsics,
+            context_intrinsics,
+            batch["context"]["near"],
+            batch["context"]["far"],
+            stochastic=False,
+        )
 
         # Render context + target views for validation visualization
         extrinsics = torch.cat([context_extrinsics, target_extrinsics], dim=1)
@@ -971,10 +1092,10 @@ class ModelWrapper(LightningModule):
         _, v_cxt, _, _ = batch["context"]["extrinsics"].shape
 
         visualization_dump = {}
-        encoder_output = self.encoder(batch["context"], self.global_step, visualization_dump=visualization_dump,
-                                      target=None)
-        gaussians = encoder_output['gaussians']
-
+        encoder_output = self._encode(
+            batch["context"],
+            visualization_dump=visualization_dump,
+        )
         if self.encoder.cfg.estimating_pose:
             pred_extrinsics = encoder_output['extrinsics']['c']
             context_extrinsics = pred_extrinsics[:, :v_cxt]
@@ -986,6 +1107,16 @@ class ModelWrapper(LightningModule):
             context_intrinsics = pred_intrinsics_cwt[:, :v_cxt]
         else:
             context_intrinsics = batch["context"]["intrinsics"]
+
+        gaussians, _, _, _ = self._select_densified_gaussians(
+            encoder_output,
+            batch["context"]["image"],
+            context_extrinsics,
+            context_intrinsics,
+            batch["context"]["near"],
+            batch["context"]["far"],
+            stochastic=False,
+        )
 
         t = torch.linspace(0, 1, num_frames, dtype=torch.float32, device=self.device)
         if smooth:
@@ -1106,7 +1237,17 @@ class ModelWrapper(LightningModule):
                     print(f"Freezing: {name}")
 
     def configure_optimizers(self):
-        if self.train_cfg.refine_only:
+        if self.train_cfg.freeze_lr_except_gaussian_head:
+            trainable_keywords = (
+                "gaussian_param_head",
+                "resunet_token_fusion",
+                "anchor_multiview_fusion",
+            )
+            for name, param in self.named_parameters():
+                param.requires_grad = any(
+                    keyword in name for keyword in trainable_keywords
+                )
+        elif self.train_cfg.refine_only:
             trainable_keywords = [
                 "resunet_token_fusion",
                 "anchor_multiview_fusion",
@@ -1134,14 +1275,16 @@ class ModelWrapper(LightningModule):
                     continue
 
                 # Heads that are always treated as new
+                new_module_keywords = [
+                    "intrinsic_encoder",
+                    "resunet_token_fusion",
+                    "anchor_multiview_fusion",
+                ]
+                if not self.train_cfg.train_lr_network_low_lr:
+                    new_module_keywords.append("gaussian_param_head")
                 if any(
                     x in name
-                    for x in [
-                        "gaussian_param_head",
-                        "intrinsic_encoder",
-                        "resunet_token_fusion",
-                        "anchor_multiview_fusion",
-                    ]
+                    for x in new_module_keywords
                 ):
                     new_params.append(param)
                     new_param_names.append(name)

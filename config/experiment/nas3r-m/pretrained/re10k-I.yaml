@@ -11,65 +11,69 @@ wandb:
   name: re10k
   tags: [re10k, 256x256]
   project: nas3r-m
-
+  mode: offline
 
 model:
   encoder:
     backbone:
       name: masked_croco_multi
-      intrinsics_embed_loc: 'decoder'
+      intrinsics_embed_loc: decoder
+      intrinsics_embed_type: token
 
     gs_params_head_type: dpt_gs
     pose_free: true
-    pretrained_weights:  "/space0/mengxl/NAS3R-master/outputs/exp_re10k/64in64/checkpoints/epoch_36-step_300000.ckpt" #"/space0/mengxl/NAS3R-master/pretrained_weights/naslr.ckpt" # "/space0/mengxl/NAS3R-master/pretrained_weights/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth"
-
+    pretrained_weights: /space0/mengxl/NAS3R-master/outputs/exp_re10k/64in256/checkpoints/epoch_18-step_75000.ckpt
 
     estimating_focal: false
-    depth_activation: 'sigmoid'
+    depth_activation: sigmoid
+
     pose_head:
       pose_init_t: true
       use_homogeneous: false
       concat_enc: false
       estimate_focal: false
 
-
-
 dataset:
   re10k:
+    input_image_shape: [256, 256]
     make_baseline_1: true
+    relative_pose: true
     view_sampler:
-      warm_up_steps: 10000
+      warm_up_steps: 10_000
       num_target_views: 1
       num_context_views: 2
+      min_distance_between_context_views: 45
       max_distance_between_context_views: 150
-
 
 optimizer:
   lr: 1e-4
   warm_up_steps: 1000
-  backbone_lr_multiplier: 1.0
-  min_lr_multiplier: 0.0
+  backbone_lr_multiplier: 0.1
+  min_lr_multiplier: 0.01
 
 data_loader:
   train:
-    batch_size: 16
+    batch_size: 32
 
 trainer:
-  max_steps: 120001
-  val_check_interval: 10000
+  max_steps: 120_001
+  val_check_interval: 10_000
 
 checkpointing:
   every_n_train_steps: 1000
   save_weights_only: false
   save_top_k: 1
 
-
 train:
   training_context: false
-  refine_only: true
+  pretrain_camera_head: false
+  refine_only: false
   refine_train_gaussian_head: false
   lr_gaussian_loss_weight: 0.0
-
+  densification_budget: 2048
+  densification_temperature: 0.2
+  train_lr_network_low_lr: true
+  freeze_lr_except_gaussian_head: true
 
 test:
   output_path: outputs/test/nas3r-m/pretrained-I/

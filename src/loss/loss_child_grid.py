@@ -34,6 +34,7 @@ class LossChildGrid(Loss[LossChildGridCfg, LossChildGridCfgWrapper]):
         intrinsics: Tensor,
         sr_image_shape: tuple[int, int],
         global_step: int,
+        parent_selection: Tensor | None = None,
     ) -> Tensor:
         if global_step < self.cfg.apply_after_step:
             return child_means.new_zeros(())
@@ -84,11 +85,20 @@ class LossChildGrid(Loss[LossChildGridCfg, LossChildGridCfgWrapper]):
         outside_x_pixels = outside_x * sr_width
         outside_y_pixels = outside_y * sr_height
         zero = torch.zeros((), device=device, dtype=dtype)
-        loss = F.smooth_l1_loss(
+        per_child_loss = F.smooth_l1_loss(
             outside_x_pixels,
             zero.expand_as(outside_x_pixels),
+            reduction="none",
         ) + F.smooth_l1_loss(
             outside_y_pixels,
             zero.expand_as(outside_y_pixels),
+            reduction="none",
         )
+        if parent_selection is not None:
+            selected = parent_selection[..., None].expand_as(per_child_loss)
+            if not selected.any():
+                return child_means.new_zeros(())
+            loss = per_child_loss[selected].mean()
+        else:
+            loss = per_child_loss.mean()
         return self.cfg.weight * loss

@@ -68,6 +68,11 @@ train:
   refine_only: false
   refine_train_gaussian_head: false
   lr_gaussian_loss_weight: 1.0
+  # Number of LR parent Gaussians densified independently in each input view.
+  densification_budget: 2048
+  densification_temperature: 0.2
+  train_lr_network_low_lr: false
+  freeze_lr_except_gaussian_head: false
 
 
 test:
