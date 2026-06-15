@@ -20,13 +20,14 @@ class DecoderSplattingCUDACfg:
     enable_cov_grad: bool
     enable_sh_grad: bool
 
+
 class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
     background_color: Float[Tensor, "3"]
 
     def __init__(
-        self,
-        cfg: DecoderSplattingCUDACfg,
-        # dataset_cfg: DatasetCfg,
+            self,
+            cfg: DecoderSplattingCUDACfg,
+            # dataset_cfg: DatasetCfg,
     ) -> None:
         super().__init__(cfg)
         self.make_scale_invariant = cfg.make_scale_invariant
@@ -39,17 +40,17 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
         )
 
     def forward(
-        self,
-        gaussians: Gaussians,
-        extrinsics: Float[Tensor, "batch view 4 4"],
-        intrinsics: Float[Tensor, "batch view 3 3"],
-        near: Float[Tensor, "batch view"],
-        far: Float[Tensor, "batch view"],
-        image_shape: tuple[int, int],
-        depth_mode: DepthRenderingMode | None = None,
+            self,
+            gaussians: Gaussians,
+            extrinsics: Float[Tensor, "batch view 4 4"],
+            intrinsics: Float[Tensor, "batch view 3 3"],
+            near: Float[Tensor, "batch view"],
+            far: Float[Tensor, "batch view"],
+            image_shape: tuple[int, int],
+            depth_mode: DepthRenderingMode | None = None,
     ) -> DecoderOutput:
         b, v, _, _ = extrinsics.shape
-        color, depth = render_cuda(
+        color, depth, accumulated_opacity = render_cuda(
             rearrange(extrinsics, "b v i j -> (b v) i j"),
             rearrange(intrinsics, "b v i j -> (b v) i j"),
             rearrange(near, "b v -> (b v)"),
@@ -67,16 +68,20 @@ class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
             enable_sh_grad=self.enable_sh_grad
         )
         color = rearrange(color, "(b v) c h w -> b v c h w", b=b, v=v)
-
-        
         depth = rearrange(depth, "(b v) 1 h w -> b v h w", b=b, v=v)
+        accumulated_opacity = rearrange(
+            accumulated_opacity,
+            "(b v) 1 h w -> b v h w",
+            b=b,
+            v=v,
+        )
 
         if self.make_scale_invariant:
             scale = near / 1
             depth = depth * scale[:, :, None, None]
 
-        return DecoderOutput(color, depth)
-        
+        return DecoderOutput(color, depth, accumulated_opacity)
 
 
-  
+
+

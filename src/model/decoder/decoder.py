@@ -19,6 +19,7 @@ DepthRenderingMode = Literal[
 class DecoderOutput:
     color: Float[Tensor, "batch view 3 height width"]
     depth: Float[Tensor, "batch view height width"] | None
+    accumulated_opacity: Float[Tensor, "batch view height width"] | None
 
 
 T = TypeVar("T")

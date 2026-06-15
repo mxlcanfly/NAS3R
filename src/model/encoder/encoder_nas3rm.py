@@ -1,10 +1,10 @@
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, Optional
 
 import torch
 import torch.nn.functional as F
-from einops import rearrange
+from einops import rearrange, repeat
 from jaxtyping import Float
 from torch import Tensor, nn
 import math
@@ -24,6 +24,9 @@ from .visualization.encoder_visualizer_epipolar_cfg import EncoderVisualizerEpip
 from ...misc.cam_utils import camera_normalization, convert_pose_to_4x4, depth_projector, \
     unproject_depth_map_to_point_map_batch
 from .heads.pose_head import PoseHeadCfg
+from .resunet_fusion import HiSplatResUnetTokenFusion
+from ..super_resolution import FrozenSwinIRUpsampler
+from ..decoder.cuda_splatting import render_cuda
 
 inf = float('inf')
 
@@ -64,6 +67,19 @@ class EncoderNAS3RMCfg:
 
     equal_fxfy: bool = True
     equal_view_intrinsics: bool = True
+    use_swinir: bool = False
+    swinir_weights: str = ""
+    swinir_upscale: int = 4
+    swinir_input_size: int = 64
+    compute_render_error: bool = False
+    render_error_background: list[float] = field(
+        default_factory=lambda: [0.0, 0.0, 0.0]
+    )
+    use_resunet_token_fusion: bool = False
+    unimatch_weights_path: str = ""
+    densification_grid_size: int = 64
+    densification_budget: int = 2048
+    densification_sampling: Literal["topk", "multinomial"] = "multinomial"
 
 
 def rearrange_head(feat, patch_size, H, W):
@@ -82,6 +98,43 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
         super().__init__(cfg)
 
         self.backbone = get_backbone(cfg.backbone, 3)
+
+        self.swinir = None
+        if cfg.use_swinir:
+            if not cfg.swinir_weights:
+                raise ValueError("swinir_weights must be set when use_swinir=True")
+            self.swinir = FrozenSwinIRUpsampler(
+                weight_path=cfg.swinir_weights,
+                upscale=cfg.swinir_upscale,
+                img_size=cfg.swinir_input_size,
+            )
+        if cfg.compute_render_error and self.swinir is None:
+            raise ValueError(
+                "compute_render_error=True requires use_swinir=True"
+            )
+        if cfg.use_resunet_token_fusion and self.swinir is None:
+            raise ValueError(
+                "use_resunet_token_fusion=True requires use_swinir=True"
+            )
+        self.resunet_token_fusion = (
+            HiSplatResUnetTokenFusion(
+                token_dim=self.backbone.dec_embed_dim,
+            )
+            if cfg.use_resunet_token_fusion
+            else None
+        )
+        if (
+            self.resunet_token_fusion is not None
+            and cfg.unimatch_weights_path
+        ):
+            self.resunet_token_fusion.load_unimatch_encoder(
+                cfg.unimatch_weights_path
+            )
+        self.register_buffer(
+            "render_error_background",
+            torch.tensor(cfg.render_error_background, dtype=torch.float32),
+            persistent=False,
+        )
 
         self.pose_free = cfg.pose_free
         if self.pose_free:
@@ -161,24 +214,178 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
         head = getattr(self, f'depth_head{head_num}')
         return head(decout, img_shape, ray_embedding=ray_embedding)
 
-    def forward(
-            self,
-            context: dict,
-            global_step: int = 0,
-            visualization_dump: Optional[dict] = None,
-            target: Optional[dict] = None,
-            warmup_pts3d: bool = False,
-    ):
-        context_image = context.get("image_lr", context["image"])
-        target_image = target.get("image_lr", target["image"]) if target is not None else None
+    def _super_resolve(self, images: Tensor) -> Tensor:
+        expected_size = (self.cfg.swinir_input_size, self.cfg.swinir_input_size)
+        if images.shape[-2:] != expected_size:
+            raise ValueError(
+                f"SwinIR expects {expected_size} inputs, got {tuple(images.shape[-2:])}"
+            )
+        return self.swinir(images)
 
-        device = context_image.device
-        b, v_cxt, _, h, w = context_image.shape
+    @torch.no_grad()
+    def _compute_render_error(
+            self,
+            gaussians: Gaussians,
+            sr_images: Tensor,
+            extrinsics: Tensor,
+            intrinsics: Tensor,
+            near: Tensor,
+            far: Tensor,
+    ) -> dict[str, Tensor]:
+        b, v, _, h, w = sr_images.shape
+        rendered_color, _, accumulated_opacity = render_cuda(
+            rearrange(extrinsics.detach(), "b v i j -> (b v) i j"),
+            rearrange(intrinsics.detach(), "b v i j -> (b v) i j"),
+            rearrange(near.detach(), "b v -> (b v)"),
+            rearrange(far.detach(), "b v -> (b v)"),
+            (h, w),
+            repeat(
+                self.render_error_background,
+                "c -> (b v) c",
+                b=b,
+                v=v,
+            ),
+            repeat(gaussians.means.detach(), "b g xyz -> (b v) g xyz", v=v),
+            repeat(
+                gaussians.covariances.detach(),
+                "b g i j -> (b v) g i j",
+                v=v,
+            ),
+            repeat(
+                gaussians.harmonics.detach(),
+                "b g c d -> (b v) g c d",
+                v=v,
+            ),
+            repeat(gaussians.opacities.detach(), "b g -> (b v) g", v=v),
+            repeat(gaussians.rotations.detach(), "b g d -> (b v) g d", v=v),
+            repeat(gaussians.scales.detach(), "b g d -> (b v) g d", v=v),
+            scale_invariant=True,
+            enable_cov_grad=False,
+            enable_sh_grad=False,
+        )
+        rendered_color = rearrange(
+            rendered_color,
+            "(b v) c h w -> b v c h w",
+            b=b,
+            v=v,
+        )
+        accumulated_opacity = rearrange(
+            accumulated_opacity,
+            "(b v) 1 h w -> b v 1 h w",
+            b=b,
+            v=v,
+        )
+        sr_images = sr_images.detach()
+        return {
+            "lr_render": rendered_color,
+            "render_error": (rendered_color - sr_images),
+            "accumulated_opacity": accumulated_opacity,
+        }
+
+    @torch.no_grad()
+    def _compute_densification_mask(
+            self,
+            render_error: Tensor,
+    ) -> dict[str, Tensor]:
+        if render_error.ndim != 5:
+            raise ValueError(
+                "render_error must have shape [B, V, C, H, W], got "
+                f"{tuple(render_error.shape)}"
+            )
+
+        b, v = render_error.shape[:2]
+        grid_size = self.cfg.densification_grid_size
+        if grid_size <= 0:
+            raise ValueError(
+                f"densification_grid_size must be positive, got {grid_size}"
+            )
+        error_score = render_error.detach().abs().mean(dim=2)
+        error_score = F.adaptive_avg_pool2d(
+            rearrange(error_score, "b v h w -> (b v) 1 h w"),
+            (grid_size, grid_size),
+        )
+        error_score = rearrange(
+            error_score,
+            "(b v) 1 h w -> b v h w",
+            b=b,
+            v=v,
+        )
+
+        flat_score = rearrange(
+            error_score.float(),
+            "b v h w -> b v (h w)",
+        )
+        sampling_weight = flat_score + 1e-8
+        probability = sampling_weight / sampling_weight.sum(
+            dim=-1,
+            keepdim=True,
+        )
+
+        num_candidates = probability.shape[-1]
+        budget = min(max(int(self.cfg.densification_budget), 0), num_candidates)
+        flat_mask = torch.zeros_like(probability, dtype=torch.bool)
+        if budget > 0:
+            if self.cfg.densification_sampling == "multinomial":
+                selected = torch.multinomial(
+                    probability.reshape(b * v, num_candidates),
+                    num_samples=budget,
+                    replacement=False,
+                )
+                selected = rearrange(selected, "(b v) k -> b v k", b=b, v=v)
+            elif self.cfg.densification_sampling == "topk":
+                selected = probability.topk(budget, dim=-1).indices
+            else:
+                raise ValueError(
+                    "densification_sampling must be 'topk' or 'multinomial', "
+                    f"got {self.cfg.densification_sampling!r}"
+                )
+            flat_mask.scatter_(-1, selected, True)
+
+        densification_mask = rearrange(
+            flat_mask,
+            "b v (h w) -> b v h w",
+            h=grid_size,
+            w=grid_size,
+        )
+        return {
+            "densification_probability": rearrange(
+                probability,
+                "b v (h w) -> b v h w",
+                h=grid_size,
+                w=grid_size,
+            ),
+            "densification_mask": densification_mask,
+            "remaining_mask": ~densification_mask,
+        }
+
+    def forward(
+        self,
+        context: dict,
+        global_step: int = 0,
+        visualization_dump: Optional[dict] = None,
+        target: Optional[dict] = None,
+        warmup_pts3d: bool = False,
+    ):
+        context_image_lr = context.get("image_lr", context["image"])
+        target_image_lr = (
+            target.get("image_lr", target["image"])
+            if target is not None
+            else None
+        )
+        context_image_sr = (
+            self._super_resolve(context_image_lr)
+            if self.cfg.compute_render_error
+            else None
+        )
+
+        b, v_cxt, _, h, w = context_image_lr.shape
 
         if target is not None:
-            v_tgt = target_image.shape[1]
+            v_tgt = target_image_lr.shape[1]
             context_target = {
-                "image": normalize_image(torch.cat([context_image, target_image], dim=1)),
+                "image": normalize_image(
+                    torch.cat([context_image_lr, target_image_lr], dim=1)
+                ),
                 "intrinsics": torch.cat([context["intrinsics"], target["intrinsics"]], dim=1),
             }
             # Encode the context and target images.
@@ -186,13 +393,21 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
         else:
             v_tgt = 0
             context_input = {
-                "image": normalize_image(context_image),
+                "image": normalize_image(context_image_lr),
                 "intrinsics": context["intrinsics"],
             }
             # Encode the context images.
             out = self.backbone(context_input)
 
         dec_feat, shape, images = out['dec_feat'], out['shape'], out['images']
+        resunet_features = (
+            self.resunet_token_fusion(
+                context_image_sr,
+                dec_feat[-1][:, :v_cxt],
+            )
+            if self.resunet_token_fusion is not None
+            else None
+        )
 
         with torch.amp.autocast('cuda', enabled=False):
             all_other_params = []
@@ -212,12 +427,12 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
 
             # for the 3DGS heads
             if 'dpt' in self.gs_params_head_type:
-                GS_res1 = self.gaussian_param_head([tok[:, 0].float() for tok in dec_feat], images[:, 0, :3],
+                GS_res1, gs_feat1 = self.gaussian_param_head([tok[:, 0].float() for tok in dec_feat], images[:, 0, :3],
                                                    shape[0, 0].cpu().tolist())
                 GS_res1 = rearrange(GS_res1, "b d h w -> b (h w) d")
                 all_other_params.append(GS_res1)
                 for i in range(1, v_cxt):
-                    GS_res2 = self.gaussian_param_head2([tok[:, i].float() for tok in dec_feat], images[:, i, :3],
+                    GS_res2, gs_feat2 = self.gaussian_param_head2([tok[:, i].float() for tok in dec_feat], images[:, i, :3],
                                                         shape[0, i].cpu().tolist())
                     GS_res2 = rearrange(GS_res2, "b d h w -> b (h w) d")
                     all_other_params.append(GS_res2)
@@ -299,7 +514,7 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
 
         encoder_output = dict()
 
-        encoder_output["gaussians"] = Gaussians(
+        output_gaussians = Gaussians(
             rearrange(gaussians.means, "b v r srf spp xyz -> b (v r srf spp) xyz"),
             rearrange(gaussians.covariances, "b v r srf spp i j -> b (v r srf spp) i j"),
             rearrange(gaussians.rotations, "b v r srf spp i  -> b (v r srf spp) i "),
@@ -307,6 +522,28 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             rearrange(gaussians.harmonics, "b v r srf spp c d_sh -> b (v r srf spp) c d_sh"),
             rearrange(gaussians.opacities, "b v r srf spp -> b (v r srf spp)"),
         )
+        encoder_output["gaussians"] = output_gaussians
+        if resunet_features is not None:
+            encoder_output["resunet_features"] = resunet_features
+
+        if self.cfg.compute_render_error:
+            if "near" not in context or "far" not in context:
+                raise KeyError(
+                    "context must contain near and far to compute render_error"
+                )
+            render_error_output = self._compute_render_error(
+                output_gaussians,
+                context_image_sr,
+                context_extrinsics,
+                context_intrinsics,
+                context["near"],
+                context["far"],
+            )
+            encoder_output.update(
+                self._compute_densification_mask(
+                    render_error_output["render_error"]
+                )
+            )
 
         if self.cfg.estimating_pose:
             encoder_output['extrinsics'] = dict()

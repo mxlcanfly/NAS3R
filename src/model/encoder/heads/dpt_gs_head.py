@@ -66,16 +66,15 @@ class DPTOutputAdapter_fix(DPTOutputAdapter):
         path_2 = self.scratch.refinenet2(path_3, layers[1])
         path_1 = self.scratch.refinenet1(path_2, layers[0])
 
-
-
         direct_img_feat = self.input_merger(imgs)
         path_1 = self.feat_up(path_1)
         path_1 = path_1 + direct_img_feat
+        gs_feat = path_1
 
         # Output head
         out = self.head(path_1)
 
-        return out
+        return out, gs_feat
 
 
 class PixelwiseTaskWithDPT(nn.Module):
@@ -103,10 +102,10 @@ class PixelwiseTaskWithDPT(nn.Module):
         self.dpt.init(**dpt_init_args)
 
     def forward(self, x, imgs, img_info, conf=None):
-        out = self.dpt(x, imgs, image_size=(img_info[0], img_info[1]), conf=conf)
+        out, gs_feat = self.dpt(x, imgs, image_size=(img_info[0], img_info[1]), conf=conf)
         if self.postprocess:
             out = self.postprocess(out, self.depth_mode, self.conf_mode)
-        return out
+        return out, gs_feat
 
 
 def create_gs_dpt_head(net, has_conf=False, out_nchan=3, postprocess_func=postprocess):

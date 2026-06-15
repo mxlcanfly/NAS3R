@@ -52,3 +52,19 @@ depth_activation: 'sigmoid'
 
 equal_fxfy: true
 equal_view_intrinsics: true
+
+use_swinir: true
+swinir_weights: /space0/mengxl/NAS3R-master/pretrained_weights/001_classicalSR_DF2K_s64w8_SwinIR-M_x4.pth
+swinir_upscale: 4
+swinir_input_size: 64
+
+compute_render_error: true
+render_error_background: [0.0, 0.0, 0.0]
+
+use_resunet_token_fusion: true
+unimatch_weights_path: /space0/mengxl/NAS3R-master/pretrained_weights/gmdepth-scale1-resumeflowthings-scannet-5d9d7964.pth
+
+densification_grid_size: 64
+# Number of LR Gaussian positions selected independently in each input view.
+densification_budget: 2048
+densification_sampling: multinomial
