@@ -130,6 +130,16 @@ class ResUnetDecoder(nn.Module):
 
         return out_feature
 
+    def forward_64(
+        self,
+        feature_list: list[torch.Tensor],
+        dino_feature: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        x = feature_list[-1]
+        if dino_feature is not None:
+            x = x + dino_feature
+        return self.out_layer2(torch.cat([x, feature_list[-2]], dim=1))
+
 
 class ResUnet(nn.Module):
     def __init__(
@@ -169,6 +179,24 @@ class ResUnet(nn.Module):
             dino_feature_list.append(dino_feature_i)
         fused_features = self.decoder(feature_list, dino_feature_list)
         return fused_features, image_only_features
+
+    def forward_64(
+        self,
+        x: torch.Tensor,
+        dino_feature: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        feature_list = self.encoder(x)
+        image_only = self.decoder.forward_64(feature_list)
+        dino_64 = self.up_dino_cnn[0](
+            F.interpolate(
+                dino_feature,
+                size=feature_list[-2].shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+        )
+        fused = self.decoder.forward_64(feature_list, dino_64)
+        return fused, image_only
 
 
 class HiSplatResUnetTokenFusion(nn.Module):
@@ -261,18 +289,11 @@ class HiSplatResUnetTokenFusion(nn.Module):
         images = rearrange(images, "b v c h w -> (b v) c h w")
         images = (images.clamp(0, 1) - self.image_mean) / self.image_std
         dino_feature = self.tokens_to_16x16(tokens)
-        fused, image_only = self.resunet(images, dino_feature)
+        fused, image_only = self.resunet.forward_64(images, dino_feature)
         return {
-            "64": rearrange(fused[0], "(b v) c h w -> b v c h w", b=b, v=v),
-            "256": rearrange(fused[2], "(b v) c h w -> b v c h w", b=b, v=v),
+            "64": rearrange(fused, "(b v) c h w -> b v c h w", b=b, v=v),
             "image_only_64": rearrange(
-                image_only[0],
-                "(b v) c h w -> b v c h w",
-                b=b,
-                v=v,
-            ),
-            "image_only_256": rearrange(
-                image_only[2],
+                image_only,
                 "(b v) c h w -> b v c h w",
                 b=b,
                 v=v,

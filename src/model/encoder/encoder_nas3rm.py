@@ -7,23 +7,21 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 from jaxtyping import Float
 from torch import Tensor, nn
-import math
 
 from .backbone.croco.misc import transpose_to_landscape
 from .heads import head_factory, camera_head_factory
-from ...dataset.shims.bounds_shim import apply_bounds_shim
 from ...dataset.shims.normalize_shim import apply_normalize_shim, normalize_image
-from ...dataset.shims.patch_shim import apply_patch_shim
 from ...dataset.types import BatchedExample, DataShim
-from ...geometry.projection import sample_image_grid
 from ..types import Gaussians
-from .backbone import Backbone, BackboneCfg, get_backbone
+from .backbone import BackboneCfg, get_backbone
 from .common.gaussian_adapter import GaussianAdapter, GaussianAdapterCfg, UnifiedGaussianAdapter
 from .encoder import Encoder
 from .visualization.encoder_visualizer_epipolar_cfg import EncoderVisualizerEpipolarCfg
-from ...misc.cam_utils import camera_normalization, convert_pose_to_4x4, depth_projector, \
-    unproject_depth_map_to_point_map_batch
+from ...misc.cam_utils import convert_pose_to_4x4, unproject_depth_map_to_point_map_batch
 from .heads.pose_head import PoseHeadCfg
+from .conditional_gaussian_densifier import ConditionalGaussianDensifier
+from .gaussian_transmittance import GaussianTransmittanceEstimator
+from .multi_view_consistency import FeatureMultiViewConsistencyEstimator
 from .resunet_fusion import HiSplatResUnetTokenFusion
 from ..super_resolution import FrozenSwinIRUpsampler
 from ..decoder.cuda_splatting import render_cuda
@@ -77,6 +75,20 @@ class EncoderNAS3RMCfg:
     )
     use_resunet_token_fusion: bool = False
     unimatch_weights_path: str = ""
+    use_multiview_physical_conditions: bool = False
+    consistency_patch_size: int = 1
+    gaussian_transmittance_chunk_size: int = 256
+    gaussian_transmittance_min_pixel_std: float = 0.3
+    occlusion_delta_scale: float = 0.1
+    use_conditional_densifier: bool = False
+    densifier_attention_dim: int = 128
+    densifier_attention_heads: int = 8
+    densifier_num_slots: int = 8
+    densifier_slot_dim: int = 32
+    densifier_hidden_dim: int = 256
+    densifier_use_full_litept: bool = True
+    densifier_litept_path: str = "/space0/mengxl/LitePT-main"
+    densifier_litept_grid_size: float = 0.02
     densification_grid_size: int = 64
     densification_budget: int = 2048
     densification_sampling: Literal["topk", "multinomial"] = "multinomial"
@@ -129,6 +141,63 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
         ):
             self.resunet_token_fusion.load_unimatch_encoder(
                 cfg.unimatch_weights_path
+            )
+        self.multiview_consistency = (
+            FeatureMultiViewConsistencyEstimator(
+                patch_size=cfg.consistency_patch_size,
+            )
+            if cfg.use_multiview_physical_conditions
+            else None
+        )
+        self.gaussian_transmittance = (
+            GaussianTransmittanceEstimator(
+                target_chunk_size=cfg.gaussian_transmittance_chunk_size,
+                min_pixel_std=cfg.gaussian_transmittance_min_pixel_std,
+            )
+            if cfg.use_multiview_physical_conditions
+            else None
+        )
+        if (
+            self.multiview_consistency is not None
+            and self.resunet_token_fusion is None
+        ):
+            raise ValueError(
+                "use_multiview_physical_conditions=True requires "
+                "use_resunet_token_fusion=True"
+            )
+        if cfg.occlusion_delta_scale <= 0:
+            raise ValueError("occlusion_delta_scale must be positive")
+        self.conditional_densifier = (
+            ConditionalGaussianDensifier(
+                attention_dim=cfg.densifier_attention_dim,
+                attention_heads=cfg.densifier_attention_heads,
+                num_slots=cfg.densifier_num_slots,
+                slot_dim=cfg.densifier_slot_dim,
+                hidden_dim=cfg.densifier_hidden_dim,
+                raw_gaussian_dim=(
+                    7
+                    + 3
+                    * (cfg.gaussian_adapter.sh_degree + 1) ** 2
+                ),
+                litept_path=cfg.densifier_litept_path,
+                use_full_litept=cfg.densifier_use_full_litept,
+                litept_grid_size=cfg.densifier_litept_grid_size,
+            )
+            if cfg.use_conditional_densifier
+            else None
+        )
+        if (
+            self.conditional_densifier is not None
+            and not cfg.use_multiview_physical_conditions
+        ):
+            raise ValueError(
+                "use_conditional_densifier=True requires "
+                "use_multiview_physical_conditions=True"
+            )
+        if self.conditional_densifier is not None and not cfg.pose_free:
+            raise ValueError(
+                "Conditional densification currently requires pose_free=True "
+                "and UnifiedGaussianAdapter"
             )
         self.register_buffer(
             "render_error_background",
@@ -358,6 +427,57 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             "remaining_mask": ~densification_mask,
         }
 
+    @staticmethod
+    def _gather_selected_tensor(
+            values: Tensor,
+            mask: Tensor,
+    ) -> Tensor:
+        return torch.stack(
+            [
+                sample_values[sample_mask]
+                for sample_values, sample_mask in zip(
+                    values,
+                    mask,
+                    strict=True,
+                )
+            ],
+            dim=0,
+        )
+
+    @staticmethod
+    def _gather_gaussians(
+            gaussians: Gaussians,
+            mask: Tensor,
+    ) -> Gaussians:
+        def gather(values: Tensor) -> Tensor:
+            return EncoderNAS3RM._gather_selected_tensor(values, mask)
+
+        return Gaussians(
+            means=gather(gaussians.means),
+            covariances=gather(gaussians.covariances),
+            rotations=gather(gaussians.rotations),
+            scales=gather(gaussians.scales),
+            harmonics=gather(gaussians.harmonics),
+            opacities=gather(gaussians.opacities),
+        )
+
+    @staticmethod
+    def _concatenate_gaussians(
+            first: Gaussians,
+            second: Gaussians,
+    ) -> Gaussians:
+        return Gaussians(
+            means=torch.cat([first.means, second.means], dim=1),
+            covariances=torch.cat(
+                [first.covariances, second.covariances],
+                dim=1,
+            ),
+            rotations=torch.cat([first.rotations, second.rotations], dim=1),
+            scales=torch.cat([first.scales, second.scales], dim=1),
+            harmonics=torch.cat([first.harmonics, second.harmonics], dim=1),
+            opacities=torch.cat([first.opacities, second.opacities], dim=1),
+        )
+
     def forward(
         self,
         context: dict,
@@ -411,6 +531,7 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
 
         with torch.amp.autocast('cuda', enabled=False):
             all_other_params = []
+            all_gs_features = []
             all_depth_res = []
 
             if self.cfg.estimating_pose:
@@ -431,11 +552,13 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
                                                    shape[0, 0].cpu().tolist())
                 GS_res1 = rearrange(GS_res1, "b d h w -> b (h w) d")
                 all_other_params.append(GS_res1)
+                all_gs_features.append(gs_feat1)
                 for i in range(1, v_cxt):
                     GS_res2, gs_feat2 = self.gaussian_param_head2([tok[:, i].float() for tok in dec_feat], images[:, i, :3],
                                                         shape[0, i].cpu().tolist())
                     GS_res2 = rearrange(GS_res2, "b d h w -> b (h w) d")
                     all_other_params.append(GS_res2)
+                    all_gs_features.append(gs_feat2)
             else:
                 raise NotImplementedError(f"unexpected {self.gs_params_head_type=}")
 
@@ -456,6 +579,7 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
                         all_intrin_params.append(pose_res2['intrinsics'])
 
         gaussians = torch.stack(all_other_params, dim=1)  # [b, v, 65536, 83]
+        gs_features = torch.stack(all_gs_features, dim=1)
         # print("gaussians", gaussians.shape)
 
         if self.cfg.estimating_pose:
@@ -523,8 +647,20 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             rearrange(gaussians.opacities, "b v r srf spp -> b (v r srf spp)"),
         )
         encoder_output["gaussians"] = output_gaussians
-        if resunet_features is not None:
-            encoder_output["resunet_features"] = resunet_features
+        source_view_indices = None
+        if self.multiview_consistency is not None:
+            if output_gaussians.means.shape[1] % v_cxt != 0:
+                raise ValueError(
+                    "LR Gaussian count must be divisible by the number of "
+                    "context views"
+                )
+            gaussians_per_view = output_gaussians.means.shape[1] // v_cxt
+            source_view_indices = repeat(
+                torch.arange(v_cxt, device=output_gaussians.means.device),
+                "v -> b (v n)",
+                b=b,
+                n=gaussians_per_view,
+            )
 
         if self.cfg.compute_render_error:
             if "near" not in context or "far" not in context:
@@ -539,11 +675,186 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
                 context["near"],
                 context["far"],
             )
-            encoder_output.update(
-                self._compute_densification_mask(
-                    render_error_output["render_error"]
-                )
+            densification_output = self._compute_densification_mask(
+                render_error_output["render_error"]
             )
+            encoder_output.update(densification_output)
+            if self.conditional_densifier is not None:
+                flat_densification_mask = rearrange(
+                    densification_output["densification_mask"],
+                    "b v h w -> b (v h w)",
+                )
+                selected_anchors = self._gather_selected_tensor(
+                    output_gaussians.means,
+                    flat_densification_mask,
+                )
+                selected_source_views = self._gather_selected_tensor(
+                    source_view_indices,
+                    flat_densification_mask,
+                )
+                with torch.no_grad():
+                    consistency = self.multiview_consistency(
+                        anchors=selected_anchors,
+                        consistency_features=resunet_features[
+                            "image_only_64"
+                        ],
+                        depths=depths_per_view,
+                        extrinsics=context_extrinsics,
+                        intrinsics=context_intrinsics,
+                        source_view_indices=selected_source_views,
+                    )
+                    transmittance = self.gaussian_transmittance(
+                        means=output_gaussians.means,
+                        covariances=output_gaussians.covariances,
+                        opacities=output_gaussians.opacities,
+                        extrinsics=context_extrinsics,
+                        intrinsics=context_intrinsics,
+                        image_shape=context_image_sr.shape[-2:],
+                        source_view_indices=source_view_indices,
+                        target_mask=flat_densification_mask,
+                    )
+                    projection_valid = consistency.view_projection_valid
+                    condition_dtype = (
+                        consistency.per_view_consistency_weight.dtype
+                    )
+                    multiview_condition = torch.stack(
+                        [
+                            consistency.per_view_consistency_weight.clamp(
+                                0, 1
+                            ),
+                            transmittance.transmittance.clamp(0, 1),
+                            torch.tanh(
+                                consistency.occlusion_delta
+                                / self.cfg.occlusion_delta_scale
+                            ),
+                            projection_valid.to(dtype=condition_dtype),
+                            consistency.occlusion_valid_mask.to(
+                                dtype=condition_dtype
+                            ),
+                            transmittance.valid_mask.to(
+                                dtype=condition_dtype
+                            ),
+                        ],
+                        dim=-1,
+                    )
+                gs_features_flat = rearrange(
+                    gs_features,
+                    "b v c h w -> b (v h w) c",
+                )
+                sr_image_64 = F.adaptive_avg_pool2d(
+                    rearrange(
+                        context_image_sr.detach(),
+                        "b v c h w -> (b v) c h w",
+                    ),
+                    resunet_features["64"].shape[-2:],
+                )
+                sr_image_64 = rearrange(
+                    sr_image_64,
+                    "(b v) c h w -> b v c h w",
+                    b=b,
+                    v=v_cxt,
+                )
+                depth_64 = depths_per_view.detach()
+                depth_scale = depth_64.mean(
+                    dim=(-2, -1),
+                    keepdim=True,
+                ).clamp_min(1e-6)
+                depth_64 = torch.tanh(
+                    torch.log(
+                        depth_64.clamp_min(1e-6) / depth_scale
+                    )
+                )[:, :, None]
+                render_residual_64 = F.adaptive_avg_pool2d(
+                    rearrange(
+                        render_error_output["render_error"].detach(),
+                        "b v c h w -> (b v) c h w",
+                    ),
+                    resunet_features["64"].shape[-2:],
+                )
+                render_residual_64 = rearrange(
+                    render_residual_64,
+                    "(b v) c h w -> b v c h w",
+                    b=b,
+                    v=v_cxt,
+                )
+                accumulated_opacity_64 = F.adaptive_avg_pool2d(
+                    rearrange(
+                        render_error_output[
+                            "accumulated_opacity"
+                        ].detach(),
+                        "b v c h w -> (b v) c h w",
+                    ),
+                    resunet_features["64"].shape[-2:],
+                )
+                accumulated_opacity_64 = rearrange(
+                    accumulated_opacity_64,
+                    "(b v) c h w -> b v c h w",
+                    b=b,
+                    v=v_cxt,
+                ).clamp(0, 1)
+                point_feature_map = torch.cat(
+                    [
+                        sr_image_64,
+                        depth_64,
+                        render_residual_64,
+                        accumulated_opacity_64,
+                    ],
+                    dim=2,
+                )
+                densification = self.conditional_densifier(
+                    anchors=output_gaussians.means,
+                    gs_features=gs_features_flat,
+                    view_feature_map=resunet_features["64"],
+                    point_feature_map=point_feature_map,
+                    conditions=multiview_condition,
+                    projection_valid=projection_valid,
+                    source_view_indices=selected_source_views,
+                    densification_mask=flat_densification_mask,
+                    extrinsics=context_extrinsics,
+                    intrinsics=context_intrinsics,
+                )
+                dense_gaussians = self.gaussian_adapter.forward(
+                    densification.child_means,
+                    self.map_pdf_to_opacity(
+                        densification.densities,
+                        global_step,
+                    ),
+                    densification.raw_gaussians,
+                )
+                dense_gaussians = Gaussians(
+                    means=rearrange(
+                        dense_gaussians.means,
+                        "b n k xyz -> b (n k) xyz",
+                    ),
+                    covariances=rearrange(
+                        dense_gaussians.covariances,
+                        "b n k i j -> b (n k) i j",
+                    ),
+                    rotations=rearrange(
+                        dense_gaussians.rotations,
+                        "b n k c -> b (n k) c",
+                    ),
+                    scales=rearrange(
+                        dense_gaussians.scales,
+                        "b n k c -> b (n k) c",
+                    ),
+                    harmonics=rearrange(
+                        dense_gaussians.harmonics,
+                        "b n k c d -> b (n k) c d",
+                    ),
+                    opacities=rearrange(
+                        dense_gaussians.opacities,
+                        "b n k -> b (n k)",
+                    ),
+                )
+                remaining_gaussians = self._gather_gaussians(
+                    output_gaussians,
+                    ~flat_densification_mask,
+                )
+                encoder_output["gaussians"] = self._concatenate_gaussians(
+                    remaining_gaussians,
+                    dense_gaussians,
+                )
 
         if self.cfg.estimating_pose:
             encoder_output['extrinsics'] = dict()

@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Protocol, runtime_checkable, Any, Dict
+from typing import Optional, Protocol, runtime_checkable
 
 import moviepy.editor as mpy
 import torch
@@ -11,12 +11,9 @@ from lightning.pytorch import LightningModule
 from lightning.pytorch.loggers.wandb import WandbLogger
 from lightning.pytorch.utilities import rank_zero_only
 from tabulate import tabulate
-from torch import Tensor, nn, optim
+from torch import Tensor, nn
 import json
 import numpy as np
-import cv2
-import os
-import time
 
 from ..dataset.data_module import get_data_shim
 from ..dataset.types import BatchedExample
@@ -29,7 +26,7 @@ from ..misc.image_io import prep_image, save_image, save_video
 from ..misc.LocalLogger import LOG_PATH, LocalLogger
 from ..misc.nn_module_tools import convert_to_buffer
 from ..misc.step_tracker import StepTracker
-from ..misc.utils import vis_depth_map, confidence_map, get_overlap_tag
+from ..misc.utils import vis_depth_map, get_overlap_tag
 from ..visualization.annotation import add_label
 from ..visualization.camera_trajectory.interpolation import (
     interpolate_extrinsics,
@@ -39,14 +36,12 @@ from ..visualization.camera_trajectory.wobble import (
     generate_wobble,
     generate_wobble_transformation,
 )
-from ..visualization.color_map import apply_color_map_to_image
 from ..visualization.layout import add_border, hcat, vcat
-from ..visualization.validation_in_3d import render_cameras, render_projections, render_cameras_es
 from .decoder.decoder import Decoder, DepthRenderingMode
 from .encoder import Encoder
 from .encoder.visualization.encoder_visualizer import EncoderVisualizer
 from ..misc.intrinsics_utils import estimate_intrinsics
-from ..evaluation.metrics import compute_pose_error, compute_pose_error_for_batch
+from ..evaluation.metrics import compute_pose_error_for_batch
 from ..misc.cam_utils import pose_auc
 
 
@@ -238,8 +233,7 @@ class ModelWrapper(LightningModule):
                                       target=batch["target"] if self.encoder.cfg.estimating_pose else None)
 
         if self.encoder.cfg.estimating_pose:
-            pred_extrinsics, pred_extrinsics_cwt = encoder_output['extrinsics']['c'], encoder_output['extrinsics'][
-                'cwt']
+            pred_extrinsics_cwt = encoder_output['extrinsics']['cwt']
             target_extrinsics = pred_extrinsics_cwt[:, v_cxt:]
             context_extrinsics = pred_extrinsics_cwt[:, :v_cxt]
         else:
@@ -496,7 +490,6 @@ class ModelWrapper(LightningModule):
 
         target_image = self._images(target)
         b, v, _, h, w = target_image.shape
-        device = target_image.device
         with torch.set_grad_enabled(True):
             if initial_extrinsics is not None:
                 extrinsics = nn.Parameter(initial_extrinsics)
@@ -631,8 +624,7 @@ class ModelWrapper(LightningModule):
                                       target=batch["target"] if self.encoder.cfg.estimating_pose else None)
 
         if self.encoder.cfg.estimating_pose:
-            pred_extrinsics, pred_extrinsics_cwt = encoder_output['extrinsics']['c'], encoder_output['extrinsics'][
-                'cwt']
+            pred_extrinsics_cwt = encoder_output['extrinsics']['cwt']
             target_extrinsics = pred_extrinsics_cwt[:, v_cxt:]
             context_extrinsics = pred_extrinsics_cwt[:, :v_cxt]
         else:
@@ -975,7 +967,13 @@ class ModelWrapper(LightningModule):
                     continue
 
                 # Heads that are always treated as new
-                if any(x in name for x in ["gaussian_param_head", "intrinsic_encoder"]):
+                if any(
+                    x in name
+                    for x in [
+                        "resunet_token_fusion",
+                        "conditional_densifier",
+                    ]
+                ):
                     new_params.append(param)
                     new_param_names.append(name)
                     # print(name)

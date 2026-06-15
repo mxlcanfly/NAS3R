@@ -64,6 +64,22 @@ render_error_background: [0.0, 0.0, 0.0]
 use_resunet_token_fusion: true
 unimatch_weights_path: /space0/mengxl/NAS3R-master/pretrained_weights/gmdepth-scale1-resumeflowthings-scannet-5d9d7964.pth
 
+use_multiview_physical_conditions: true
+consistency_patch_size: 1
+gaussian_transmittance_chunk_size: 256
+gaussian_transmittance_min_pixel_std: 0.3
+occlusion_delta_scale: 0.1
+
+use_conditional_densifier: true
+densifier_attention_dim: 128
+densifier_attention_heads: 8
+densifier_num_slots: 8
+densifier_slot_dim: 32
+densifier_hidden_dim: 256
+densifier_use_full_litept: true
+densifier_litept_path: /space0/mengxl/LitePT-main
+densifier_litept_grid_size: 0.02
+
 densification_grid_size: 64
 # Number of LR Gaussian positions selected independently in each input view.
 densification_budget: 2048
