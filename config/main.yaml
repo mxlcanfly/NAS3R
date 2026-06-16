@@ -50,13 +50,14 @@ train:
   depth_mode: null
   extended_visualization: false
   print_log_every_n_steps: 10
+  debug_visualization_every_n_steps: 500
 
   distiller: ""
   distill_max_steps: 10000
 
   training_context: false
-  freeze_pretrained: false
-  freeze_backbone: false
+  freeze_pretrained: true
+  freeze_backbone: true
   freeze_pose_head: false
   freeze_aggregator: false
   freeze_intrinsics_head: false

@@ -4,6 +4,7 @@ from typing import Optional, Protocol, runtime_checkable
 
 import moviepy.editor as mpy
 import torch
+import torch.nn.functional as F
 import wandb
 from einops import pack, rearrange, repeat
 from jaxtyping import Float
@@ -40,6 +41,7 @@ from ..visualization.layout import add_border, hcat, vcat
 from .decoder.decoder import Decoder, DepthRenderingMode
 from .encoder import Encoder
 from .encoder.visualization.encoder_visualizer import EncoderVisualizer
+from .ply_export import export_ply
 from ..misc.intrinsics_utils import estimate_intrinsics
 from ..evaluation.metrics import compute_pose_error_for_batch
 from ..misc.cam_utils import pose_auc
@@ -83,6 +85,7 @@ class TrainCfg:
     random_drop_target_views: bool = False
 
     pretrain_camera_head: bool = False
+    debug_visualization_every_n_steps: int = 500
 
 
 def dropout_context_views(v_cxt):
@@ -183,6 +186,92 @@ class ModelWrapper(LightningModule):
 
         self.ckpt_path = None
 
+        if self.train_cfg.freeze_pretrained:
+            self.freeze_params(
+                unfreeze_keywords=[
+                    "encoder.conditional_densifier",
+                    "encoder.resunet_token_fusion",
+                ]
+            )
+        elif self.train_cfg.freeze_backbone:
+            self.freeze_params(
+                freeze_keywords=[
+                    "encoder.backbone",
+                ]
+            )
+
+    @torch.no_grad()
+    def _save_training_debug(
+        self,
+        batch: dict,
+        target_gt: Tensor,
+        output_lr,
+        output_refined,
+        gaussians_lr,
+        gaussians_refined,
+        reference_extrinsics: Tensor,
+        psnr_lr: Tensor,
+        psnr_refined: Tensor,
+    ) -> None:
+        run_dir = next(
+            (
+                Path(logger.save_dir)
+                for logger in self.trainer.loggers
+                if getattr(logger, "save_dir", None) is not None
+            ),
+            Path("."),
+        )
+        output_dir = (
+            run_dir
+            / "debug_gaussians"
+            / f"step_{self.global_step:06d}"
+        )
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        rgb_comparison = hcat(
+            add_label(vcat(*target_gt[0]), "Target GT"),
+            add_label(
+                vcat(*output_lr.color[0]),
+                f"LR render PSNR {psnr_lr.mean().item():.2f}",
+            ),
+            add_label(
+                vcat(*output_refined.color[0]),
+                f"Refined render PSNR {psnr_refined.mean().item():.2f}",
+            ),
+        )
+        save_image(
+            add_border(rgb_comparison),
+            output_dir / "render_comparison.png",
+        )
+        if output_lr.depth is not None:
+            save_image(
+                vcat(*vis_depth_map(output_lr.depth[0])),
+                output_dir / "depth_lr.png",
+            )
+        if output_refined.depth is not None:
+            save_image(
+                vcat(*vis_depth_map(output_refined.depth[0])),
+                output_dir / "depth_refined.png",
+            )
+
+        export_ply(
+            reference_extrinsics[0, 0],
+            gaussians_refined.means[0],
+            gaussians_refined.scales[0],
+            gaussians_refined.rotations[0],
+            gaussians_refined.harmonics[0],
+            gaussians_refined.opacities[0],
+            output_dir / "gaussians_refined.ply",
+        )
+
+        if self.logger is not None and hasattr(self.logger, "log_image"):
+            self.logger.log_image(
+                "train/render_comparison",
+                [prep_image(add_border(rgb_comparison))],
+                step=self.global_step,
+                caption=[str(batch["scene"][0])],
+            )
+
     def _image_key(self, views: dict) -> str:
         if getattr(self.encoder.cfg, "name", None) == "nas3r-m" and "image_lr" in views:
             return "image_lr"
@@ -252,6 +341,7 @@ class ModelWrapper(LightningModule):
         total_loss = 0
 
         gaussians = encoder_output["gaussians"]
+        gaussians_lr = encoder_output.get("gaussians_lr", gaussians)
         # Determine decoder inputs
         extrinsics = target_extrinsics if not self.train_cfg.training_context else torch.cat(
             [context_extrinsics, target_extrinsics], dim=1)
@@ -262,6 +352,15 @@ class ModelWrapper(LightningModule):
         far = batch["target"]["far"] if not self.train_cfg.training_context else torch.cat(
             [batch["context"]["far"], batch["target"]["far"]], dim=1)
         # Run decoder
+        output_lr = self.decoder.forward(
+            gaussians_lr,
+            extrinsics,
+            intrinsics,
+            near,
+            far,
+            (h, w),
+            depth_mode=self.train_cfg.depth_mode,
+        )
         output = self.decoder.forward(
             gaussians,
             extrinsics,
@@ -272,21 +371,58 @@ class ModelWrapper(LightningModule):
             depth_mode=self.train_cfg.depth_mode,
         )
 
-        # Compute PSNR
-        psnr = compute_psnr(
+        psnr_lr = compute_psnr(
+            rearrange(target_gt, "b v c h w -> (b v) c h w"),
+            rearrange(output_lr.color, "b v c h w -> (b v) c h w"),
+        )
+        psnr_refined = compute_psnr(
             rearrange(target_gt, "b v c h w -> (b v) c h w"),
             rearrange(output.color, "b v c h w -> (b v) c h w"),
         )
-        self.log(f"train/psnr", psnr.mean())
+        self.log("train/psnr_lr", psnr_lr.mean())
+        self.log("train/psnr_refined", psnr_refined.mean())
+        self.log("train/psnr", psnr_refined.mean())
+        self.log(
+            "train/render_mse_lr",
+            F.mse_loss(output_lr.color, target_gt),
+        )
+        self.log(
+            "train/render_mse_refined",
+            F.mse_loss(output.color, target_gt),
+        )
 
         # Compute and log loss.
         for loss_fn in self.losses:
             if loss_fn.name in ['mse', 'lpips']:
-                loss = loss_fn.forward(output.color, target_gt, gaussians, self.global_step)
-                self.log(f"loss/{loss_fn.name}", loss)
-                total_loss += loss
+                loss_refined = loss_fn.forward(
+                    output.color,
+                    target_gt,
+                    gaussians,
+                    self.global_step,
+                )
+                self.log(f"loss/{loss_fn.name}_refined", loss_refined)
+                self.log(f"loss/{loss_fn.name}", loss_refined)
+                total_loss += loss_refined
 
         self.log("loss/total", total_loss)
+
+        debug_interval = self.train_cfg.debug_visualization_every_n_steps
+        if (
+            self.global_rank == 0
+            and debug_interval > 0
+            and self.global_step % debug_interval == 0
+        ):
+            self._save_training_debug(
+                batch=batch,
+                target_gt=target_gt,
+                output_lr=output_lr,
+                output_refined=output,
+                gaussians_lr=gaussians_lr,
+                gaussians_refined=gaussians,
+                reference_extrinsics=extrinsics,
+                psnr_lr=psnr_lr,
+                psnr_refined=psnr_refined,
+            )
 
         if self.encoder.cfg.estimating_pose:
             context_rot_error, context_transl_error = compute_pose_error_for_batch(pred_extrinsics_cwt[:, v_cxt - 1],
@@ -311,7 +447,8 @@ class ModelWrapper(LightningModule):
                 f"context = {batch['context']['index'].tolist()}; "
                 f"target = {batch['target']['index'].tolist()}; "
                 f"loss = {total_loss:.6f}; "
-                f"psnr = {psnr.mean().item():.6f}; "
+                f"psnr_lr = {psnr_lr.mean().item():.6f}; "
+                f"psnr_refined = {psnr_refined.mean().item():.6f}; "
             )
         self.log("info/global_step", self.global_step)  # hack for ckpt monitor
 
@@ -713,7 +850,7 @@ class ModelWrapper(LightningModule):
             "comparison",
             [prep_image(add_border(comparison))],
             step=self.global_step,
-            caption=batch["scene"],
+            caption=[str(batch["scene"][0])],
         )
 
         # Run video validation step.

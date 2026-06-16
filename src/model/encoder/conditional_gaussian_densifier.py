@@ -105,7 +105,7 @@ class ConditionalGaussianDensifier(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, 2),
+            nn.Linear(hidden_dim, 3),
         )
         nn.init.normal_(self.offset_mlp[-1].weight, mean=0.0, std=1e-3)
         nn.init.zeros_(self.offset_mlp[-1].bias)
@@ -280,13 +280,42 @@ class ConditionalGaussianDensifier(nn.Module):
         half_lr_pixel = parent_uv.new_tensor(
             [0.5 / lr_width, 0.5 / lr_height]
         )
-        child_uv = (
-            parent_uv[:, :, None]
-            + torch.tanh(self.offset_mlp(offset_input)) * half_lr_pixel
+        raw_offset = self.offset_mlp(offset_input)
+        parent_depth = camera_anchors[..., 2].clamp_min(1e-6)
+        fx = source_intrinsics[..., 0, 0].abs().clamp_min(1e-6)
+        fy = source_intrinsics[..., 1, 1].abs().clamp_min(1e-6)
+        xy_camera_radius = torch.stack(
+            [
+                half_lr_pixel[0] * parent_depth / fx,
+                half_lr_pixel[1] * parent_depth / fy,
+            ],
+            dim=-1,
+        )
+        z_camera_radius = parent_depth[..., None] * 0.05
+        camera_offset = torch.cat(
+            [
+                torch.tanh(raw_offset[..., :2])
+                * xy_camera_radius[:, :, None],
+                torch.tanh(raw_offset[..., 2:3])
+                * z_camera_radius[:, :, None],
+            ],
+            dim=-1,
+        )
+        child_camera = camera_anchors[:, :, None] + camera_offset
+
+        child_uv = project_camera_space(
+            child_camera,
+            source_intrinsics[:, :, None],
+        )
+        clamped_child_uv = parent_uv[:, :, None] + (
+            child_uv - parent_uv[:, :, None]
+        ).clamp(
+            min=-half_lr_pixel,
+            max=half_lr_pixel,
         )
         child_camera = unproject(
-            child_uv,
-            camera_anchors[..., 2, None].expand(-1, -1, self.num_slots),
+            clamped_child_uv,
+            child_camera[..., 2],
             source_intrinsics[:, :, None],
         )
         child_means = transform_cam2world(

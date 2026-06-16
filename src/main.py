@@ -1,17 +1,15 @@
-import os
 from pathlib import Path
 
 import hydra
 import torch
 import wandb
-import signal
 from colorama import Fore
 from lightning.pytorch.callbacks import Callback
 from jaxtyping import install_import_hook
 from lightning.pytorch import Trainer
 from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
+from lightning.pytorch.loggers import TensorBoardLogger
 from lightning.pytorch.loggers.wandb import WandbLogger
-from lightning.pytorch.plugins.environments import SLURMEnvironment
 from omegaconf import DictConfig, OmegaConf
 import uuid
 import time
@@ -80,7 +78,7 @@ def train(cfg_dict: DictConfig):
             print(cfg.checkpointing.load, Path(cfg.checkpointing.load).parent.parent)
             with open(Path(cfg.checkpointing.load).parent.parent / "wandb_run_id.txt") as f:
                 resume_id = f.read().strip()
-            logger = WandbLogger(
+            wandb_logger = WandbLogger(
                 project=cfg_dict.wandb.project,
                 mode=cfg_dict.wandb.mode,
                 name=f"{cfg_dict.wandb.name} ({output_dir.parent.name}/{output_dir.name})",
@@ -100,7 +98,7 @@ def train(cfg_dict: DictConfig):
 
         else:
             new_id = uuid.uuid4().hex
-            logger = WandbLogger(
+            wandb_logger = WandbLogger(
                 project=cfg_dict.wandb.project,
                 mode=cfg_dict.wandb.mode,
                 name=f"{cfg_dict.wandb.name} ({output_dir.parent.name}/{output_dir.name})",
@@ -122,8 +120,23 @@ def train(cfg_dict: DictConfig):
         # On rank != 0, wandb.run is None.
         if wandb.run is not None:
             wandb.run.log_code("src")
+        logger = [
+            wandb_logger,
+            TensorBoardLogger(
+                save_dir=output_dir,
+                name="tensorboard",
+                version="",
+            ),
+        ]
     else:
-        logger = LocalLogger()
+        logger = [
+            LocalLogger(),
+            TensorBoardLogger(
+                save_dir=output_dir,
+                name="tensorboard",
+                version="",
+            ),
+        ]
 
     # Set up checkpointing.
     callbacks.append(

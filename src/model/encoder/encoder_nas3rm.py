@@ -91,7 +91,7 @@ class EncoderNAS3RMCfg:
     densifier_litept_grid_size: float = 0.02
     densification_grid_size: int = 64
     densification_budget: int = 2048
-    densification_sampling: Literal["topk", "multinomial"] = "multinomial"
+    densification_sampling: Literal["topk", "multinomial", "all"] = "multinomial"
 
 
 def rearrange_head(feat, patch_size, H, W):
@@ -391,6 +391,25 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
         )
 
         num_candidates = probability.shape[-1]
+        if self.cfg.densification_sampling == "all":
+            flat_mask = torch.ones_like(probability, dtype=torch.bool)
+            densification_mask = rearrange(
+                flat_mask,
+                "b v (h w) -> b v h w",
+                h=grid_size,
+                w=grid_size,
+            )
+            return {
+                "densification_probability": rearrange(
+                    probability,
+                    "b v (h w) -> b v h w",
+                    h=grid_size,
+                    w=grid_size,
+                ),
+                "densification_mask": densification_mask,
+                "remaining_mask": ~densification_mask,
+            }
+
         budget = min(max(int(self.cfg.densification_budget), 0), num_candidates)
         flat_mask = torch.zeros_like(probability, dtype=torch.bool)
         if budget > 0:
@@ -405,7 +424,7 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
                 selected = probability.topk(budget, dim=-1).indices
             else:
                 raise ValueError(
-                    "densification_sampling must be 'topk' or 'multinomial', "
+                    "densification_sampling must be 'topk', 'multinomial', or 'all', "
                     f"got {self.cfg.densification_sampling!r}"
                 )
             flat_mask.scatter_(-1, selected, True)
@@ -851,6 +870,7 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
                     output_gaussians,
                     ~flat_densification_mask,
                 )
+                encoder_output["gaussians_lr"] = output_gaussians
                 encoder_output["gaussians"] = self._concatenate_gaussians(
                     remaining_gaussians,
                     dense_gaussians,

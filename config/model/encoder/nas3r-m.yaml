@@ -73,7 +73,7 @@ occlusion_delta_scale: 0.1
 use_conditional_densifier: true
 densifier_attention_dim: 128
 densifier_attention_heads: 8
-densifier_num_slots: 8
+densifier_num_slots: 16
 densifier_slot_dim: 32
 densifier_hidden_dim: 256
 densifier_use_full_litept: true
@@ -82,5 +82,5 @@ densifier_litept_grid_size: 0.02
 
 densification_grid_size: 64
 # Number of LR Gaussian positions selected independently in each input view.
-densification_budget: 2048
-densification_sampling: multinomial
+densification_budget: 4096
+densification_sampling: all
