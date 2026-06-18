@@ -45,6 +45,7 @@ from ..visualization.validation_in_3d import render_cameras, render_projections,
 from .decoder.decoder import Decoder, DepthRenderingMode
 from .encoder import Encoder
 from .encoder.visualization.encoder_visualizer import EncoderVisualizer
+from .ply_export import export_ply
 from ..misc.intrinsics_utils import estimate_intrinsics
 from ..evaluation.metrics import compute_pose_error, compute_pose_error_for_batch
 from ..misc.cam_utils import pose_auc
@@ -187,6 +188,8 @@ class ModelWrapper(LightningModule):
         self.all_metrics_sub = {}
 
         self.ckpt_path = None
+        self._last_densification_debug_step = -1
+        self._freeze_nas3rm_lr_branch()
 
     def _image_key(self, views: dict) -> str:
         if getattr(self.encoder.cfg, "name", None) == "nas3r-m" and "image_lr" in views:
@@ -195,6 +198,175 @@ class ModelWrapper(LightningModule):
 
     def _images(self, views: dict) -> Tensor:
         return views[self._image_key(views)]
+
+    def _freeze_nas3rm_lr_branch(self) -> None:
+        if getattr(self.encoder.cfg, "name", None) != "nas3r-m":
+            return
+        module_names = [
+            "backbone",
+            "downstream_depth_head1",
+            "downstream_depth_head2",
+            "depth_head1",
+            "depth_head2",
+            "gaussian_param_head",
+            "gaussian_param_head2",
+            "pose_head",
+            "pose_head2",
+        ]
+        frozen = set()
+        for module_name in module_names:
+            module = getattr(self.encoder, module_name, None)
+            if module is None or not isinstance(module, nn.Module):
+                continue
+            for param in module.parameters():
+                param.requires_grad = False
+            frozen.add(module_name)
+        if frozen:
+            print(f"Frozen nas3r-m LR branch modules: {sorted(frozen)}")
+
+    @staticmethod
+    def _normalize_depth_for_debug(depth: Tensor) -> Tensor:
+        valid = torch.isfinite(depth) & (depth > 0)
+        if valid.any():
+            depth_values = depth[valid]
+            near = depth_values.quantile(0.01)
+            far = depth_values.quantile(0.99)
+        else:
+            near = depth.new_tensor(0.0)
+            far = depth.new_tensor(1.0)
+        depth_norm = (depth - near) / (far - near).clamp_min(1e-6)
+        depth_norm = depth_norm.clamp(0, 1)
+        depth_norm = torch.where(valid, depth_norm, torch.zeros_like(depth_norm))
+        return apply_color_map_to_image(depth_norm, "turbo")
+
+    def _debug_densification_dir(self) -> Path:
+        checkpoint_callback = getattr(self.trainer, "checkpoint_callback", None)
+        checkpoint_dir = getattr(checkpoint_callback, "dirpath", None)
+        if checkpoint_dir is not None:
+            return Path(checkpoint_dir) / "debug_densification"
+        return Path(self.trainer.default_root_dir) / "checkpoints" / "debug_densification"
+
+    @torch.no_grad()
+    def _save_densification_debug(
+            self,
+            batch: BatchedExample,
+            encoder_output: dict,
+            lr_gaussians,
+            extrinsics: Tensor,
+            intrinsics: Tensor,
+            near: Tensor,
+            far: Tensor,
+            image_shape: tuple[int, int],
+    ) -> None:
+        if self.global_rank != 0 or self.global_step % 500 != 0:
+            return
+        if self._last_densification_debug_step == self.global_step:
+            return
+        if "child_gaussians" not in encoder_output:
+            return
+
+        child_gaussians = encoder_output["child_gaussians"]
+        lr_output = self.decoder.forward(
+            lr_gaussians,
+            extrinsics,
+            intrinsics,
+            near,
+            far,
+            image_shape,
+            depth_mode=self.train_cfg.depth_mode,
+        )
+        child_output = self.decoder.forward(
+            child_gaussians,
+            extrinsics,
+            intrinsics,
+            near,
+            far,
+            image_shape,
+            depth_mode=self.train_cfg.depth_mode,
+        )
+
+        target_panel = add_label(batch["target"]["image"][0, 0].detach(), "target gt 256")
+        lr_panel = add_label(lr_output.color[0, 0].detach(), "lr gaussians render 256")
+        child_panel = add_label(child_output.color[0, 0].detach(), "densified render 256")
+        lr_depth_panel = add_label(
+            self._normalize_depth_for_debug(lr_output.depth[0, 0].detach()),
+            "lr depth",
+        )
+        child_depth_panel = add_label(
+            self._normalize_depth_for_debug(child_output.depth[0, 0].detach()),
+            "densified depth",
+        )
+        debug_image = vcat(
+            hcat(target_panel, lr_panel, child_panel, gap=8),
+            hcat(lr_depth_panel, child_depth_panel, gap=8),
+            gap=8,
+        )
+
+        output_dir = self._debug_densification_dir()
+        save_image(debug_image, output_dir / f"{self.global_step:0>6}.png")
+        if "point_offset_densification" in encoder_output:
+            point_offset = encoder_output["point_offset_densification"]
+            offsets = point_offset["offsets"][0].detach().float()
+            child_centers = point_offset["child_centers"][0].detach().float()
+            parent_centers = point_offset["parent_centers"][0].detach().float()
+            offset_radius = point_offset.get("offset_radius")
+            if offset_radius is not None:
+                offset_radius = offset_radius[0].detach().float()
+            offset_norm = offsets.norm(dim=-1)
+            child_spread = (
+                child_centers.max(dim=1).values
+                - child_centers.min(dim=1).values
+            ).norm(dim=-1)
+            stats = {
+                "step": int(self.global_step),
+                "num_parents": int(parent_centers.shape[0]),
+                "k_offsets": int(offsets.shape[1]),
+                "num_children": int(child_centers.shape[0] * child_centers.shape[1]),
+                "expected_children": int(parent_centers.shape[0] * offsets.shape[1]),
+                "offset_norm_mean": float(offset_norm.mean().item()),
+                "offset_norm_max": float(offset_norm.max().item()),
+                "offset_norm_p50": float(offset_norm.quantile(0.50).item()),
+                "offset_norm_p90": float(offset_norm.quantile(0.90).item()),
+                "offset_norm_p99": float(offset_norm.quantile(0.99).item()),
+                "offset_abs_xyz_mean": [
+                    float(x) for x in offsets.abs().mean(dim=(0, 1)).tolist()
+                ],
+                "offset_abs_xyz_max": [
+                    float(x) for x in offsets.abs().amax(dim=(0, 1)).tolist()
+                ],
+                "child_group_spread_mean": float(child_spread.mean().item()),
+                "child_group_spread_max": float(child_spread.max().item()),
+                "child_group_spread_p50": float(child_spread.quantile(0.50).item()),
+                "child_group_spread_p90": float(child_spread.quantile(0.90).item()),
+                "child_group_spread_p99": float(child_spread.quantile(0.99).item()),
+                "num_groups_spread_lt_1e_6": int((child_spread < 1e-6).sum().item()),
+                "num_groups_spread_lt_1e_5": int((child_spread < 1e-5).sum().item()),
+                "num_groups_spread_lt_1e_4": int((child_spread < 1e-4).sum().item()),
+            }
+            if offset_radius is not None:
+                stats.update(
+                    {
+                        "offset_radius_mean": float(offset_radius.mean().item()),
+                        "offset_radius_max": float(offset_radius.max().item()),
+                        "offset_radius_p50": float(offset_radius.quantile(0.50).item()),
+                        "offset_radius_p90": float(offset_radius.quantile(0.90).item()),
+                        "offset_radius_p99": float(offset_radius.quantile(0.99).item()),
+                    }
+                )
+            stats_path = output_dir / f"{self.global_step:0>6}_offset_stats.json"
+            stats_path.parent.mkdir(exist_ok=True, parents=True)
+            with stats_path.open("w") as f:
+                json.dump(stats, f, indent=2)
+        export_ply(
+            torch.eye(4, device=child_gaussians.means.device, dtype=child_gaussians.means.dtype),
+            child_gaussians.means[0].detach(),
+            child_gaussians.scales[0].detach(),
+            child_gaussians.rotations[0].detach(),
+            child_gaussians.harmonics[0].detach(),
+            child_gaussians.opacities[0].detach(),
+            output_dir / f"{self.global_step:0>6}_densified.ply",
+        )
+        self._last_densification_debug_step = self.global_step
 
     def training_step(self, batch, batch_idx):
         # combine batch from different dataloaders
@@ -257,7 +429,8 @@ class ModelWrapper(LightningModule):
 
         total_loss = 0
 
-        gaussians = encoder_output["gaussians"]
+        lr_gaussians = encoder_output["gaussians"]
+        gaussians = encoder_output.get("child_gaussians", lr_gaussians)
         # Determine decoder inputs
         extrinsics = target_extrinsics if not self.train_cfg.training_context else torch.cat(
             [context_extrinsics, target_extrinsics], dim=1)
@@ -276,6 +449,16 @@ class ModelWrapper(LightningModule):
             far,
             (h, w),
             depth_mode=self.train_cfg.depth_mode,
+        )
+        self._save_densification_debug(
+            batch,
+            encoder_output,
+            lr_gaussians,
+            extrinsics,
+            intrinsics,
+            near,
+            far,
+            (h, w),
         )
 
         # Compute PSNR
@@ -963,6 +1146,12 @@ class ModelWrapper(LightningModule):
 
         has_pretrained_backbone = getattr(self.encoder.backbone.cfg, "pretrained", False)
         has_pretrained_encoder_weights = bool(getattr(self.encoder.cfg, "pretrained_weights", ""))
+        new_branch_keywords = [
+            "resunet_token_fusion",
+            "image_only_consistency",
+            "point_offset_decoder",
+            "child_gaussian_head",
+        ]
         if not (has_pretrained_backbone or has_pretrained_encoder_weights):
             for name, param in self.named_parameters():
                 if not param.requires_grad:
@@ -979,6 +1168,11 @@ class ModelWrapper(LightningModule):
                     new_params.append(param)
                     new_param_names.append(name)
                     # print(name)
+
+                # Newly added densification/SR branches use the main learning rate.
+                elif any(x in name for x in new_branch_keywords):
+                    new_params.append(param)
+                    new_param_names.append(name)
 
                 # Camera head logic
                 elif "camera_head" in name:
