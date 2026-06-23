@@ -23,14 +23,10 @@ class PointOffsetDecoder(nn.Module):
         patch_size: int = 48,
         mlp_ratio: float = 4.0,
         k_offsets: int = 8,
-        grid_size: float = 0.02,
-        offset_scale: float = 0.1,
         order=("z", "z-trans", "hilbert", "hilbert-trans"),
         shuffle_orders: bool = True,
     ) -> None:
         super().__init__()
-        self.grid_size = grid_size
-        self.offset_scale = offset_scale
         self.k_offsets = k_offsets
         self.order = [order] if isinstance(order, str) else order
         self.shuffle_orders = shuffle_orders
@@ -68,6 +64,15 @@ class PointOffsetDecoder(nn.Module):
         )
         nn.init.zeros_(self.offset_head[-1].weight)
         nn.init.zeros_(self.offset_head[-1].bias)
+        self.feature_delta_head = nn.Sequential(
+            nn.LayerNorm(hidden_channels),
+            nn.Linear(hidden_channels, hidden_channels),
+            nn.GELU(),
+            nn.Linear(hidden_channels, hidden_channels * k_offsets),
+        )
+        self.feature_norm = nn.LayerNorm(hidden_channels)
+        nn.init.zeros_(self.feature_delta_head[-1].weight)
+        nn.init.zeros_(self.feature_delta_head[-1].bias)
 
     @staticmethod
     def _batch_offsets(batch_size: int, points_per_batch: int, device: torch.device) -> torch.Tensor:
@@ -77,6 +82,21 @@ class PointOffsetDecoder(nn.Module):
             device=device,
             dtype=torch.long,
         ) * points_per_batch
+
+    @staticmethod
+    def _make_grid_coord(anchors: torch.Tensor, offset_radius: torch.Tensor) -> torch.Tensor:
+        coords = rearrange(anchors.detach(), "b n c -> (b n) c")
+        radius = offset_radius.detach().reshape(-1)
+        radius = radius[torch.isfinite(radius) & (radius > 0)]
+        if radius.numel() == 0:
+            quant_size = anchors.new_tensor(1.0)
+        else:
+            quant_size = radius.median().clamp_min(1e-6)
+        return torch.div(
+            coords - coords.min(dim=0).values,
+            quant_size,
+            rounding_mode="trunc",
+        ).int()
 
     def forward(
         self,
@@ -90,24 +110,9 @@ class PointOffsetDecoder(nn.Module):
                 f"{tuple(anchors.shape)} and {tuple(features.shape)}."
             )
         b, n, _ = anchors.shape
-        point = Point(
-            {
-                "coord": rearrange(anchors, "b n c -> (b n) c"),
-                "feat": self.input_proj(rearrange(features, "b n c -> (b n) c")),
-                "offset": self._batch_offsets(b, n, anchors.device),
-                "grid_size": self.grid_size,
-            }
-        )
-        point.serialization(order=self.order, shuffle_orders=self.shuffle_orders)
-        point.sparsify()
-        point = self.blocks(point)
-
-        offsets = self.offset_head(point.feat)
-        offsets = rearrange(offsets, "(b n) (k xyz) -> b n k xyz", b=b, n=n, k=self.k_offsets, xyz=3)
         if offset_radius is None:
-            offset_radius = torch.full(
+            offset_radius = torch.ones(
                 (b, n, 1),
-                self.grid_size,
                 dtype=anchors.dtype,
                 device=anchors.device,
             )
@@ -121,13 +126,41 @@ class PointOffsetDecoder(nn.Module):
                 "offset_radius must have last dimension 1 or 3, got "
                 f"{tuple(offset_radius.shape)}."
             )
+        offset_radius = offset_radius.clamp_min(1e-6)
+        point = Point(
+            {
+                "coord": rearrange(anchors, "b n c -> (b n) c"),
+                "grid_coord": self._make_grid_coord(anchors, offset_radius),
+                "feat": self.input_proj(rearrange(features, "b n c -> (b n) c")),
+                "offset": self._batch_offsets(b, n, anchors.device),
+            }
+        )
+        point.serialization(order=self.order, shuffle_orders=self.shuffle_orders)
+        point.sparsify()
+        point = self.blocks(point)
+
+        offsets = self.offset_head(point.feat)
+        offsets = rearrange(offsets, "(b n) (k xyz) -> b n k xyz", b=b, n=n, k=self.k_offsets, xyz=3)
         offset_radius = offset_radius[:, :, None].clamp_min(1e-6)
-        offsets = self.offset_scale * offset_radius * torch.tanh(offsets)
+        offsets = offset_radius * offsets
         child_centers = anchors[:, :, None] + offsets
+        parent_features = rearrange(point.feat, "(b n) c -> b n c", b=b, n=n)
+        feature_deltas = self.feature_delta_head(point.feat)
+        feature_deltas = rearrange(
+            feature_deltas,
+            "(b n) (k c) -> b n k c",
+            b=b,
+            n=n,
+            k=self.k_offsets,
+            c=parent_features.shape[-1],
+        )
+        child_features = self.feature_norm(parent_features[:, :, None] + feature_deltas)
         return {
             "offsets": offsets,
             "child_centers": child_centers,
             "parent_centers": anchors,
-            "parent_features": rearrange(point.feat, "(b n) c -> b n c", b=b, n=n),
+            "parent_features": parent_features,
+            "feature_deltas": feature_deltas,
+            "child_features": child_features,
             "offset_radius": offset_radius.squeeze(2),
         }

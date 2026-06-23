@@ -246,6 +246,16 @@ class ModelWrapper(LightningModule):
             return Path(checkpoint_dir) / "debug_densification"
         return Path(self.trainer.default_root_dir) / "checkpoints" / "debug_densification"
 
+    def _current_learning_rates(self) -> list[float]:
+        optimizers = getattr(self.trainer, "optimizers", None)
+        if not optimizers:
+            return []
+        return [
+            float(group["lr"])
+            for optimizer in optimizers
+            for group in optimizer.param_groups
+        ]
+
     @torch.no_grad()
     def _save_densification_debug(
             self,
@@ -265,7 +275,7 @@ class ModelWrapper(LightningModule):
         if "child_gaussians" not in encoder_output:
             return
 
-        child_gaussians = encoder_output["child_gaussians"]
+        child_gaussians = encoder_output["gaussians"]
         lr_output = self.decoder.forward(
             lr_gaussians,
             extrinsics,
@@ -296,9 +306,19 @@ class ModelWrapper(LightningModule):
             self._normalize_depth_for_debug(child_output.depth[0, 0].detach()),
             "densified depth",
         )
+        top_row = [target_panel, lr_panel, child_panel]
+        bottom_row = [lr_depth_panel, child_depth_panel]
+
+        swinir = getattr(self.encoder, "swinir", None)
+        if swinir is not None and "image_lr" in batch["target"]:
+            target_image_sr = swinir(batch["target"]["image_lr"][:, 0].detach())[0]
+            sr_diff = (target_image_sr - child_output.color[0, 0].detach()).abs()
+            top_row.append(add_label(target_image_sr, "target 64->256 SR"))
+            bottom_row.append(add_label(sr_diff, "|SR - densified render|"))
+
         debug_image = vcat(
-            hcat(target_panel, lr_panel, child_panel, gap=8),
-            hcat(lr_depth_panel, child_depth_panel, gap=8),
+            hcat(*top_row, gap=8),
+            hcat(*bottom_row, gap=8),
             gap=8,
         )
 
@@ -429,8 +449,8 @@ class ModelWrapper(LightningModule):
 
         total_loss = 0
 
-        lr_gaussians = encoder_output["gaussians"]
-        gaussians = encoder_output.get("child_gaussians", lr_gaussians)
+        gaussians = encoder_output["gaussians"]
+        lr_gaussians = encoder_output.get("parent_gaussians", gaussians)
         # Determine decoder inputs
         extrinsics = target_extrinsics if not self.train_cfg.training_context else torch.cat(
             [context_extrinsics, target_extrinsics], dim=1)
@@ -493,6 +513,8 @@ class ModelWrapper(LightningModule):
                 self.global_rank == 0
                 and self.global_step % self.train_cfg.print_log_every_n_steps == 0
         ):
+            lrs = self._current_learning_rates()
+            lr_text = ", ".join(f"{lr:.8e}" for lr in lrs) if lrs else "n/a"
             print(
                 f"Epoch {self.current_epoch}; "
                 f"train step {self.global_step}; "
@@ -501,7 +523,17 @@ class ModelWrapper(LightningModule):
                 f"target = {batch['target']['index'].tolist()}; "
                 f"loss = {total_loss:.6f}; "
                 f"psnr = {psnr.mean().item():.6f}; "
+                f"lr = [{lr_text}]; "
             )
+            for lr_idx, lr in enumerate(lrs):
+                self.log(
+                    f"train/lr_group_{lr_idx}",
+                    lr,
+                    prog_bar=False,
+                    logger=True,
+                    on_step=True,
+                    on_epoch=False,
+                )
         self.log("info/global_step", self.global_step)  # hack for ckpt monitor
 
         # Tell the data loader processes about the current step.
@@ -1149,6 +1181,9 @@ class ModelWrapper(LightningModule):
         new_branch_keywords = [
             "resunet_token_fusion",
             "image_only_consistency",
+            "anchor_sr_feature_proj",
+            "anchor_lr_feature_proj",
+            "anchor_feature_fusion",
             "point_offset_decoder",
             "child_gaussian_head",
         ]
@@ -1196,6 +1231,16 @@ class ModelWrapper(LightningModule):
                 "lr": self.optimizer_cfg.lr * self.optimizer_cfg.backbone_lr_multiplier,
             },
         ]
+        if self.global_rank == 0:
+            num_new = sum(param.numel() for param in new_params)
+            num_pretrained = sum(param.numel() for param in pretrained_params)
+            print(
+                "Optimizer parameter groups: "
+                f"new={len(new_params)} tensors/{num_new:,} params "
+                f"lr={self.optimizer_cfg.lr:.3e}; "
+                f"pretrained={len(pretrained_params)} tensors/{num_pretrained:,} params "
+                f"lr={self.optimizer_cfg.lr * self.optimizer_cfg.backbone_lr_multiplier:.3e}"
+            )
         optimizer = torch.optim.AdamW(param_dicts, lr=self.optimizer_cfg.lr, weight_decay=0.05, betas=(0.9, 0.95))
         warm_up_steps = self.optimizer_cfg.warm_up_steps
         warm_up = torch.optim.lr_scheduler.LinearLR(

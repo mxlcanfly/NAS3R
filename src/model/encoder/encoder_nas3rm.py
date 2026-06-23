@@ -19,7 +19,6 @@ from ...geometry.projection import sample_image_grid
 from ..types import Gaussians
 from .backbone import Backbone, BackboneCfg, get_backbone
 from .common.gaussian_adapter import GaussianAdapter, GaussianAdapterCfg, UnifiedGaussianAdapter
-from .common.gaussians import build_covariance
 from .encoder import Encoder
 from .visualization.encoder_visualizer_epipolar_cfg import EncoderVisualizerEpipolarCfg
 from ...misc.cam_utils import camera_normalization, convert_pose_to_4x4, depth_projector, \
@@ -75,9 +74,13 @@ class EncoderNAS3RMCfg:
     swinir_upscale: int = 4
     swinir_input_size: int = 64
     use_resunet_token_fusion: bool = False
+    use_resunet_multiview_transformer: bool = False
+    resunet_multiview_transformer_layers: int = 6
+    resunet_multiview_transformer_heads: int = 1
+    resunet_multiview_attn_splits: int = 2
     unimatch_weights_path: str = ""
     use_image_only_feature_consistency: bool = False
-    image_only_consistency_patch_size: int = 1
+    image_only_consistency_patch_size: int = 4
     image_only_consistency_depth_relative_tolerance: float = 0.1
     use_anchor_multiview_feature_aggregation: bool = False
     anchor_feature_occlusion_tau: float = 10.0
@@ -90,14 +93,14 @@ class EncoderNAS3RMCfg:
     point_offset_num_heads: int = 8
     point_offset_patch_size: int = 48
     point_offset_k: int = 8
-    point_offset_grid_size: float = 0.02
-    point_offset_scale: float = 0.1
+    point_offset_spacing_k: int = 8
+    point_offset_spacing_chunk_size: int = 1024
     use_child_gaussian_residual: bool = False
-    child_feature_patch_size: int = 2
     child_gaussian_hidden_dim: int = 256
     child_gaussian_fourier_frequencies: int = 6
     child_gaussian_enable_absolute_pe: bool = True
     child_scale_divisor: float = 2.0
+    child_gaussian_opacity_init: float = 0.05
 
 
 def rearrange_head(feat, patch_size, H, W):
@@ -128,7 +131,11 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
         self.resunet_token_fusion = None
         if cfg.use_resunet_token_fusion:
             self.resunet_token_fusion = HiSplatResUnetTokenFusion(
-                token_dim=self.backbone.dec_embed_dim,
+                token_dim=getattr(self.backbone, "enc_embed_dim", self.backbone.dec_embed_dim),
+                use_multiview_transformer=cfg.use_resunet_multiview_transformer,
+                multiview_transformer_layers=cfg.resunet_multiview_transformer_layers,
+                multiview_transformer_heads=cfg.resunet_multiview_transformer_heads,
+                multiview_attn_splits=cfg.resunet_multiview_attn_splits,
             )
             if cfg.unimatch_weights_path:
                 self.resunet_token_fusion.load_unimatch_encoder(cfg.unimatch_weights_path)
@@ -138,18 +145,25 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
                 patch_size=cfg.image_only_consistency_patch_size,
                 depth_relative_tolerance=cfg.image_only_consistency_depth_relative_tolerance,
             )
-        self.anchor_feature_dim = cfg.anchor_feature_patch_size ** 2 * (32 + 3)
+        self.anchor_feature_map_dim = 32
+        self.anchor_feature_dim = cfg.anchor_feature_patch_size ** 2 * (self.anchor_feature_map_dim + 3)
+        self.anchor_fusion_dim = cfg.point_offset_hidden_dim
+        self.anchor_offset_feature_proj = nn.Sequential(
+            nn.Linear(self.anchor_feature_dim, self.anchor_fusion_dim),
+            nn.GELU(),
+            nn.Linear(self.anchor_fusion_dim, self.anchor_fusion_dim),
+        )
+        self.anchor_offset_feature_norm = nn.LayerNorm(self.anchor_fusion_dim)
+        self._init_mlp(self.anchor_offset_feature_proj)
         self.point_offset_decoder = None
         if cfg.use_point_offset_decoder:
             self.point_offset_decoder = PointOffsetDecoder(
-                in_channels=self.anchor_feature_dim,
+                in_channels=self.anchor_fusion_dim,
                 hidden_channels=cfg.point_offset_hidden_dim,
                 depth=cfg.point_offset_depth,
                 num_heads=cfg.point_offset_num_heads,
                 patch_size=cfg.point_offset_patch_size,
                 k_offsets=cfg.point_offset_k,
-                grid_size=cfg.point_offset_grid_size,
-                offset_scale=cfg.point_offset_scale,
             )
         self.pose_free = cfg.pose_free
         if self.pose_free:
@@ -159,27 +173,26 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
 
         self.child_gaussian_head = None
         if cfg.use_child_gaussian_residual:
-            child_obs_dim = cfg.child_feature_patch_size ** 2 * (32 + 3)
             offset_pe_dim = 3 * 2 * cfg.child_gaussian_fourier_frequencies
-            child_gaussian_param_dim = 3 + 4 + 1 + 3 * (self.gaussian_adapter.d_sh)
             child_input_dim = (
-                child_obs_dim
-                + cfg.point_offset_hidden_dim
+                cfg.point_offset_hidden_dim
                 + offset_pe_dim
-                + child_gaussian_param_dim
             )
-            child_output_dim = child_gaussian_param_dim
+            child_output_dim = 1 + self.gaussian_adapter.d_in
             self.child_gaussian_head = nn.Sequential(
                 nn.Linear(child_input_dim, cfg.child_gaussian_hidden_dim),
                 nn.GELU(),
-                nn.Linear(cfg.child_gaussian_hidden_dim, cfg.child_gaussian_hidden_dim),
-                nn.GELU(),
-                nn.Linear(cfg.child_gaussian_hidden_dim, cfg.child_gaussian_hidden_dim),
-                nn.GELU(),
                 nn.Linear(cfg.child_gaussian_hidden_dim, child_output_dim),
             )
-            nn.init.zeros_(self.child_gaussian_head[-1].weight)
-            nn.init.zeros_(self.child_gaussian_head[-1].bias)
+            self._init_mlp(self.child_gaussian_head)
+            opacity_init = min(max(cfg.child_gaussian_opacity_init, 1e-6), 1 - 1e-6)
+            self.child_gaussian_head[-1].bias.data[0] = math.log(
+                opacity_init / (1 - opacity_init)
+            )
+            rotation_bias_start = 1 + 3
+            self.child_gaussian_head[-1].bias.data[
+                rotation_bias_start + 3
+            ] = 1.0
             self.register_buffer(
                 "child_offset_frequencies",
                 2.0 ** torch.arange(cfg.child_gaussian_fourier_frequencies),
@@ -192,19 +205,30 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
 
         self.gs_params_head_type = cfg.gs_params_head_type
 
-        if self.cfg.depth_activation == 'exp':
-            self.set_depth_head(output_mode='depth', head_type='dpt', landscape_only=True,
-                                depth_mode=('exp', -inf, inf), conf_mode=None, )
-        elif self.cfg.depth_activation == 'sigmoid':
-            self.set_depth_head(output_mode='depth', head_type='dpt', landscape_only=True,
-                                depth_mode=('range', 1, 100.), conf_mode=None, )
-        else:
-            raise NotImplementedError
+        depth_modes = {
+            "exp": ("exp", -inf, inf),
+            "sigmoid": ("range", 1, 100.),
+        }
+        self.set_depth_head(
+            output_mode="depth",
+            head_type="dpt",
+            landscape_only=True,
+            depth_mode=depth_modes[self.cfg.depth_activation],
+            conf_mode=None,
+        )
 
         self.set_gs_params_head(cfg, cfg.gs_params_head_type)
 
         if self.cfg.estimating_pose:
             self.set_pose_head(cfg, cfg.pose_head_type)
+
+    @staticmethod
+    def _init_mlp(layers: nn.Module) -> None:
+        for layer in layers.modules():
+            if not isinstance(layer, nn.Linear):
+                continue
+            nn.init.xavier_uniform_(layer.weight)
+            nn.init.zeros_(layer.bias)
 
     def set_depth_head(self, output_mode, head_type, landscape_only, depth_mode, conf_mode):
         self.backbone.depth_mode = depth_mode
@@ -259,13 +283,6 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
         return head(decout, img_shape, ray_embedding=ray_embedding)
 
     def _super_resolve(self, images: Tensor) -> Tensor:
-        if self.swinir is None:
-            raise RuntimeError("_super_resolve called while use_swinir=False")
-        expected_size = (self.cfg.swinir_input_size, self.cfg.swinir_input_size)
-        if images.shape[-2:] != expected_size:
-            raise ValueError(
-                f"SwinIR expects {expected_size} inputs, got {tuple(images.shape[-2:])}"
-            )
         return self.swinir(images)
 
     @staticmethod
@@ -401,12 +418,6 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
         aggregated_features = (sampled_features * weights[..., None]).sum(dim=2)
         aggregated_rgb = (sampled_rgb * weights[..., None]).sum(dim=2)
 
-        if source_view_indices.shape != (b, num_anchors):
-            raise ValueError(
-                f"Expected source_view_indices shape {(b, num_anchors)}, got "
-                f"{tuple(source_view_indices.shape)}."
-            )
-
         return {
             "feature_3d": torch.cat([aggregated_features, aggregated_rgb], dim=-1),
             "weights": weights,
@@ -414,6 +425,50 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             "w_occ": weight_dict["w_occ"],
             "w_sim": weight_dict["w_sim"],
         }
+
+    @staticmethod
+    def _build_anchor_feature_map(resunet_features: dict[str, Tensor]) -> Tensor:
+        return resunet_features["256"]
+
+    @staticmethod
+    @torch.no_grad()
+    def _compute_anchor_spacing(
+            anchors: Tensor,
+            k: int,
+            chunk_size: int,
+    ) -> Tensor:
+        b, num_anchors, _ = anchors.shape
+        if num_anchors <= 1:
+            return anchors.new_ones(b, num_anchors, 1)
+
+        k = min(max(int(k), 1), num_anchors - 1)
+        chunk_size = max(int(chunk_size), 1)
+        anchors_detached = anchors.detach()
+        all_spacing = []
+        anchor_indices = torch.arange(num_anchors, device=anchors.device)
+
+        for batch_idx in range(b):
+            scene_anchors = anchors_detached[batch_idx]
+            spacing_chunks = []
+            for start in range(0, num_anchors, chunk_size):
+                end = min(start + chunk_size, num_anchors)
+                distances = torch.cdist(scene_anchors[start:end], scene_anchors)
+                local_indices = anchor_indices[start:end] - start
+                distances[local_indices, anchor_indices[start:end]] = float("inf")
+                nearest_distances = distances.topk(k, largest=False, dim=-1).values
+                spacing_chunks.append(nearest_distances.mean(dim=-1, keepdim=True))
+            all_spacing.append(torch.cat(spacing_chunks, dim=0))
+
+        spacing = torch.stack(all_spacing, dim=0)
+        finite_spacing = torch.where(
+            torch.isfinite(spacing),
+            spacing,
+            torch.zeros_like(spacing),
+        )
+        fallback = finite_spacing[finite_spacing > 0].mean()
+        if not torch.isfinite(fallback):
+            fallback = anchors.new_tensor(1.0)
+        return torch.where(spacing > 0, spacing, fallback).clamp_min(1e-6)
 
     def _fourier_encode_positions(self, positions: Tensor) -> Tensor:
         if self.cfg.child_gaussian_fourier_frequencies <= 0:
@@ -426,215 +481,60 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
         encoded = torch.cat([encoded.sin(), encoded.cos()], dim=-2)
         return rearrange(encoded, "b n k two_f xyz -> b n k (two_f xyz)")
 
-    def _aggregate_child_multiview_features(
-            self,
-            child_centers: Tensor,
-            feature_map: Tensor,
-            sr_images: Tensor,
-            parent_weights: Tensor,
-            extrinsics: Tensor,
-            intrinsics: Tensor,
-    ) -> dict[str, Tensor]:
-        b, num_anchors, k_offsets, _ = child_centers.shape
-        num_views = extrinsics.shape[1]
-        child_centers_flat = rearrange(child_centers, "b n k xyz -> b (n k) xyz")
-        child_centers_per_view = repeat(
-            child_centers_flat,
-            "b nk xyz -> b v nk xyz",
-            v=num_views,
-        )
-        camera_points = transform_world2cam(
-            homogenize_points(child_centers_per_view),
-            extrinsics[:, :, None],
-        )[..., :-1]
-        camera_depth = camera_points[..., -1]
-        projected_xy = project_camera_space(
-            camera_points,
-            intrinsics[:, :, None],
-        )
-        projected_xy = rearrange(projected_xy, "b v nk xy -> b nk v xy")
-        camera_depth = rearrange(camera_depth, "b v nk -> b nk v")
-
-        sampled_features = self._sample_projected_map(
-            feature_map,
-            projected_xy,
-            self.cfg.child_feature_patch_size,
-        )
-        sampled_rgb = self._sample_projected_map(
-            sr_images,
-            projected_xy,
-            self.cfg.child_feature_patch_size,
-        )
-
-        projection_valid = (
-            (camera_depth > 0)
-            & projected_xy.isfinite().all(dim=-1)
-            & (projected_xy >= 0).all(dim=-1)
-            & (projected_xy <= 1).all(dim=-1)
-        )
-        child_weights = repeat(
-            parent_weights,
-            "b n v -> b n k v",
-            k=k_offsets,
-        )
-        child_weights = rearrange(child_weights, "b n k v -> b (n k) v")
-        child_weights = torch.where(
-            projection_valid,
-            child_weights,
-            torch.zeros_like(child_weights),
-        )
-        child_weights = child_weights / child_weights.sum(
-            dim=-1,
-            keepdim=True,
-        ).clamp_min(self.cfg.anchor_feature_eps)
-
-        aggregated_features = (sampled_features * child_weights[..., None]).sum(dim=2)
-        aggregated_rgb = (sampled_rgb * child_weights[..., None]).sum(dim=2)
-        feature_3d = torch.cat([aggregated_features, aggregated_rgb], dim=-1)
-
-        return {
-            "feature_3d": rearrange(feature_3d, "b (n k) c -> b n k c", n=num_anchors, k=k_offsets),
-            "weights": rearrange(child_weights, "b (n k) v -> b n k v", n=num_anchors, k=k_offsets),
-            "valid_mask": rearrange(projection_valid, "b (n k) v -> b n k v", n=num_anchors, k=k_offsets),
-        }
-
     def _decode_child_gaussian_residuals(
             self,
-            parent_gaussians,
             point_offset_densification: dict[str, Tensor],
-            anchor_multiview_features: dict[str, Tensor],
-            feature_map: Tensor,
-            sr_images: Tensor,
-            extrinsics: Tensor,
-            intrinsics: Tensor,
     ) -> dict[str, Tensor | Gaussians]:
-        if self.child_gaussian_head is None:
-            raise RuntimeError("_decode_child_gaussian_residuals called while disabled")
-
         child_centers = point_offset_densification["child_centers"]
         offsets = point_offset_densification["offsets"]
-        b, num_anchors, k_offsets, _ = child_centers.shape
-
-        child_multiview_features = self._aggregate_child_multiview_features(
-            child_centers,
-            feature_map,
-            sr_images,
-            anchor_multiview_features["weights"],
-            extrinsics,
-            intrinsics,
-        )
-        parent_point_features = repeat(
-            point_offset_densification["parent_features"],
-            "b n c -> b n k c",
-            k=k_offsets,
-        )
-        parent_scales = rearrange(
-            parent_gaussians.scales,
-            "b v r srf spp xyz -> b (v r srf spp) xyz",
-        ).detach()
-        parent_rotations = rearrange(
-            parent_gaussians.rotations,
-            "b v r srf spp xyzw -> b (v r srf spp) xyzw",
-        ).detach()
-        parent_harmonics = rearrange(
-            parent_gaussians.harmonics,
-            "b v r srf spp c d_sh -> b (v r srf spp) c d_sh",
-        ).detach()
-        parent_opacities_raw = torch.logit(
-            rearrange(
-                parent_gaussians.opacities,
-                "b v r srf spp -> b (v r srf spp)",
-            ).detach().clamp(1e-6, 1 - 1e-6)
-            / k_offsets,
-            eps=1e-6,
-        )
-        base_scales = repeat(
-            parent_scales / self.cfg.child_scale_divisor,
-            "b n xyz -> b n k xyz",
-            k=k_offsets,
-        )
-        base_rotations = repeat(
-            parent_rotations,
-            "b n xyzw -> b n k xyzw",
-            k=k_offsets,
-        )
-        base_harmonics = repeat(
-            parent_harmonics,
-            "b n c d_sh -> b n k c d_sh",
-            k=k_offsets,
-        )
-        base_opacities_raw = repeat(
-            parent_opacities_raw,
-            "b n -> b n k",
-            k=k_offsets,
-        )[..., None]
-        base_gaussian_features = torch.cat(
-            [
-                base_scales,
-                base_rotations,
-                base_opacities_raw,
-                rearrange(base_harmonics, "b n k c d_sh -> b n k (c d_sh)"),
-            ],
-            dim=-1,
-        )
+        child_point_features = point_offset_densification["child_features"]
         positions_for_encoding = child_centers if self.cfg.child_gaussian_enable_absolute_pe else offsets
         position_encoding = self._fourier_encode_positions(positions_for_encoding)
         child_input = torch.cat(
             [
-                child_multiview_features["feature_3d"],
-                parent_point_features,
+                child_point_features,
                 position_encoding,
-                base_gaussian_features,
             ],
             dim=-1,
         )
         child_input = rearrange(child_input, "b n k c -> b (n k) c")
-        delta_gaussians = self.child_gaussian_head(child_input)
-
-        sh_dim = 3 * self.gaussian_adapter.d_sh
-        delta_scales, delta_rotations, delta_opacities, delta_shs = (
-            delta_gaussians.split((3, 4, 1, sh_dim), dim=-1)
-        )
-
+        child_raw_parameters = self.child_gaussian_head(child_input)
+        child_opacities_raw = child_raw_parameters[..., 0]
+        child_raw_gaussians = child_raw_parameters[..., 1:]
         child_means = rearrange(child_centers, "b n k xyz -> b (n k) xyz")
-        child_scales = (
-            rearrange(base_scales, "b n k xyz -> b (n k) xyz") + delta_scales
-        ).clamp_min(1e-6)
-        child_rotations_unnorm = (
-            rearrange(base_rotations, "b n k xyzw -> b (n k) xyzw") + delta_rotations
-        )
-        child_rotations = child_rotations_unnorm / (
-            child_rotations_unnorm.norm(dim=-1, keepdim=True) + 1e-8
-        )
-        child_opacities_raw = rearrange(
-            base_opacities_raw,
-            "b n k one -> b (n k) one",
-        ) + delta_opacities
-        child_harmonics = rearrange(
-            base_harmonics,
-            "b n k c d_sh -> b (n k) c d_sh",
-        ) + rearrange(delta_shs, "b nk (c d_sh) -> b nk c d_sh", c=3)
-        child_covariances = build_covariance(child_scales, child_rotations)
-
-        child_gaussians = Gaussians(
+        child_gaussians = self.gaussian_adapter.forward(
             child_means,
-            child_covariances,
-            child_rotations,
-            child_scales,
-            child_harmonics,
-            child_opacities_raw.squeeze(-1).sigmoid(),
+            child_opacities_raw.sigmoid(),
+            child_raw_gaussians,
+        )
+        child_gaussians = Gaussians(
+            means=child_gaussians.means,
+            covariances=child_gaussians.covariances,
+            rotations=child_gaussians.rotations,
+            scales=child_gaussians.scales,
+            harmonics=child_gaussians.harmonics,
+            opacities=child_gaussians.opacities,
         )
 
         return {
             "gaussians": child_gaussians,
-            "child_multiview_weights": child_multiview_features["weights"],
-            "delta_scales": delta_scales,
-            "delta_rotations": delta_rotations,
-            "delta_opacities": delta_opacities,
-            "delta_harmonics": delta_shs,
-            "base_scales": rearrange(base_scales, "b n k xyz -> b (n k) xyz"),
-            "base_opacities_raw": rearrange(base_opacities_raw, "b n k one -> b (n k) one"),
+            "raw_parameters": child_raw_parameters,
+            "raw_gaussians": child_raw_gaussians,
+            "opacities_raw": child_opacities_raw,
+            "child_point_features": rearrange(child_point_features, "b n k c -> b (n k) c"),
+            "child_feature_delta": rearrange(point_offset_densification["feature_deltas"], "b n k c -> b (n k) c"),
         }
+
+    @staticmethod
+    def _flatten_view_gaussians(gaussians) -> Gaussians:
+        return Gaussians(
+            rearrange(gaussians.means, "b v r srf spp xyz -> b (v r srf spp) xyz"),
+            rearrange(gaussians.covariances, "b v r srf spp i j -> b (v r srf spp) i j"),
+            rearrange(gaussians.rotations, "b v r srf spp i -> b (v r srf spp) i"),
+            rearrange(gaussians.scales, "b v r srf spp i -> b (v r srf spp) i"),
+            rearrange(gaussians.harmonics, "b v r srf spp c d_sh -> b (v r srf spp) c d_sh"),
+            rearrange(gaussians.opacities, "b v r srf spp -> b (v r srf spp)"),
+        )
 
     def forward(
             self,
@@ -670,11 +570,9 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
         dec_feat, shape, images = out['dec_feat'], out['shape'], out['images']
         resunet_features = None
         if self.resunet_token_fusion is not None:
-            if context_image_sr is None:
-                raise RuntimeError("use_resunet_token_fusion=True requires use_swinir=True")
             resunet_features = self.resunet_token_fusion(
                 context_image_sr,
-                dec_feat[-1][:, :v_cxt].float(),
+                out["enc_feat"][:, :v_cxt].float(),
             )
 
         with torch.amp.autocast('cuda', enabled=False):
@@ -760,14 +658,9 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
         )
         image_only_consistency = None
         if self.image_only_consistency is not None:
-            if resunet_features is None or "image_only_64" not in resunet_features:
-                raise RuntimeError(
-                    "use_image_only_feature_consistency=True requires "
-                    "use_resunet_token_fusion=True and image_only_64 features."
-                )
             image_only_consistency = self.image_only_consistency(
                 flattened_anchors,
-                resunet_features["image_only_64"],
+                resunet_features["image_only_256"],
                 depth_all,
                 context_extrinsics,
                 context_intrinsics,
@@ -775,24 +668,10 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             )
         anchor_multiview_features = None
         if self.cfg.use_anchor_multiview_feature_aggregation:
-            if image_only_consistency is None:
-                raise RuntimeError(
-                    "use_anchor_multiview_feature_aggregation=True requires "
-                    "use_image_only_feature_consistency=True."
-                )
-            if resunet_features is None or "256" not in resunet_features:
-                raise RuntimeError(
-                    "use_anchor_multiview_feature_aggregation=True requires "
-                    "resunet_features['256']."
-                )
-            if context_image_sr is None:
-                raise RuntimeError(
-                    "use_anchor_multiview_feature_aggregation=True requires "
-                    "use_swinir=True."
-                )
+            anchor_feature_map = self._build_anchor_feature_map(resunet_features)
             anchor_multiview_features = self._aggregate_anchor_multiview_features(
                 flattened_anchors,
-                resunet_features["256"],
+                anchor_feature_map,
                 context_image_sr,
                 image_only_consistency,
                 context_extrinsics,
@@ -812,54 +691,23 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
         )
         point_offset_densification = None
         if self.point_offset_decoder is not None:
-            if anchor_multiview_features is None:
-                raise RuntimeError(
-                    "use_point_offset_decoder=True requires "
-                    "use_anchor_multiview_feature_aggregation=True."
-                )
-            point_offset_radius = rearrange(
-                gaussians.scales,
-                "b v r srf spp xyz -> b (v r srf spp) xyz",
-            ).detach().mean(dim=-1, keepdim=True)
+            anchor_multiview_features["point_offset_feature"] = self.anchor_offset_feature_norm(
+                self.anchor_offset_feature_proj(anchor_multiview_features["feature_3d"])
+            )
+            point_offset_radius = self._compute_anchor_spacing(
+                flattened_anchors,
+                self.cfg.point_offset_spacing_k,
+                self.cfg.point_offset_spacing_chunk_size,
+            )
             point_offset_densification = self.point_offset_decoder(
                 flattened_anchors,
-                anchor_multiview_features["feature_3d"],
+                anchor_multiview_features["point_offset_feature"],
                 point_offset_radius,
             )
         child_gaussian_residual = None
         if self.child_gaussian_head is not None:
-            if point_offset_densification is None:
-                raise RuntimeError(
-                    "use_child_gaussian_residual=True requires "
-                    "use_point_offset_decoder=True."
-                )
-            if anchor_multiview_features is None:
-                raise RuntimeError(
-                    "use_child_gaussian_residual=True requires "
-                    "use_anchor_multiview_feature_aggregation=True."
-                )
-            if resunet_features is None:
-                raise RuntimeError(
-                    "use_child_gaussian_residual=True requires "
-                    "use_resunet_token_fusion=True."
-                )
-            if "256" not in resunet_features:
-                raise RuntimeError(
-                    "use_child_gaussian_residual=True requires "
-                    "resunet_features['256']."
-                )
-            if context_image_sr is None:
-                raise RuntimeError(
-                    "use_child_gaussian_residual=True requires use_swinir=True."
-                )
             child_gaussian_residual = self._decode_child_gaussian_residuals(
-                gaussians,
                 point_offset_densification,
-                anchor_multiview_features,
-                resunet_features["256"],
-                context_image_sr,
-                context_extrinsics,
-                context_intrinsics,
             )
 
         # Dump visualizations if needed.
@@ -920,13 +768,12 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             encoder_output["child_gaussian_residual"] = child_gaussian_residual
             encoder_output["child_gaussians"] = child_gaussian_residual["gaussians"]
 
-        encoder_output["gaussians"] = Gaussians(
-            rearrange(gaussians.means, "b v r srf spp xyz -> b (v r srf spp) xyz"),
-            rearrange(gaussians.covariances, "b v r srf spp i j -> b (v r srf spp) i j"),
-            rearrange(gaussians.rotations, "b v r srf spp i  -> b (v r srf spp) i "),
-            rearrange(gaussians.scales, "b v r srf spp i  -> b (v r srf spp) i "),
-            rearrange(gaussians.harmonics, "b v r srf spp c d_sh -> b (v r srf spp) c d_sh"),
-            rearrange(gaussians.opacities, "b v r srf spp -> b (v r srf spp)"),
+        parent_gaussians = self._flatten_view_gaussians(gaussians)
+        encoder_output["parent_gaussians"] = parent_gaussians
+        encoder_output["gaussians"] = (
+            child_gaussian_residual["gaussians"]
+            if child_gaussian_residual is not None
+            else parent_gaussians
         )
 
         if self.cfg.estimating_pose:

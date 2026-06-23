@@ -7,6 +7,33 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
+from .hisplat_multiview_transformer import MultiViewFeatureTransformer
+from .hisplat_position import PositionEmbeddingSine
+
+
+def feature_add_position_list(
+    features_list: list[torch.Tensor],
+    attn_splits: int,
+    feature_channels: int,
+) -> list[torch.Tensor]:
+    pos_enc = PositionEmbeddingSine(num_pos_feats=feature_channels // 2)
+    if attn_splits > 1:
+        features_splits = [
+            feature.reshape(-1, *feature.shape[-3:])
+            for feature in features_list
+        ]
+        position = pos_enc(features_splits[0])
+        return [
+            feature + position
+            for feature in features_splits
+        ]
+
+    position = pos_enc(features_list[0])
+    return [
+        feature + position
+        for feature in features_list
+    ]
+
 
 class ResidualBlock(nn.Module):
     def __init__(
@@ -206,9 +233,26 @@ class HiSplatResUnetTokenFusion(nn.Module):
         token_ch: int = 64,
         feature_dims: tuple[int, int, int] = (32, 64, 128),
         norm_layer=nn.InstanceNorm2d,
+        use_multiview_transformer: bool = False,
+        multiview_transformer_layers: int = 6,
+        multiview_transformer_heads: int = 1,
+        multiview_attn_splits: int = 2,
     ) -> None:
         super().__init__()
         self.resunet = ResUnet(dino_dim=token_ch, norm_layer=norm_layer, feature_dims=feature_dims)
+        self.use_multiview_transformer = use_multiview_transformer
+        self.multiview_attn_splits = multiview_attn_splits
+        self.multiview_transformer = (
+            MultiViewFeatureTransformer(
+                num_layers=multiview_transformer_layers,
+                d_model=feature_dims[-1],
+                nhead=multiview_transformer_heads,
+                ffn_dim_expansion=4,
+                no_cross_attn=False,
+            )
+            if use_multiview_transformer
+            else None
+        )
         self.register_buffer(
             "image_mean",
             torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(1, 3, 1, 1),
@@ -290,6 +334,24 @@ class HiSplatResUnetTokenFusion(nn.Module):
         images = (images.clamp(0, 1) - self.image_mean) / self.image_std
         dino_feature = self.tokens_to_16x16(tokens)
         fused_features, image_only_features = self.resunet(images, dino_feature)
+        if self.multiview_transformer is not None:
+            feature_64_list = [
+                fused_features[0].reshape(b, v, *fused_features[0].shape[-3:])[:, i]
+                for i in range(v)
+            ]
+            feature_64_list = feature_add_position_list(
+                feature_64_list,
+                self.multiview_attn_splits,
+                fused_features[0].shape[1],
+            )
+            feature_64_list = self.multiview_transformer(
+                feature_64_list,
+                self.multiview_attn_splits,
+            )
+            fused_features[0] = rearrange(
+                torch.stack(feature_64_list, dim=1),
+                "b v c h w -> (b v) c h w",
+            )
         return {
             "64": rearrange(fused_features[0], "(b v) c h w -> b v c h w", b=b, v=v),
             "128": rearrange(fused_features[1], "(b v) c h w -> b v c h w", b=b, v=v),
