@@ -52,3 +52,35 @@ depth_activation: 'sigmoid'
 
 equal_fxfy: true
 equal_view_intrinsics: true
+
+freeze_lr_network: true
+
+sr_refiner:
+  enabled: true
+  swinir_weight_path: "/space0/mengxl/NAS3R-master/pretrained_weights/001_classicalSR_DF2K_s64w8_SwinIR-M_x4.pth"
+  swinir_upscale: 4
+  swinir_img_size: 64
+  swinir_window_size: 8
+  feature_dim: 128
+  cross_attn_heads: 8
+  cross_attn_layers: dpt
+  dpt_hooks: [2, 5, 8, 11]
+
+gd_offset_refiner:
+  enabled: true
+  gs_feature_dim: 256
+  hidden_dim: 160
+  sample_patch_size: 4
+  cross_attn_heads: 16
+  point_transformer_depth: 2
+  point_transformer_heads: 8
+  point_transformer_knn: 16
+  num_offsets: 4
+  sr_feature_dim: 128
+  child_sample_patch_size: 2
+  child_self_attn_layers: 4
+  sh_degree: 4
+  child_scale_divisor: 1.2
+  child_aggregation_views: 2
+  child_fused_dim: 256
+  scale_residual_scale: 0.25

@@ -4,7 +4,7 @@ from typing import Literal, Optional
 
 import torch
 import torch.nn.functional as F
-from einops import rearrange
+from einops import rearrange, repeat
 from jaxtyping import Float
 from torch import Tensor, nn
 import math
@@ -24,6 +24,10 @@ from .visualization.encoder_visualizer_epipolar_cfg import EncoderVisualizerEpip
 from ...misc.cam_utils import camera_normalization, convert_pose_to_4x4, depth_projector, \
     unproject_depth_map_to_point_map_batch
 from .heads.pose_head import PoseHeadCfg
+from .sr_croco_refiner import SRCroCoRefinerCfg, CrossAttentionTokenRefiner, SRFeatureDPT
+from .gd_offset_refiner import GDOffsetRefinerCfg, GDOffsetRefiner
+from ..super_resolution import FrozenSwinIRUpsampler
+from ..decoder.cuda_splatting import render_cuda
 
 inf = float('inf')
 
@@ -64,6 +68,9 @@ class EncoderNAS3RMCfg:
 
     equal_fxfy: bool = True
     equal_view_intrinsics: bool = True
+    freeze_lr_network: bool = False
+    sr_refiner: Optional[SRCroCoRefinerCfg] = None
+    gd_offset_refiner: Optional[GDOffsetRefinerCfg] = None
 
 
 def rearrange_head(feat, patch_size, H, W):
@@ -108,6 +115,65 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
 
         if self.cfg.estimating_pose:
             self.set_pose_head(cfg, cfg.pose_head_type)
+
+        self.sr_upsampler = None
+        self.sr_token_refiner = None
+        self.sr_feature_head = None
+        self.gd_offset_refiner = None
+        sr_cfg = self.cfg.sr_refiner
+        if sr_cfg is not None and sr_cfg.enabled:
+            if not sr_cfg.swinir_weight_path:
+                raise ValueError("sr_refiner.swinir_weight_path must be set when sr_refiner.enabled=true")
+            self.sr_upsampler = FrozenSwinIRUpsampler(
+                weight_path=sr_cfg.swinir_weight_path,
+                upscale=sr_cfg.swinir_upscale,
+                img_size=sr_cfg.swinir_img_size,
+                window_size=sr_cfg.swinir_window_size,
+            )
+            self.sr_token_refiner = CrossAttentionTokenRefiner(
+                dim=self.backbone.enc_embed_dim,
+                num_heads=sr_cfg.cross_attn_heads,
+                layer_mode="last",
+                dpt_hooks=(0,),
+            )
+            self.sr_feature_head = SRFeatureDPT(
+                dec_embed_dim=self.backbone.dec_embed_dim,
+                feature_dim=sr_cfg.feature_dim,
+                hooks=sr_cfg.dpt_hooks,
+            )
+        gd_cfg = self.cfg.gd_offset_refiner
+        if gd_cfg is not None and gd_cfg.enabled:
+            self.gd_offset_refiner = GDOffsetRefiner(gd_cfg)
+
+        if self.cfg.freeze_lr_network:
+            self._freeze_lr_network()
+
+    def _freeze_module(self, module) -> None:
+        if isinstance(module, nn.Module):
+            module.eval()
+            for parameter in module.parameters():
+                parameter.requires_grad = False
+
+    def _freeze_lr_network(self) -> None:
+        self._freeze_module(self.backbone)
+        self._freeze_module(self.downstream_depth_head1)
+        self._freeze_module(self.downstream_depth_head2)
+        self._freeze_module(self.gaussian_param_head)
+        self._freeze_module(self.gaussian_param_head2)
+        if self.cfg.estimating_pose:
+            self._freeze_module(self.pose_head)
+            self._freeze_module(self.pose_head2)
+
+    def _keep_lr_network_frozen(self) -> None:
+        if self.cfg.freeze_lr_network:
+            self.backbone.eval()
+            self.downstream_depth_head1.eval()
+            self.downstream_depth_head2.eval()
+            self.gaussian_param_head.eval()
+            self.gaussian_param_head2.eval()
+            if self.cfg.estimating_pose:
+                self.pose_head.eval()
+                self.pose_head2.eval()
 
     def set_depth_head(self, output_mode, head_type, landscape_only, depth_mode, conf_mode):
         self.backbone.depth_mode = depth_mode
@@ -169,6 +235,7 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             target: Optional[dict] = None,
             warmup_pts3d: bool = False,
     ):
+        self._keep_lr_network_frozen()
         context_image = context.get("image_lr", context["image"])
         target_image = target.get("image_lr", target["image"]) if target is not None else None
 
@@ -193,9 +260,11 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             out = self.backbone(context_input)
 
         dec_feat, shape, images = out['dec_feat'], out['shape'], out['images']
+        sr_output = self._forward_sr_refiner(context_image, context, out, v_cxt)
 
         with torch.amp.autocast('cuda', enabled=False):
             all_other_params = []
+            all_gs_feature_maps = []
             all_depth_res = []
 
             if self.cfg.estimating_pose:
@@ -212,15 +281,25 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
 
             # for the 3DGS heads
             if 'dpt' in self.gs_params_head_type:
-                GS_res1 = self.gaussian_param_head([tok[:, 0].float() for tok in dec_feat], images[:, 0, :3],
-                                                   shape[0, 0].cpu().tolist())
+                GS_res1, GS_feat1 = self.gaussian_param_head(
+                    [tok[:, 0].float() for tok in dec_feat],
+                    images[:, 0, :3],
+                    shape[0, 0].cpu().tolist(),
+                    return_feature=True,
+                )
                 GS_res1 = rearrange(GS_res1, "b d h w -> b (h w) d")
                 all_other_params.append(GS_res1)
+                all_gs_feature_maps.append(GS_feat1)
                 for i in range(1, v_cxt):
-                    GS_res2 = self.gaussian_param_head2([tok[:, i].float() for tok in dec_feat], images[:, i, :3],
-                                                        shape[0, i].cpu().tolist())
+                    GS_res2, GS_feat2 = self.gaussian_param_head2(
+                        [tok[:, i].float() for tok in dec_feat],
+                        images[:, i, :3],
+                        shape[0, i].cpu().tolist(),
+                        return_feature=True,
+                    )
                     GS_res2 = rearrange(GS_res2, "b d h w -> b (h w) d")
                     all_other_params.append(GS_res2)
+                    all_gs_feature_maps.append(GS_feat2)
             else:
                 raise NotImplementedError(f"unexpected {self.gs_params_head_type=}")
 
@@ -279,6 +358,11 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             self.map_pdf_to_opacity(densities, global_step),
             rearrange(gaussian_params[..., 1:], "b v r srf c -> b v r srf () c"),
         )
+        anchor_means = rearrange(
+            gaussians.means,
+            "b v r srf spp xyz -> b v (r srf spp) xyz",
+        )
+        gs_feature_map = torch.stack(all_gs_feature_maps, dim=1)
 
         # Dump visualizations if needed.
         if visualization_dump is not None:
@@ -320,7 +404,127 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             if target is not None:
                 encoder_output['intrinsics']['cwt'] = pred_intrinsics
 
+        if sr_output is not None:
+            encoder_output["sr"] = sr_output
+
+        gd_offset_output = self._forward_gd_offset_refiner(
+            sr_output=sr_output,
+            anchor_means=anchor_means,
+            gs_feature_map=gs_feature_map,
+            gaussians=encoder_output["gaussians"],
+            extrinsics=context_extrinsics,
+            intrinsics=context_intrinsics,
+            near=context["near"],
+            far=context["far"],
+        )
+        if gd_offset_output is not None:
+            encoder_output["lr_gaussians"] = encoder_output["gaussians"]
+            encoder_output["parent_gaussians"] = encoder_output["gaussians"]
+            encoder_output["child_gaussians"] = gd_offset_output["gaussians"]
+            encoder_output["gaussians"] = gd_offset_output["gaussians"]
+            encoder_output["gd_offset"] = gd_offset_output
+
         return encoder_output
+
+    def _forward_gd_offset_refiner(
+        self,
+        sr_output,
+        anchor_means,
+        gs_feature_map,
+        gaussians,
+        extrinsics,
+        intrinsics,
+        near,
+        far,
+    ):
+        if self.gd_offset_refiner is None or sr_output is None:
+            return None
+
+        b, v = extrinsics.shape[:2]
+        sr_image = sr_output["image"]
+        image_shape = tuple(sr_image.shape[-2:])
+        background = torch.zeros(
+            b * v,
+            3,
+            dtype=sr_image.dtype,
+            device=sr_image.device,
+        )
+        with torch.no_grad():
+            lr_render_color, _ = render_cuda(
+                rearrange(extrinsics, "b v i j -> (b v) i j"),
+                rearrange(intrinsics, "b v i j -> (b v) i j"),
+                rearrange(near[:, :v], "b v -> (b v)"),
+                rearrange(far[:, :v], "b v -> (b v)"),
+                image_shape,
+                background,
+                repeat(gaussians.means, "b g xyz -> (b v) g xyz", v=v),
+                repeat(gaussians.covariances, "b g i j -> (b v) g i j", v=v),
+                repeat(gaussians.harmonics, "b g c d_sh -> (b v) g c d_sh", v=v),
+                repeat(gaussians.opacities, "b g -> (b v) g", v=v),
+                repeat(gaussians.rotations, "b g i -> (b v) g i", v=v),
+                repeat(gaussians.scales, "b g i -> (b v) g i", v=v),
+                scale_invariant=True,
+            )
+        lr_render_color = rearrange(
+            lr_render_color,
+            "(b v) c h w -> b v c h w",
+            b=b,
+            v=v,
+        )
+        gd_output = self.gd_offset_refiner(
+            anchors=anchor_means,
+            gs_feature_map=gs_feature_map,
+            sr_feature_map=sr_output["feature_map"],
+            sr_image=sr_image,
+            lr_render_color=lr_render_color,
+            parent_gaussians=gaussians,
+            extrinsics=extrinsics,
+            intrinsics=intrinsics,
+        )
+        gd_output["lr_render_color"] = lr_render_color.detach()
+        return gd_output
+
+    def _forward_sr_refiner(self, context_image, context, lr_out, num_context_views):
+        if self.sr_upsampler is None:
+            return None
+
+        with torch.no_grad():
+            sr_image = self.sr_upsampler(context_image)
+
+        sr_context = {
+            "image": normalize_image(sr_image),
+            "intrinsics": context["intrinsics"][:, :num_context_views],
+        }
+        sr_feat, sr_pos, sr_shape, sr_images, sr_patch_tokens = self.backbone.encode_context(sr_context)
+        lr_feat = lr_out["enc_feat"][:, :num_context_views]
+        if sr_feat.shape[:2] != lr_feat.shape[:2]:
+            raise ValueError(
+                "SR/LR context encoder tokens must have the same batch and context-view dimensions, "
+                f"got sr={tuple(sr_feat.shape[:2])}, lr={tuple(lr_feat.shape[:2])}."
+            )
+        refined_sr_feat = self.sr_token_refiner([sr_feat], [lr_feat])[0]
+        refined_dec_feat, _ = self.backbone.decode_context(
+            sr_context,
+            refined_sr_feat,
+            sr_pos,
+            sr_patch_tokens,
+        )
+
+        sr_feature_maps = []
+        for view_idx in range(num_context_views):
+            view_tokens = [tok[:, view_idx].float() for tok in refined_dec_feat]
+            feature_map = self.sr_feature_head(
+                view_tokens,
+                tuple(sr_shape[0, view_idx].cpu().tolist()),
+            )
+            sr_feature_maps.append(feature_map)
+
+        return {
+            "image": sr_image,
+            "enc_feat": refined_sr_feat,
+            "dec_feat": refined_dec_feat,
+            "feature_map": torch.stack(sr_feature_maps, dim=1),
+        }
 
     def process_pose(self, pose_enc, context_views):
         # pose_enc: (b v 9)

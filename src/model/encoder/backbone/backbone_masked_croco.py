@@ -16,7 +16,6 @@ from ....geometry.camera_emb import get_intrinsic_embedding, get_intrinsic_posit
 
 inf = float('inf')
 
-
 croco_params = {
     'ViTLarge_BaseDecoder': {
         'enc_depth': 24,
@@ -50,7 +49,8 @@ default_dust3r_params = {
 @dataclass
 class BackboneMaskedCrocoMultiCfg:
     name: Literal["masked_croco_multi"]
-    model: Literal["ViTLarge_BaseDecoder", "ViTBase_SmallDecoder", "ViTBase_BaseDecoder"]  # keep interface for the last two models, but they are not supported
+    model: Literal[
+        "ViTLarge_BaseDecoder", "ViTBase_SmallDecoder", "ViTBase_BaseDecoder"]  # keep interface for the last two models, but they are not supported
     patch_embed_cls: str = 'PatchEmbedDust3R'  # PatchEmbedDust3R or ManyAR_PatchEmbed
     asymmetry_decoder: bool = True
     intrinsics_embed_loc: Literal["encoder", "decoder", "none"] = 'none'
@@ -58,6 +58,7 @@ class BackboneMaskedCrocoMultiCfg:
     intrinsics_embed_type: Literal["pixelwise", "linear", "token", "none"] = 'token'  # linear or dpt
     pose_embed_loc: Literal["encoder", "decoder", "none"] = 'none'
     pose_embed_type: Literal['learnable_token',] = 'learnable_token'
+
 
 class AsymmetricMaskedCroCoMulti(CroCoNet):
     """ Two siamese encoders, followed by two decoders.
@@ -77,9 +78,11 @@ class AsymmetricMaskedCroCoMulti(CroCoNet):
         self.intrinsics_embed_encoder_dim = 0
         self.intrinsics_embed_decoder_dim = 0
         if self.intrinsics_embed_loc == 'encoder' and self.intrinsics_embed_type == 'pixelwise':
-            self.intrinsics_embed_encoder_dim = (self.intrinsics_embed_degree + 1) ** 2 if self.intrinsics_embed_degree > 0 else 3
+            self.intrinsics_embed_encoder_dim = (
+                                                            self.intrinsics_embed_degree + 1) ** 2 if self.intrinsics_embed_degree > 0 else 3
         elif self.intrinsics_embed_loc == 'decoder' and self.intrinsics_embed_type == 'pixelwise':
-            self.intrinsics_embed_decoder_dim = (self.intrinsics_embed_degree + 1) ** 2 if self.intrinsics_embed_degree > 0 else 3
+            self.intrinsics_embed_decoder_dim = (
+                                                            self.intrinsics_embed_degree + 1) ** 2 if self.intrinsics_embed_degree > 0 else 3
 
         self.patch_embed_cls = cfg.patch_embed_cls
         self.croco_args = fill_default_args(croco_params[cfg.model], CroCoNet.__init__)
@@ -104,7 +107,6 @@ class AsymmetricMaskedCroCoMulti(CroCoNet):
         if self.pose_embed_loc != 'none' and self.pose_embed_type == 'separate_learnable_token':
             self.pose_token = nn.Parameter(torch.randn(1, 2, 1, 1024))
 
-
         # self.set_downstream_head(output_mode, head_type, landscape_only, depth_mode, conf_mode, **croco_kwargs)
         # self.set_freeze(freeze)
 
@@ -112,8 +114,8 @@ class AsymmetricMaskedCroCoMulti(CroCoNet):
         in_chans = in_chans + self.intrinsics_embed_encoder_dim
         self.patch_embed = get_patch_embed(self.patch_embed_cls, img_size, patch_size, enc_embed_dim, in_chans)
 
-
-    def _set_decoder(self, enc_embed_dim, dec_embed_dim, dec_num_heads, dec_depth, mlp_ratio, norm_layer, norm_im2_in_dec):
+    def _set_decoder(self, enc_embed_dim, dec_embed_dim, dec_num_heads, dec_depth, mlp_ratio, norm_layer,
+                     norm_im2_in_dec):
         self.dec_depth = dec_depth
         self.dec_embed_dim = dec_embed_dim
         # transfer from encoder to decoder
@@ -121,7 +123,8 @@ class AsymmetricMaskedCroCoMulti(CroCoNet):
         self.decoder_embed = nn.Linear(enc_embed_dim, dec_embed_dim, bias=True)
         # transformer for the decoder
         self.dec_blocks = nn.ModuleList([
-            DecoderBlock(dec_embed_dim, dec_num_heads, mlp_ratio=mlp_ratio, qkv_bias=True, norm_layer=norm_layer, norm_mem=norm_im2_in_dec, rope=self.rope)
+            DecoderBlock(dec_embed_dim, dec_num_heads, mlp_ratio=mlp_ratio, qkv_bias=True, norm_layer=norm_layer,
+                         norm_mem=norm_im2_in_dec, rope=self.rope)
             for i in range(dec_depth)])
         # final norm layer
         self.dec_norm = norm_layer(dec_embed_dim)
@@ -138,10 +141,11 @@ class AsymmetricMaskedCroCoMulti(CroCoNet):
     def set_freeze(self, freeze):  # this is for use by downstream models
         assert freeze in ['none', 'mask', 'encoder'], f"unexpected freeze={freeze}"
         to_be_frozen = {
-            'none':     [],
-            'mask':     [self.mask_token],
-            'encoder':  [self.mask_token, self.patch_embed, self.enc_blocks],
-            'encoder_decoder':  [self.mask_token, self.patch_embed, self.enc_blocks, self.enc_norm, self.decoder_embed, self.dec_blocks, self.dec_blocks2, self.dec_norm],
+            'none': [],
+            'mask': [self.mask_token],
+            'encoder': [self.mask_token, self.patch_embed, self.enc_blocks],
+            'encoder_decoder': [self.mask_token, self.patch_embed, self.enc_blocks, self.enc_norm, self.decoder_embed,
+                                self.dec_blocks, self.dec_blocks2, self.dec_norm],
         }
         freeze_all_params(to_be_frozen[freeze])
 
@@ -151,8 +155,8 @@ class AsymmetricMaskedCroCoMulti(CroCoNet):
 
     def _encode_image(self, image, true_shape, intrinsics_embed=None, intrinsics_pos_embed=None, pose_embedding=None):
         # embed the image into patches  (x has size B x Npatches x C)
-        x, pos = self.patch_embed(image, true_shape=true_shape) # (bv, 256, 1024), (bv, 256, 2)
-        
+        x, pos = self.patch_embed(image, true_shape=true_shape)  # (bv, 256, 1024), (bv, 256, 2)
+
         P = x.shape[1]
         if intrinsics_pos_embed is not None:
             x = x + intrinsics_pos_embed
@@ -166,7 +170,6 @@ class AsymmetricMaskedCroCoMulti(CroCoNet):
                 add_pos = pos[:, 0:1, :].clone()
                 add_pos[:, :, 0] += (pos[:, -1, 0].unsqueeze(-1) + 1)
                 pos = torch.cat((pos, add_pos), dim=1)
-          
 
         if pose_embedding is not None:
             x = torch.cat((x, pose_embedding), dim=1)
@@ -181,10 +184,9 @@ class AsymmetricMaskedCroCoMulti(CroCoNet):
             x = blk(x, pos)
 
         x = self.enc_norm(x)
-        return x, pos, P 
+        return x, pos, P
 
-    def _decoder(self, feat, pos, intrinsics_embed=None,  pose_embedding=None, extra_embed=None, num_target=0):
-        
+    def _decoder(self, feat, pos, intrinsics_embed=None, pose_embedding=None, extra_embed=None, num_target=0):
 
         if intrinsics_embed is not None:
             if self.intrinsics_embed_type == 'linear':
@@ -195,14 +197,12 @@ class AsymmetricMaskedCroCoMulti(CroCoNet):
                 add_pos = pos[:, :, 0:1, :].clone()
                 add_pos[:, :, :, 0] += (pos[:, :, -1, 0].unsqueeze(-1) + 1)
                 pos = torch.cat((pos, add_pos), dim=2)
-          
 
         if pose_embedding is not None:
             feat = torch.cat((feat, pose_embedding), dim=2)
             add_pos = pos[:, :, 0:1, :].clone()
             add_pos[:, :, :, 0] += (pos[:, :, -1, 0].unsqueeze(-1) + 1)
             pos = torch.cat((pos, add_pos), dim=2)
-
 
         b, v, l, c = feat.shape
 
@@ -241,15 +241,15 @@ class AsymmetricMaskedCroCoMulti(CroCoNet):
             # Step 2: Remove self-attention and stack into shape [v, v-1]
             bool_mask = []
             for i in range(v):
-                row = torch.cat([mask[i, :i], mask[i, i+1:]])
+                row = torch.cat([mask[i, :i], mask[i, i + 1:]])
                 bool_mask.append(row)
             bool_mask = torch.stack(bool_mask)  # shape [v, v-1]
 
             # Step 3: Convert to additive mask: True -> 0, False -> -inf
-            mask = torch.where(bool_mask, torch.tensor(0.0), float("-inf")) # [v, v-1]
-            return mask  
-        
-        pos_ctx = generate_ctx_views(pos) # [b, v, v-1, l, 2]: [1, 3, 2, 258, 2]
+            mask = torch.where(bool_mask, torch.tensor(0.0), float("-inf"))  # [v, v-1]
+            return mask
+
+        pos_ctx = generate_ctx_views(pos)  # [b, v, v-1, l, 2]: [1, 3, 2, 258, 2]
 
         ## Two implementations are both OK.
         ## ************ mask v1 ************
@@ -259,7 +259,7 @@ class AsymmetricMaskedCroCoMulti(CroCoNet):
         # masks = masks.repeat_interleave(l, dim=1) # [v, (v-1)*l]
         # masks = masks.unsqueeze(1).repeat(1, l, 1) # [v, l, (v-1)*l]
         # masks = masks.unsqueeze(0).repeat(b, 1, 1, 1).to(feat.device) # [b, v, l, (v-1)*l]
-        
+
         # for blk1, blk2 in zip(self.dec_blocks, self.dec_blocks2):
         #     feat_current = final_output[-1] # [b, v, l, c]
         #     feat_current_ctx = generate_ctx_views(feat_current) # [b, v, (v-1), l, c]
@@ -280,29 +280,33 @@ class AsymmetricMaskedCroCoMulti(CroCoNet):
 
         ## ************ mask v2, more efficient ************
         for blk1, blk2 in zip(self.dec_blocks, self.dec_blocks2):
-            feat_current = final_output[-1] # [b, v, l, c]
-            feat_current_ctx = generate_ctx_views(feat_current) # [b, v, (v-1), l, c]
+            feat_current = final_output[-1]  # [b, v, l, c]
+            feat_current_ctx = generate_ctx_views(feat_current)  # [b, v, (v-1), l, c]
             # img1 side
-            f1, _ = blk1(feat_current[:, 0].contiguous(), feat_current_ctx[:, 0, :v-1-num_target].flatten(1,2).contiguous(), pos[:, 0].contiguous(), pos_ctx[:, 0, :v-1-num_target].flatten(1,2).contiguous())
+            f1, _ = blk1(feat_current[:, 0].contiguous(),
+                         feat_current_ctx[:, 0, :v - 1 - num_target].flatten(1, 2).contiguous(), pos[:, 0].contiguous(),
+                         pos_ctx[:, 0, :v - 1 - num_target].flatten(1, 2).contiguous())
             f1 = f1.unsqueeze(1)
             # img2 side
-            f2, _ = blk2(rearrange(feat_current[:, 1:v-num_target], "b v l c -> (b v) l c"),
-                         rearrange(feat_current_ctx[:, 1:v-num_target, :v-1-num_target].flatten(2,3), "b v l c -> (b v) l c"),
-                         rearrange(pos[:, 1:v-num_target].contiguous(), "b v l c -> (b v) l c"),
-                         rearrange(pos_ctx[:, 1:v-num_target, :v-1-num_target].flatten(2,3).contiguous(), "b v l c -> (b v) l c")
-                         )  
-            f2 = rearrange(f2, "(b v) l c -> b v l c", b=b, v=v-1-num_target)
+            f2, _ = blk2(rearrange(feat_current[:, 1:v - num_target], "b v l c -> (b v) l c"),
+                         rearrange(feat_current_ctx[:, 1:v - num_target, :v - 1 - num_target].flatten(2, 3),
+                                   "b v l c -> (b v) l c"),
+                         rearrange(pos[:, 1:v - num_target].contiguous(), "b v l c -> (b v) l c"),
+                         rearrange(pos_ctx[:, 1:v - num_target, :v - 1 - num_target].flatten(2, 3).contiguous(),
+                                   "b v l c -> (b v) l c")
+                         )
+            f2 = rearrange(f2, "(b v) l c -> b v l c", b=b, v=v - 1 - num_target)
 
             if num_target > 0:
-                f2_tgt, _ = blk2(rearrange(feat_current[:, v-num_target:], "b v l c -> (b v) l c"),
-                            rearrange(feat_current_ctx[:, v-num_target:].flatten(2,3), "b v l c -> (b v) l c"),
-                            rearrange(pos[:, v-num_target:].contiguous(), "b v l c -> (b v) l c"),
-                            rearrange(pos_ctx[:, v-num_target:].flatten(2,3).contiguous(), "b v l c -> (b v) l c")
-                            )  
+                f2_tgt, _ = blk2(rearrange(feat_current[:, v - num_target:], "b v l c -> (b v) l c"),
+                                 rearrange(feat_current_ctx[:, v - num_target:].flatten(2, 3), "b v l c -> (b v) l c"),
+                                 rearrange(pos[:, v - num_target:].contiguous(), "b v l c -> (b v) l c"),
+                                 rearrange(pos_ctx[:, v - num_target:].flatten(2, 3).contiguous(),
+                                           "b v l c -> (b v) l c")
+                                 )
                 f2_tgt = rearrange(f2_tgt, "(b v) l c -> b v l c", b=b, v=num_target)
                 f2 = torch.cat([f2, f2_tgt], dim=1)
 
-            
             # store the result
             final_output.append(torch.cat((f1, f2), dim=1))
         #######################################################
@@ -314,56 +318,57 @@ class AsymmetricMaskedCroCoMulti(CroCoNet):
         final_output[-1] = rearrange(last_feat, "(b v) l c -> b v l c", b=b, v=v)
         return final_output
 
-    def forward(self,
-                context: dict,
-                target_num_views: int = 0,
-                symmetrize_batch=False,
-                return_views=False,
-                ):
+    def encode_context(self, context: dict):
         b, v, _, h, w = context["image"].shape
-            
+
         images_all = context["image"]
 
-
-        #****************** encoder *******************************
+        # ****************** encoder *******************************
         # camera embedding in the encoder
         if self.intrinsics_embed_loc == 'encoder' and self.intrinsics_embed_type == 'pixelwise':
-            intrinsic_embedding = get_intrinsic_embedding(context, degree=self.intrinsics_embed_degree) # (b, v, 25, h w)
-            images_all = torch.cat((images_all, intrinsic_embedding), dim=2) # (b, v, 28, h w)
+            intrinsic_embedding = get_intrinsic_embedding(context,
+                                                          degree=self.intrinsics_embed_degree)  # (b, v, 25, h w)
+            images_all = torch.cat((images_all, intrinsic_embedding), dim=2)  # (b, v, 28, h w)
 
-        
         intrinsic_embedding_all = None
-        if self.intrinsics_embed_loc == 'encoder' and (self.intrinsics_embed_type == 'token' or self.intrinsics_embed_type == 'linear'):
+        if self.intrinsics_embed_loc == 'encoder' and (
+                self.intrinsics_embed_type == 'token' or self.intrinsics_embed_type == 'linear'):
             intrinsic_embedding = self.intrinsic_encoder(context["intrinsics"].flatten(2))
             intrinsic_embedding_all = rearrange(intrinsic_embedding, "b v c -> (b v) c").unsqueeze(1)
 
-
         pose_embedding_all = None
         if self.pose_embed_loc == 'encoder' and self.pose_embed_type == 'learnable_token':
-            pose_embedding = self.pose_token.expand(b, v, *self.pose_token.shape[2:]) 
+            pose_embedding = self.pose_token.expand(b, v, *self.pose_token.shape[2:])
             pose_embedding_all = rearrange(pose_embedding, "b v ... -> (b v) ...")
-
 
         # step 1: encoder input images
         images_all = rearrange(images_all, "b v c h w -> (b v) c h w")
-        shape_all = torch.tensor(images_all.shape[-2:])[None].repeat(b*v, 1)
+        shape_all = torch.tensor(images_all.shape[-2:])[None].repeat(b * v, 1)
 
+        feat, pos, P = self._encode_image(images_all, shape_all, intrinsic_embedding_all,
+                                          pose_embedding=pose_embedding_all)  # (bv, n_tokens, 1024)
 
-        feat, pos, P = self._encode_image(images_all, shape_all, intrinsic_embedding_all, pose_embedding=pose_embedding_all) # (bv, n_tokens, 1024)
-        #****************** decoder *******************************
-        
-        intrinsic_embedding = None
-        if self.intrinsics_embed_loc == 'decoder' and (self.intrinsics_embed_type == 'token' or self.intrinsics_embed_type == 'linear'):
-            intrinsic_embedding = self.intrinsic_encoder(context["intrinsics"].flatten(2)).unsqueeze(2)
-        
-        pose_embedding = None
-        if self.pose_embed_loc == 'decoder' and self.pose_embed_type == 'learnable_token':
-            pose_embedding = self.pose_token.expand(b, v, *self.pose_token.shape[2:]) 
-        
         feat = rearrange(feat, "(b v) l c -> b v l c", b=b, v=v)
         pos = rearrange(pos, "(b v) l c -> b v l c", b=b, v=v)
+        shape = rearrange(shape_all, "(b v) c -> b v c", b=b, v=v)
+        images = rearrange(images_all, "(b v) c h w -> b v c h w", b=b, v=v)
 
-        dec_feat = self._decoder(feat, pos.contiguous(), intrinsics_embed=intrinsic_embedding, pose_embedding=pose_embedding, num_target=target_num_views)
+        return feat, pos, shape, images, P
+
+    def decode_context(self, context: dict, feat, pos, patch_tokens: int, target_num_views: int = 0):
+        b, v = feat.shape[:2]
+
+        intrinsic_embedding = None
+        if self.intrinsics_embed_loc == 'decoder' and (
+                self.intrinsics_embed_type == 'token' or self.intrinsics_embed_type == 'linear'):
+            intrinsic_embedding = self.intrinsic_encoder(context["intrinsics"].flatten(2)).unsqueeze(2)
+
+        pose_embedding = None
+        if self.pose_embed_loc == 'decoder' and self.pose_embed_type == 'learnable_token':
+            pose_embedding = self.pose_token.expand(b, v, *self.pose_token.shape[2:])
+
+        dec_feat = self._decoder(feat, pos.contiguous(), intrinsics_embed=intrinsic_embedding,
+                                 pose_embedding=pose_embedding, num_target=target_num_views)
 
         pose_feat = None
         if self.pose_embed_loc != 'none' and self.pose_embed_type == 'learnable_token':
@@ -374,18 +379,27 @@ class AsymmetricMaskedCroCoMulti(CroCoNet):
             if self.pose_embed_loc != 'none' and self.pose_embed_type == 'learnable_token':
                 pose_feat.append(dec_feat[i][:, :, -1:])
 
-            dec_feat[i] = dec_feat[i][:, :, :P]
+            dec_feat[i] = dec_feat[i][:, :, :patch_tokens]
 
-        
-        shape = rearrange(shape_all, "(b v) c -> b v c", b=b, v=v)
-        images = rearrange(images_all, "(b v) c h w -> b v c h w", b=b, v=v)
+        return dec_feat, pose_feat
 
+    def forward(self,
+                context: dict,
+                target_num_views: int = 0,
+                symmetrize_batch=False,
+                return_views=False,
+                ):
+        feat, pos, shape, images, P = self.encode_context(context)
+        dec_feat, pose_feat = self.decode_context(context, feat, pos, P, target_num_views)
 
         out = dict()
         out['dec_feat'] = dec_feat
         out['shape'] = shape
         out['images'] = images
-        
+        out['enc_feat'] = feat
+        out['enc_pos'] = pos
+        out['patch_tokens'] = P
+
         if pose_feat is not None:
             out['pose_feat'] = pose_feat
 

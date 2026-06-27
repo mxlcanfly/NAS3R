@@ -65,6 +65,8 @@ train:
   random_drop_target_views: true
 
   pretrain_camera_head: false
+  debug_save_every_n_steps: 500
+  debug_save_dir: debug_densification
 
 
 test:
@@ -87,4 +89,4 @@ trainer:
 
 hydra:
   run:
-    dir: outputs/exp_${wandb.name}/${now:%Y-%m-%d_%H-%M-%S}
+    dir: /space0/mengxl/NAS3R-master/outputs/exp_${wandb.name}/${now:%Y-%m-%d_%H-%M-%S}
