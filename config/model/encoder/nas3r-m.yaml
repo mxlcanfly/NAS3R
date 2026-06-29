@@ -31,6 +31,8 @@ apply_bounds_shim: true
 gs_params_head_type: dpt_gs
 pose_free: true
 pretrained_weights: ""
+use_swinir_sr: true
+swinir_weight_path: "/space0/mengxl/NAS3R-master/pretrained_weights/001_classicalSR_DF2K_s64w8_SwinIR-M_x4.pth"
 
 pose_make_baseline_1: false
 pose_make_relative: true
