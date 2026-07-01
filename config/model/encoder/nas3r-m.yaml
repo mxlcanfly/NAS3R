@@ -52,3 +52,19 @@ depth_activation: 'sigmoid'
 
 equal_fxfy: true
 equal_view_intrinsics: true
+
+sr_branch:
+  enabled: true
+  weight_path: "/space0/mengxl/NAS3R-master/pretrained_weights/001_classicalSR_DF2K_s64w8_SwinIR-M_x4.pth"
+  upscale: 4
+  img_size: 64
+  window_size: 8
+  freeze_lr_branch: true
+  share_lr_backbone: false
+  output_key: sr_tokens
+  resunet_enabled: true
+  resunet_output_key: sr_resunet_features
+  resunet_feature_dims: [32, 64, 128]
+  freeze_resunet: false
+  fusion_dpt_enabled: true
+  fusion_dpt_output_key: sr_fusion_dpt_feature

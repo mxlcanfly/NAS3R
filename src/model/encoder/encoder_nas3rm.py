@@ -1,5 +1,5 @@
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, Optional
 
 import torch
@@ -10,9 +10,10 @@ from torch import Tensor, nn
 import math
 
 from .backbone.croco.misc import transpose_to_landscape
+from .heads.fusion_dpt import create_fusion_dpt
 from .heads import head_factory, camera_head_factory
 from ...dataset.shims.bounds_shim import apply_bounds_shim
-from ...dataset.shims.normalize_shim import apply_normalize_shim, normalize_image
+from ...dataset.shims.normalize_shim import apply_normalize_shim, inverse_normalize_image, normalize_image
 from ...dataset.shims.patch_shim import apply_patch_shim
 from ...dataset.types import BatchedExample, DataShim
 from ...geometry.projection import sample_image_grid
@@ -24,6 +25,8 @@ from .visualization.encoder_visualizer_epipolar_cfg import EncoderVisualizerEpip
 from ...misc.cam_utils import camera_normalization, convert_pose_to_4x4, depth_projector, \
     unproject_depth_map_to_point_map_batch
 from .heads.pose_head import PoseHeadCfg
+from .resunet_fusion import ImageNetResUnetFeatureExtractor
+from ..super_resolution import FrozenSwinIRUpsampler
 
 inf = float('inf')
 
@@ -33,6 +36,24 @@ class OpacityMappingCfg:
     initial: float
     final: float
     warm_up: int
+
+
+@dataclass
+class SwinIRBranchCfg:
+    enabled: bool = False
+    weight_path: str = ""
+    upscale: int = 4
+    img_size: int = 64
+    window_size: int = 8
+    freeze_lr_branch: bool = True
+    share_lr_backbone: bool = False
+    output_key: str = "sr_tokens"
+    resunet_enabled: bool = True
+    resunet_output_key: str = "sr_resunet_features"
+    resunet_feature_dims: list[int] = field(default_factory=lambda: [32, 64, 128])
+    freeze_resunet: bool = False
+    fusion_dpt_enabled: bool = True
+    fusion_dpt_output_key: str = "sr_fusion_dpt_feature"
 
 
 @dataclass
@@ -64,6 +85,7 @@ class EncoderNAS3RMCfg:
 
     equal_fxfy: bool = True
     equal_view_intrinsics: bool = True
+    sr_branch: SwinIRBranchCfg = field(default_factory=SwinIRBranchCfg)
 
 
 def rearrange_head(feat, patch_size, H, W):
@@ -108,6 +130,148 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
 
         if self.cfg.estimating_pose:
             self.set_pose_head(cfg, cfg.pose_head_type)
+
+        self.sr_upsampler = self._build_sr_upsampler(cfg.sr_branch)
+        self.sr_backbone = self._build_sr_backbone(cfg.sr_branch)
+        self.sr_resunet = self._build_sr_resunet(cfg.sr_branch)
+        self.sr_fusion_dpt = self._build_sr_fusion_dpt(cfg.sr_branch)
+        if cfg.sr_branch.enabled and cfg.sr_branch.freeze_lr_branch:
+            self.freeze_lr_branch()
+
+    def _build_sr_upsampler(self, cfg: SwinIRBranchCfg) -> nn.Module | None:
+        if not cfg.enabled:
+            return None
+        if not cfg.weight_path:
+            raise ValueError("sr_branch.weight_path must be set when sr_branch.enabled is true.")
+        return FrozenSwinIRUpsampler(
+            weight_path=cfg.weight_path,
+            upscale=cfg.upscale,
+            img_size=cfg.img_size,
+            window_size=cfg.window_size,
+        )
+
+    def _build_sr_backbone(self, cfg: SwinIRBranchCfg) -> nn.Module | None:
+        if not cfg.enabled:
+            return None
+        if cfg.share_lr_backbone:
+            return self.backbone
+        return deepcopy(self.backbone)
+
+    def _build_sr_resunet(self, cfg: SwinIRBranchCfg) -> nn.Module | None:
+        if not cfg.enabled or not cfg.resunet_enabled:
+            return None
+
+        feature_dims = tuple(cfg.resunet_feature_dims)
+        if len(feature_dims) != 3:
+            raise ValueError("sr_branch.resunet_feature_dims must contain exactly three channel sizes.")
+
+        resunet = ImageNetResUnetFeatureExtractor(feature_dims=feature_dims)
+        if cfg.freeze_resunet:
+            self._set_trainable(resunet, False)
+        return resunet
+
+    def _build_sr_fusion_dpt(self, cfg: SwinIRBranchCfg) -> nn.Module | None:
+        if not cfg.enabled or not cfg.fusion_dpt_enabled:
+            return None
+        if not cfg.resunet_enabled:
+            raise ValueError("sr_branch.resunet_enabled must be true when fusion_dpt_enabled is true.")
+
+        feature_dims = tuple(cfg.resunet_feature_dims)
+        if len(feature_dims) != 3:
+            raise ValueError("sr_branch.resunet_feature_dims must contain exactly three channel sizes.")
+
+        return create_fusion_dpt(self.sr_backbone, resunet_channels=feature_dims)
+
+    def load_state_dict(self, state_dict, strict: bool = True):
+        has_sr_backbone = any(key.startswith("sr_backbone.") for key in state_dict)
+        if self.sr_backbone is not None and self.sr_backbone is not self.backbone and not has_sr_backbone:
+            state_dict = dict(state_dict)
+            for key, value in list(state_dict.items()):
+                if key.startswith("backbone."):
+                    state_dict[f"sr_{key}"] = value
+        result = super().load_state_dict(state_dict, strict=strict)
+        if self.sr_backbone is not None and self.sr_backbone is not self.backbone and not has_sr_backbone:
+            self.sr_backbone.load_state_dict(self.backbone.state_dict())
+        return result
+
+    @staticmethod
+    def _set_trainable(module: nn.Module | None, trainable: bool) -> None:
+        if module is None:
+            return
+        if not isinstance(module, nn.Module):
+            return
+        for parameter in module.parameters():
+            parameter.requires_grad = trainable
+
+    def freeze_lr_branch(self) -> None:
+        """Freeze the original LR path while leaving added SR modules configurable."""
+        lr_modules = [
+            self.backbone,
+            getattr(self, "downstream_depth_head1", None),
+            getattr(self, "downstream_depth_head2", None),
+            getattr(self, "gaussian_param_head", None),
+            getattr(self, "gaussian_param_head2", None),
+            getattr(self, "pose_head", None),
+            getattr(self, "pose_head2", None),
+        ]
+        for module in lr_modules:
+            self._set_trainable(module, False)
+
+    def _sr_target_size(self, context: dict, target: Optional[dict]) -> tuple[int, int]:
+        if target is not None and "image" in target:
+            return target["image"].shape[-2:]
+        return context["image"].shape[-2:]
+
+    def _make_sr_context_image(
+        self,
+        context_image: Tensor,
+        target_size: tuple[int, int],
+    ) -> Tensor:
+        if self.sr_upsampler is None:
+            raise RuntimeError("SR upsampler is not initialized.")
+
+        sr_image = self.sr_upsampler(context_image)
+        if sr_image.shape[-2:] != target_size:
+            *batch, c, h, w = sr_image.shape
+            sr_image = rearrange(sr_image, "... c h w -> (...) c h w")
+            sr_image = F.interpolate(sr_image, size=target_size, mode="bicubic", align_corners=False)
+            sr_image = sr_image.reshape(*batch, c, *target_size)
+        return sr_image.clamp(0, 1)
+
+    def _swinir_input_image(self, context: dict, context_image: Tensor) -> Tensor:
+        if "image_lr" in context:
+            return context_image
+        return inverse_normalize_image(context_image, self.cfg.input_mean, self.cfg.input_std).clamp(0, 1)
+
+    def _encode_sr_context(
+        self,
+        context: dict,
+        context_image: Tensor,
+        target: Optional[dict],
+    ) -> dict:
+        target_size = self._sr_target_size(context, target)
+        sr_image = self._make_sr_context_image(self._swinir_input_image(context, context_image), target_size)
+        sr_context = {
+            "image": normalize_image(sr_image),
+            "intrinsics": context["intrinsics"],
+        }
+        sr_out = self.sr_backbone(sr_context, target_num_views=0)
+        output = {
+            self.cfg.sr_branch.output_key: sr_out["dec_feat"],
+            "sr_image": sr_image,
+            "sr_shape": sr_out["shape"],
+        }
+        sr_resunet_features = None
+        if self.sr_resunet is not None:
+            sr_resunet_features = self.sr_resunet(sr_image)
+            output[self.cfg.sr_branch.resunet_output_key] = sr_resunet_features
+        if self.sr_fusion_dpt is not None:
+            output[self.cfg.sr_branch.fusion_dpt_output_key] = self.sr_fusion_dpt(
+                sr_out["dec_feat"],
+                sr_resunet_features,
+                target_size,
+            )
+        return output
 
     def set_depth_head(self, output_mode, head_type, landscape_only, depth_mode, conf_mode):
         self.backbone.depth_mode = depth_mode
@@ -191,6 +355,10 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             }
             # Encode the context images.
             out = self.backbone(context_input)
+
+        sr_branch_output = None
+        if self.sr_upsampler is not None:
+            sr_branch_output = self._encode_sr_context(context, context_image, target)
 
         dec_feat, shape, images = out['dec_feat'], out['shape'], out['images']
 
@@ -319,6 +487,9 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             encoder_output['intrinsics']['c'] = pred_intrinsics[:, :v_cxt]
             if target is not None:
                 encoder_output['intrinsics']['cwt'] = pred_intrinsics
+
+        if sr_branch_output is not None:
+            encoder_output.update(sr_branch_output)
 
         return encoder_output
 
