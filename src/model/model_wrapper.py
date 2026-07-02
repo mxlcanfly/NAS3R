@@ -45,6 +45,7 @@ from ..visualization.validation_in_3d import render_cameras, render_projections,
 from .decoder.decoder import Decoder, DepthRenderingMode
 from .encoder import Encoder
 from .encoder.visualization.encoder_visualizer import EncoderVisualizer
+from .ply_export import export_ply
 from ..misc.intrinsics_utils import estimate_intrinsics
 from ..evaluation.metrics import compute_pose_error, compute_pose_error_for_batch
 from ..misc.cam_utils import pose_auc
@@ -88,6 +89,7 @@ class TrainCfg:
     random_drop_target_views: bool = False
 
     pretrain_camera_head: bool = False
+    debug_save_every_n_steps: int = 500
 
 
 def dropout_context_views(v_cxt):
@@ -285,6 +287,18 @@ class ModelWrapper(LightningModule):
         )
         self.log(f"train/psnr", psnr.mean())
 
+        self.save_child_gaussian_debug(
+            batch=batch,
+            encoder_output=encoder_output,
+            child_output=output,
+            target_gt=target_gt,
+            extrinsics=extrinsics,
+            intrinsics=intrinsics,
+            near=near,
+            far=far,
+            image_shape=(h, w),
+        )
+
         # Compute and log loss.
         for loss_fn in self.losses:
             if loss_fn.name in ['mse', 'lpips']:
@@ -326,6 +340,72 @@ class ModelWrapper(LightningModule):
             self.step_tracker.set_step(self.global_step)
 
         return total_loss
+
+    @rank_zero_only
+    def save_child_gaussian_debug(
+        self,
+        batch: BatchedExample,
+        encoder_output: dict,
+        child_output,
+        target_gt: Tensor,
+        extrinsics: Tensor,
+        intrinsics: Tensor,
+        near: Tensor,
+        far: Tensor,
+        image_shape: tuple[int, int],
+    ) -> None:
+        save_every = self.train_cfg.debug_save_every_n_steps
+        if save_every <= 0 or self.global_step % save_every != 0:
+            return
+        if "lr_gaussians" not in encoder_output:
+            return
+
+        checkpoint_dir = Path("checkpoints")
+        trainer = getattr(self, "trainer", None)
+        checkpoint_callback = getattr(trainer, "checkpoint_callback", None)
+        callback_dir = getattr(checkpoint_callback, "dirpath", None)
+        if callback_dir is not None:
+            checkpoint_dir = Path(callback_dir)
+        step_dir = checkpoint_dir / "debug_child_gaussians" / f"step_{self.global_step:0>6}"
+        step_dir.mkdir(parents=True, exist_ok=True)
+
+        with torch.no_grad():
+            lr_output = self.decoder.forward(
+                encoder_output["lr_gaussians"],
+                extrinsics,
+                intrinsics,
+                near,
+                far,
+                image_shape,
+                depth_mode=self.train_cfg.depth_mode,
+            )
+
+            target_img = target_gt[0, 0].detach().clamp(0, 1)
+            child_img = child_output.color[0, 0].detach().clamp(0, 1)
+            lr_img = lr_output.color[0, 0].detach().clamp(0, 1)
+            child_depth = vis_depth_map(child_output.depth[0, :1])[0].detach().clamp(0, 1)
+            lr_depth = vis_depth_map(lr_output.depth[0, :1])[0].detach().clamp(0, 1)
+
+            comparison = hcat(
+                add_label(target_img, "target"),
+                add_label(child_img, "child render"),
+                add_label(lr_img, "lr gs render"),
+                add_label(child_depth, "child depth"),
+                add_label(lr_depth, "lr gs depth hr"),
+            )
+            save_image(add_border(comparison), step_dir / "render_compare.png")
+
+            child_gaussians = encoder_output["gaussians"]
+            export_ply(
+                extrinsics[0, 0],
+                child_gaussians.means[0],
+                child_gaussians.scales[0],
+                child_gaussians.rotations[0],
+                child_gaussians.harmonics[0],
+                child_gaussians.opacities[0],
+                step_dir / "child_gaussians.ply",
+                save_sh_dc_only=True,
+            )
 
     def test_step(self, batch, batch_idx):
         v_cxt = batch["context"]["image"].shape[1]
@@ -961,6 +1041,16 @@ class ModelWrapper(LightningModule):
         new_params, new_param_names = [], []
         pretrained_params, pretrained_param_names = [], []
 
+        new_module_keywords = (
+            "encoder.sr_upsampler",
+            "encoder.sr_backbone",
+            "encoder.sr_resunet",
+            "encoder.sr_fusion_dpt",
+            "encoder.lr_anchor_sr_sampler",
+            "encoder.gd_anchor_densifier",
+            "encoder.child_gaussian_decoder",
+        )
+
         has_pretrained_backbone = getattr(self.encoder.backbone.cfg, "pretrained", False)
         has_pretrained_encoder_weights = bool(getattr(self.encoder.cfg, "pretrained_weights", ""))
         if not (has_pretrained_backbone or has_pretrained_encoder_weights):
@@ -974,8 +1064,14 @@ class ModelWrapper(LightningModule):
                 if not param.requires_grad:
                     continue
 
+                # Newly added SR/densification/child-GS modules should be optimized
+                # with the main LR even when the original LR encoder is pretrained.
+                if any(keyword in name for keyword in new_module_keywords):
+                    new_params.append(param)
+                    new_param_names.append(name)
+
                 # Heads that are always treated as new
-                if any(x in name for x in ["gaussian_param_head", "intrinsic_encoder"]):
+                elif any(x in name for x in ["gaussian_param_head", "intrinsic_encoder"]):
                     new_params.append(param)
                     new_param_names.append(name)
                     # print(name)

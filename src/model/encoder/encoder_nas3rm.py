@@ -4,7 +4,7 @@ from typing import Literal, Optional
 
 import torch
 import torch.nn.functional as F
-from einops import rearrange
+from einops import rearrange, repeat
 from jaxtyping import Float
 from torch import Tensor, nn
 import math
@@ -18,13 +18,17 @@ from ...dataset.shims.patch_shim import apply_patch_shim
 from ...dataset.types import BatchedExample, DataShim
 from ...geometry.projection import sample_image_grid
 from ..types import Gaussians
+from ..decoder.cuda_splatting import render_cuda
 from .backbone import Backbone, BackboneCfg, get_backbone
+from .child_gaussian_feature_decoder import ChildGaussianFeatureDecoder, ChildGaussianFeatureDecoderCfg
 from .common.gaussian_adapter import GaussianAdapter, GaussianAdapterCfg, UnifiedGaussianAdapter
 from .encoder import Encoder
+from .gd_style_anchor_densifier import GDStyleAnchorDensifier, GDStyleAnchorDensifierCfg
 from .visualization.encoder_visualizer_epipolar_cfg import EncoderVisualizerEpipolarCfg
 from ...misc.cam_utils import camera_normalization, convert_pose_to_4x4, depth_projector, \
     unproject_depth_map_to_point_map_batch
 from .heads.pose_head import PoseHeadCfg
+from .lr_anchor_sr_feature_sampler import LRAnchorSRFeatureSampler
 from .resunet_fusion import ImageNetResUnetFeatureExtractor
 from ..super_resolution import FrozenSwinIRUpsampler
 
@@ -54,6 +58,14 @@ class SwinIRBranchCfg:
     freeze_resunet: bool = False
     fusion_dpt_enabled: bool = True
     fusion_dpt_output_key: str = "sr_fusion_dpt_feature"
+    anchor_sampler_enabled: bool = True
+    anchor_sampler_patch_size: int = 4
+    anchor_sampler_padding_mode: str = "border"
+    anchor_sampler_output_key: str = "lr_anchor_sr_features"
+    anchor_render_background_color: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
+    anchor_render_scale_invariant: bool = True
+    gd_densifier: GDStyleAnchorDensifierCfg = field(default_factory=GDStyleAnchorDensifierCfg)
+    child_gaussian_decoder: ChildGaussianFeatureDecoderCfg = field(default_factory=ChildGaussianFeatureDecoderCfg)
 
 
 @dataclass
@@ -135,6 +147,14 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
         self.sr_backbone = self._build_sr_backbone(cfg.sr_branch)
         self.sr_resunet = self._build_sr_resunet(cfg.sr_branch)
         self.sr_fusion_dpt = self._build_sr_fusion_dpt(cfg.sr_branch)
+        self.lr_anchor_sr_sampler = self._build_lr_anchor_sr_sampler(cfg.sr_branch)
+        self.gd_anchor_densifier = self._build_gd_anchor_densifier(cfg.sr_branch)
+        self.child_gaussian_decoder = self._build_child_gaussian_decoder(cfg.sr_branch)
+        self.register_buffer(
+            "anchor_render_background_color",
+            torch.tensor(cfg.sr_branch.anchor_render_background_color, dtype=torch.float32),
+            persistent=False,
+        )
         if cfg.sr_branch.enabled and cfg.sr_branch.freeze_lr_branch:
             self.freeze_lr_branch()
 
@@ -181,6 +201,181 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             raise ValueError("sr_branch.resunet_feature_dims must contain exactly three channel sizes.")
 
         return create_fusion_dpt(self.sr_backbone, resunet_channels=feature_dims)
+
+    def _build_lr_anchor_sr_sampler(self, cfg: SwinIRBranchCfg) -> nn.Module | None:
+        if not cfg.enabled or not cfg.anchor_sampler_enabled:
+            return None
+        return LRAnchorSRFeatureSampler(
+            patch_size=cfg.anchor_sampler_patch_size,
+            padding_mode=cfg.anchor_sampler_padding_mode,
+        )
+
+    def _build_gd_anchor_densifier(self, cfg: SwinIRBranchCfg) -> nn.Module | None:
+        if not cfg.enabled or not cfg.anchor_sampler_enabled or not cfg.gd_densifier.enabled:
+            return None
+        return GDStyleAnchorDensifier(cfg.gd_densifier)
+
+    def _build_child_gaussian_decoder(self, cfg: SwinIRBranchCfg) -> nn.Module | None:
+        if not cfg.enabled or not cfg.child_gaussian_decoder.enabled:
+            return None
+        if not cfg.fusion_dpt_enabled:
+            raise ValueError("sr_branch.fusion_dpt_enabled must be true when child_gaussian_decoder is enabled.")
+        return ChildGaussianFeatureDecoder(
+            cfg.child_gaussian_decoder,
+            d_sh=self.gaussian_adapter.d_sh,
+        )
+
+    @staticmethod
+    def _get_first_available(data: dict, keys: tuple[str, ...]) -> Tensor | None:
+        for key in keys:
+            if key in data:
+                return data[key]
+        return None
+
+    @staticmethod
+    def _get_last_dpt_gs_feature(head: nn.Module) -> Tensor:
+        dpt = getattr(head, "dpt", None)
+        feature = getattr(dpt, "last_path_1", None)
+        if feature is None:
+            raise RuntimeError(
+                "The GS DPT head did not expose last_path_1. "
+                "GD-style anchor densification requires dpt_gs_head.py to cache "
+                "the feature after `path_1 = path_1 + direct_img_feat`."
+            )
+        return feature
+
+    def _run_gd_anchor_densifier(
+        self,
+        anchors: Tensor,
+        lr_gs_features: Tensor | None,
+        sampled_feature_output: dict,
+    ) -> dict:
+        if self.gd_anchor_densifier is None:
+            return {}
+        if lr_gs_features is None:
+            return {}
+
+        sampled_features = sampled_feature_output.get(self.cfg.sr_branch.anchor_sampler_output_key)
+        if sampled_features is None:
+            return {}
+
+        densifier_output = self.gd_anchor_densifier(
+            anchors=anchors,
+            lr_gs_features=lr_gs_features,
+            sampled_features=sampled_features,
+        )
+        return {f"gd_anchor_{key}": value for key, value in densifier_output.items()}
+
+    def _run_child_gaussian_decoder(
+        self,
+        sr_branch_output: dict | None,
+        gd_anchor_output: dict,
+        parent_gaussians: Gaussians,
+        extrinsics: Tensor,
+        intrinsics: Tensor,
+    ) -> dict:
+        if self.child_gaussian_decoder is None or sr_branch_output is None:
+            return {}
+        child_centers = gd_anchor_output.get("gd_anchor_child_centers")
+        sr_feature_map = sr_branch_output.get(self.cfg.sr_branch.fusion_dpt_output_key)
+        if child_centers is None or sr_feature_map is None:
+            return {}
+
+        child_output = self.child_gaussian_decoder(
+            child_centers=child_centers,
+            sr_feature_map=sr_feature_map,
+            parent_gaussians=parent_gaussians,
+            extrinsics=extrinsics,
+            intrinsics=intrinsics,
+        )
+        return {
+            "child_gaussians": child_output["gaussians"],
+            "child_gaussian_features": child_output["features"],
+            "child_gaussian_valid": child_output["valid"],
+        }
+
+    def _render_lr_gaussians_for_anchor_sampling(
+        self,
+        gaussians: Gaussians,
+        context: dict,
+        context_extrinsics: Tensor,
+        context_intrinsics: Tensor,
+        image_shape: tuple[int, int],
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        b, v = context_extrinsics.shape[:2]
+        if context["near"].shape[:2] != (b, v) or context["far"].shape[:2] != (b, v):
+            raise ValueError("Context near/far must match context camera batch and view axes.")
+        color, depth, alpha = render_cuda(
+            rearrange(context_extrinsics, "b v i j -> (b v) i j"),
+            rearrange(context_intrinsics, "b v i j -> (b v) i j"),
+            rearrange(context["near"], "b v -> (b v)"),
+            rearrange(context["far"], "b v -> (b v)"),
+            image_shape,
+            repeat(self.anchor_render_background_color, "c -> (b v) c", b=b, v=v),
+            repeat(gaussians.means, "b g xyz -> (b v) g xyz", v=v),
+            repeat(gaussians.covariances, "b g i j -> (b v) g i j", v=v),
+            repeat(gaussians.harmonics, "b g c d_sh -> (b v) g c d_sh", v=v),
+            repeat(gaussians.opacities, "b g -> (b v) g", v=v),
+            repeat(gaussians.rotations, "b g i -> (b v) g i", v=v),
+            repeat(gaussians.scales, "b g i -> (b v) g i", v=v),
+            scale_invariant=self.cfg.sr_branch.anchor_render_scale_invariant,
+            enable_cov_grad=False,
+            enable_sh_grad=False,
+            return_alpha=True,
+        )
+        color = rearrange(color, "(b v) c h w -> b v c h w", b=b, v=v)
+        depth = rearrange(depth, "(b v) 1 h w -> b v h w", b=b, v=v)
+        alpha = rearrange(alpha, "(b v) 1 h w -> b v h w", b=b, v=v)
+        if self.cfg.sr_branch.anchor_render_scale_invariant:
+            depth = depth * context["near"][:, :, None, None]
+        return color, depth, alpha
+
+    def _sample_lr_anchor_sr_features(
+        self,
+        sr_branch_output: dict | None,
+        context: dict,
+        gaussians: Gaussians,
+        anchors: Tensor,
+        extrinsics: Tensor,
+        intrinsics: Tensor,
+    ) -> dict:
+        if self.lr_anchor_sr_sampler is None or sr_branch_output is None:
+            return {}
+
+        sr_image = sr_branch_output.get("sr_image")
+        render_error = self._get_first_available(
+            context,
+            ("render_error_sr", "rendered_error_sr"),
+        )
+        if sr_image is None:
+            return {}
+
+        with torch.no_grad():
+            render_color, render_depth, render_alpha = self._render_lr_gaussians_for_anchor_sampling(
+                gaussians=gaussians,
+                context=context,
+                context_extrinsics=extrinsics,
+                context_intrinsics=intrinsics,
+                image_shape=sr_image.shape[-2:],
+            )
+            if render_error is None:
+                render_error = sr_image - render_color
+            feature_stack = self.lr_anchor_sr_sampler.build_feature_stack(
+                sr_image=sr_image,
+                render_color=render_color,
+                render_depth=render_depth,
+                render_alpha=render_alpha,
+                render_error=render_error,
+            )
+            sampled_features = self.lr_anchor_sr_sampler(
+                anchors=anchors,
+                feature_stack=feature_stack,
+                extrinsics=extrinsics,
+                intrinsics=intrinsics,
+            )
+        return {
+            self.cfg.sr_branch.anchor_sampler_output_key: sampled_features,
+        }
 
     def load_state_dict(self, state_dict, strict: bool = True):
         has_sr_backbone = any(key.startswith("sr_backbone.") for key in state_dict)
@@ -365,6 +560,7 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
         with torch.amp.autocast('cuda', enabled=False):
             all_other_params = []
             all_depth_res = []
+            all_lr_gs_features = []
 
             if self.cfg.estimating_pose:
                 all_pose_params = []
@@ -382,11 +578,17 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             if 'dpt' in self.gs_params_head_type:
                 GS_res1 = self.gaussian_param_head([tok[:, 0].float() for tok in dec_feat], images[:, 0, :3],
                                                    shape[0, 0].cpu().tolist())
+                all_lr_gs_features.append(
+                    rearrange(self._get_last_dpt_gs_feature(self.gaussian_param_head), "b c h w -> b (h w) c")
+                )
                 GS_res1 = rearrange(GS_res1, "b d h w -> b (h w) d")
                 all_other_params.append(GS_res1)
                 for i in range(1, v_cxt):
                     GS_res2 = self.gaussian_param_head2([tok[:, i].float() for tok in dec_feat], images[:, i, :3],
                                                         shape[0, i].cpu().tolist())
+                    all_lr_gs_features.append(
+                        rearrange(self._get_last_dpt_gs_feature(self.gaussian_param_head2), "b c h w -> b (h w) c")
+                    )
                     GS_res2 = rearrange(GS_res2, "b d h w -> b (h w) d")
                     all_other_params.append(GS_res2)
             else:
@@ -409,6 +611,7 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
                         all_intrin_params.append(pose_res2['intrinsics'])
 
         gaussians = torch.stack(all_other_params, dim=1)  # [b, v, 65536, 83]
+        lr_gs_features = torch.stack(all_lr_gs_features, dim=1) if all_lr_gs_features else None
         # print("gaussians", gaussians.shape)
 
         if self.cfg.estimating_pose:
@@ -436,6 +639,7 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
         depth_to_pts_all = rearrange(point_map_from_depth, "(b v) ... -> b v ...", b=b, v=v_cxt)
         depth_to_pts_all = rearrange(depth_to_pts_all, "b v h w xyz -> b v (h w) xyz")
         # print("depth_to_pts_all", depth_to_pts_all[0,0,0])
+        lr_anchors = depth_to_pts_all
         depth_to_pts_all = depth_to_pts_all.unsqueeze(-2)
         gaussian_params = rearrange(gaussians, "... (srf c) -> ... srf c",
                                     srf=self.cfg.num_surfaces)  # for cfg.num_surfaces
@@ -467,7 +671,7 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
 
         encoder_output = dict()
 
-        encoder_output["gaussians"] = Gaussians(
+        flat_gaussians = Gaussians(
             rearrange(gaussians.means, "b v r srf spp xyz -> b (v r srf spp) xyz"),
             rearrange(gaussians.covariances, "b v r srf spp i j -> b (v r srf spp) i j"),
             rearrange(gaussians.rotations, "b v r srf spp i  -> b (v r srf spp) i "),
@@ -475,6 +679,30 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             rearrange(gaussians.harmonics, "b v r srf spp c d_sh -> b (v r srf spp) c d_sh"),
             rearrange(gaussians.opacities, "b v r srf spp -> b (v r srf spp)"),
         )
+        encoder_output["gaussians"] = flat_gaussians
+        lr_anchor_sr_features = self._sample_lr_anchor_sr_features(
+            sr_branch_output,
+            context,
+            flat_gaussians,
+            lr_anchors,
+            context_extrinsics,
+            context_intrinsics,
+        )
+        gd_anchor_output = self._run_gd_anchor_densifier(
+            anchors=lr_anchors,
+            lr_gs_features=lr_gs_features,
+            sampled_feature_output=lr_anchor_sr_features,
+        )
+        child_gaussian_output = self._run_child_gaussian_decoder(
+            sr_branch_output=sr_branch_output,
+            gd_anchor_output=gd_anchor_output,
+            parent_gaussians=flat_gaussians,
+            extrinsics=context_extrinsics,
+            intrinsics=context_intrinsics,
+        )
+        if child_gaussian_output:
+            encoder_output["lr_gaussians"] = flat_gaussians
+            encoder_output["gaussians"] = child_gaussian_output["child_gaussians"]
 
         if self.cfg.estimating_pose:
             encoder_output['extrinsics'] = dict()
@@ -490,6 +718,9 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
 
         if sr_branch_output is not None:
             encoder_output.update(sr_branch_output)
+        encoder_output.update(lr_anchor_sr_features)
+        encoder_output.update(gd_anchor_output)
+        encoder_output.update(child_gaussian_output)
 
         return encoder_output
 
