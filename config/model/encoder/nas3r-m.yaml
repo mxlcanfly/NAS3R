@@ -52,3 +52,7 @@ depth_activation: 'sigmoid'
 
 equal_fxfy: true
 equal_view_intrinsics: true
+
+context_sr_weights: /space0/mengxl/NAS3R-master/pretrained_weights/001_classicalSR_DF2K_s64w8_SwinIR-M_x4.pth
+context_sr_upscale: 4
+context_sr_img_size: 64

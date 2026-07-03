@@ -12,7 +12,7 @@ import math
 from .backbone.croco.misc import transpose_to_landscape
 from .heads import head_factory, camera_head_factory
 from ...dataset.shims.bounds_shim import apply_bounds_shim
-from ...dataset.shims.normalize_shim import apply_normalize_shim, normalize_image
+from ...dataset.shims.normalize_shim import apply_normalize_shim, inverse_normalize_image, normalize_image
 from ...dataset.shims.patch_shim import apply_patch_shim
 from ...dataset.types import BatchedExample, DataShim
 from ...geometry.projection import sample_image_grid
@@ -20,6 +20,7 @@ from ..types import Gaussians
 from .backbone import Backbone, BackboneCfg, get_backbone
 from .common.gaussian_adapter import GaussianAdapter, GaussianAdapterCfg, UnifiedGaussianAdapter
 from .encoder import Encoder
+from ..super_resolution import FrozenSwinIRUpsampler
 from .visualization.encoder_visualizer_epipolar_cfg import EncoderVisualizerEpipolarCfg
 from ...misc.cam_utils import camera_normalization, convert_pose_to_4x4, depth_projector, \
     unproject_depth_map_to_point_map_batch
@@ -65,6 +66,10 @@ class EncoderNAS3RMCfg:
     equal_fxfy: bool = True
     equal_view_intrinsics: bool = True
 
+    context_sr_weights: str = "/space0/mengxl/NAS3R-master/pretrained_weights/001_classicalSR_DF2K_s64w8_SwinIR-M_x4.pth"
+    context_sr_upscale: int = 4
+    context_sr_img_size: int = 64
+
 
 def rearrange_head(feat, patch_size, H, W):
     B = feat.shape[0]
@@ -108,6 +113,14 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
 
         if self.cfg.estimating_pose:
             self.set_pose_head(cfg, cfg.pose_head_type)
+
+        self.context_sr_upsampler = None
+        if self.cfg.context_sr_weights:
+            self.context_sr_upsampler = FrozenSwinIRUpsampler(
+                self.cfg.context_sr_weights,
+                upscale=self.cfg.context_sr_upscale,
+                img_size=self.cfg.context_sr_img_size,
+            )
 
     def set_depth_head(self, output_mode, head_type, landscape_only, depth_mode, conf_mode):
         self.backbone.depth_mode = depth_mode
@@ -171,6 +184,14 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
     ):
         context_image = context.get("image_lr", context["image"])
         target_image = target.get("image_lr", target["image"]) if target is not None else None
+        context_image_sr = None
+        if self.context_sr_upsampler is not None:
+            sr_input = context["image_lr"] if "image_lr" in context else inverse_normalize_image(
+                context["image"],
+                self.cfg.input_mean,
+                self.cfg.input_std,
+            )
+            context_image_sr = self.context_sr_upsampler(sr_input)
 
         device = context_image.device
         b, v_cxt, _, h, w = context_image.shape
@@ -307,6 +328,8 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             rearrange(gaussians.harmonics, "b v r srf spp c d_sh -> b (v r srf spp) c d_sh"),
             rearrange(gaussians.opacities, "b v r srf spp -> b (v r srf spp)"),
         )
+        if context_image_sr is not None:
+            encoder_output["context_image_sr"] = context_image_sr.detach()
 
         if self.cfg.estimating_pose:
             encoder_output['extrinsics'] = dict()
