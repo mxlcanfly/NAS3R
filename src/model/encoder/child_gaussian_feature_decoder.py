@@ -176,7 +176,11 @@ class ChildGaussianFeatureDecoder(nn.Module):
     ) -> dict[str, Tensor | Gaussians]:
         b, v, n, k, _ = child_centers.shape
         flat_child_centers = rearrange(child_centers, "b v n k xyz -> b (v n k) xyz")
-        uv, valid = self._project_points(flat_child_centers, extrinsics, intrinsics)
+        # Detach the projection/sampling path (as in Generative Densification): the
+        # 1/(z+eps) division produces inf gradients for points near any camera plane,
+        # which poisons the whole graph. Geometry gradients for child centers flow
+        # through the rasterizer means and the Fourier center encoding instead.
+        uv, valid = self._project_points(flat_child_centers.detach(), extrinsics, intrinsics)
         sampled = self._sample_point_features(sr_feature_map, uv)
         valid_weight = valid.to(sampled.dtype)
         child_features = (sampled * valid_weight[..., None]).sum(dim=1)

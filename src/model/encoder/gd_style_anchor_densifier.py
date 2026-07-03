@@ -7,6 +7,8 @@ import torch
 import torch.nn as nn
 from einops import rearrange
 
+from ...geometry.projection import homogenize_points, transform_world2cam
+
 
 _PTV3_ROOT = Path("/space0/mengxl")
 if str(_PTV3_ROOT) not in sys.path:
@@ -27,8 +29,10 @@ class GDStyleAnchorDensifierCfg:
     point_patch_size: int = 48
     point_mlp_ratio: float = 4.0
     num_offsets: int = 8
-    offset_knn: int = 3
     offset_init_radius_scale: float = 0.5
+    # Offsets are norm-bounded by a sphere inscribed in the anchor's LR pixel
+    # frustum: radius = scale * z / (f_px * lr_grid). 0.5 reaches the cell border.
+    offset_pixel_radius_scale: float = 0.5
     offset_init_pattern: str = "sphere"
     offset_coordinate_frame: str = "world"
 
@@ -221,32 +225,56 @@ class GDStyleAnchorDensifier(nn.Module):
                 "offset_init_pattern must be 'sphere' or 'circle', got "
                 f"{self.cfg.offset_init_pattern!r}."
             )
-        bias = torch.atanh((directions * init_scale).clamp(min=-0.999, max=0.999))
+        # Offsets are parameterized as tanh(|raw|) * radius * raw/|raw|, so a raw
+        # vector of atanh(s) * unit_direction yields an initial offset of
+        # s * radius along that direction (children start evenly spread at a
+        # fraction s of the pixel-sphere radius).
+        bias = math.atanh(init_scale) * directions
         with torch.no_grad():
             last_layer.bias.copy_(bias.reshape(-1))
 
-    def _knn_offset_radius(self, anchors: torch.Tensor) -> torch.Tensor:
-        b, v, n, _ = anchors.shape
-        if n <= 1:
-            return anchors.new_ones(b, v, n, 1)
+    def _pixel_sphere_radius(
+        self,
+        anchors: torch.Tensor,
+        extrinsics: torch.Tensor,
+        intrinsics: torch.Tensor,
+        lr_grid_size: tuple[int, int],
+    ) -> torch.Tensor:
+        """Radius of the sphere inscribed in each anchor's own-view LR pixel frustum.
 
+        A sphere of radius <= 0.5 * pixel_world_size centered on the anchor projects
+        inside the anchor's LR pixel cell from any viewpoint, so norm-bounding the
+        offsets by this radius keeps children within their parent pixel.
+        """
+        lr_height, lr_width = lr_grid_size
         with torch.no_grad():
-            points = rearrange(anchors.detach(), "b v n xyz -> (b v) n xyz")
-            distances = torch.cdist(points, points)
-            k = min(self.cfg.offset_knn + 1, n)
-            knn_distances = distances.topk(k=k, dim=-1, largest=False).values[..., 1:]
-            if knn_distances.shape[-1] == 0:
-                radius = anchors.new_ones(b * v, n, 1)
-            else:
-                radius = knn_distances.mean(dim=-1, keepdim=True).clamp_min(1e-6)
-            return rearrange(radius, "(b v) n c -> b v n c", b=b, v=v)
+            cam_points = transform_world2cam(
+                homogenize_points(anchors.detach()),
+                extrinsics[:, :, None],
+            )
+            x, y = cam_points[..., 0], cam_points[..., 1]
+            anchor_z = cam_points[..., 2].clamp_min(1e-3)
+            fx = intrinsics[..., 0, 0].clamp_min(1e-6)[:, :, None]  # normalized by image width
+            fy = intrinsics[..., 1, 1].clamp_min(1e-6)[:, :, None]  # normalized by image height
+            # Exact distance from the anchor to its pixel cell's boundary planes.
+            # Off-axis cells are oblique cones: the plane through the camera center
+            # for image column u_b has normal (fx, 0, -(u_b - 0.5)); using the outer
+            # boundary (anchor u plus half a cell) makes the bound exact.
+            u_off = (fx * x / anchor_z).abs() + 0.5 / lr_width
+            v_off = (fy * y / anchor_z).abs() + 0.5 / lr_height
+            radius_x = anchor_z / (lr_width * torch.sqrt(fx.square() + u_off.square()))
+            radius_y = anchor_z / (lr_height * torch.sqrt(fy.square() + v_off.square()))
+            radius = self.cfg.offset_pixel_radius_scale * torch.minimum(radius_x, radius_y)
+            return radius[..., None]
 
     def forward(
         self,
         anchors: torch.Tensor,
         lr_gs_features: torch.Tensor,
         sampled_features: torch.Tensor,
-        extrinsics: torch.Tensor | None = None,
+        extrinsics: torch.Tensor,
+        intrinsics: torch.Tensor,
+        lr_grid_size: tuple[int, int],
     ) -> dict[str, torch.Tensor]:
         if anchors.shape[:3] != lr_gs_features.shape[:3]:
             raise ValueError(
@@ -258,15 +286,12 @@ class GDStyleAnchorDensifier(nn.Module):
                 "sampled_features must share [B, V, N] with anchors, got "
                 f"{tuple(sampled_features.shape)} and {tuple(anchors.shape)}."
             )
-        if self.cfg.offset_coordinate_frame == "camera":
-            if extrinsics is None:
-                raise ValueError("extrinsics must be provided when offset_coordinate_frame is 'camera'.")
-            if extrinsics.shape[:2] != anchors.shape[:2] or extrinsics.shape[-2:] != (4, 4):
-                raise ValueError(
-                    "extrinsics must have shape [B, V, 4, 4] matching anchors, got "
-                    f"{tuple(extrinsics.shape)} and {tuple(anchors.shape)}."
-                )
-        elif self.cfg.offset_coordinate_frame != "world":
+        if extrinsics.shape[:2] != anchors.shape[:2] or extrinsics.shape[-2:] != (4, 4):
+            raise ValueError(
+                "extrinsics must have shape [B, V, 4, 4] matching anchors, got "
+                f"{tuple(extrinsics.shape)} and {tuple(anchors.shape)}."
+            )
+        if self.cfg.offset_coordinate_frame not in ("camera", "world"):
             raise ValueError(
                 "offset_coordinate_frame must be 'camera' or 'world', got "
                 f"{self.cfg.offset_coordinate_frame!r}."
@@ -293,8 +318,13 @@ class GDStyleAnchorDensifier(nn.Module):
 
         raw_offsets = self.offset_mlp(point_features)
         raw_offsets = rearrange(raw_offsets, "b v n (k xyz) -> b v n k xyz", k=self.cfg.num_offsets, xyz=3)
-        offset_radius = self._knn_offset_radius(anchors)
-        local_offsets = raw_offsets.tanh() * offset_radius[:, :, :, None, :]
+        offset_radius = self._pixel_sphere_radius(anchors, extrinsics, intrinsics, lr_grid_size)
+        # Norm-bounded offsets: |offset| <= radius regardless of direction, so the
+        # bound must be on the vector norm (a per-component tanh would give a box
+        # whose diagonal exceeds the pixel sphere).
+        raw_norm = raw_offsets.norm(dim=-1, keepdim=True)
+        offset_directions = raw_offsets / raw_norm.clamp_min(1e-6)
+        local_offsets = raw_norm.tanh() * offset_radius[:, :, :, None, :] * offset_directions
         if self.cfg.offset_coordinate_frame == "camera":
             rotation_c2w = extrinsics[..., :3, :3]
             offsets = torch.einsum("bvij,bvnkj->bvnki", rotation_c2w, local_offsets)

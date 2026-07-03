@@ -190,6 +190,10 @@ class ModelWrapper(LightningModule):
 
         self.ckpt_path = None
 
+        # Guard against silently skipping updates forever on bad gradients.
+        self.consecutive_bad_grad_skips = 0
+        self.max_consecutive_bad_grad_skips = 200
+
     def _image_key(self, views: dict) -> str:
         if getattr(self.encoder.cfg, "name", None) == "nas3r-m" and "image_lr" in views:
             return "image_lr"
@@ -303,6 +307,24 @@ class ModelWrapper(LightningModule):
         for loss_fn in self.losses:
             if loss_fn.name in ['mse', 'lpips']:
                 loss = loss_fn.forward(output.color, target_gt, gaussians, self.global_step)
+                self.log(f"loss/{loss_fn.name}", loss)
+                total_loss += loss
+            elif loss_fn.name == "child_grid" and "child_gaussian_centers" in encoder_output:
+                child_centers = encoder_output["child_gaussian_centers"]
+                lr_height, lr_width = batch["context"]["image_lr"].shape[-2:]
+                child_centers = rearrange(
+                    child_centers,
+                    "b v (lh lw) k xyz -> b v lh lw () () k xyz",
+                    lh=lr_height,
+                    lw=lr_width,
+                )
+                loss = loss_fn.forward(
+                    child_centers,
+                    context_extrinsics,
+                    context_intrinsics,
+                    (h, w),
+                    self.global_step,
+                )
                 self.log(f"loss/{loss_fn.name}", loss)
                 total_loss += loss
 
@@ -1044,8 +1066,7 @@ class ModelWrapper(LightningModule):
         new_module_keywords = (
             "encoder.sr_upsampler",
             "encoder.sr_backbone",
-            "encoder.sr_resunet",
-            "encoder.sr_fusion_dpt",
+            "encoder.sr_encoder_dpt",
             "encoder.lr_anchor_sr_sampler",
             "encoder.gd_anchor_densifier",
             "encoder.child_gaussian_decoder",
@@ -1125,38 +1146,52 @@ class ModelWrapper(LightningModule):
         # Perform the backward pass
         optimizer_closure()
 
-        nan_detected = False
+        bad_param_names = []
         large_detected = False
 
         max_grad_norm = 20 if 'vggt' in self.encoder.backbone.cfg.name else 5  # Define the maximum norm threshold
         max_grad_value = 0
 
-        # Check for NaN gradients
+        # Check for NaN/Inf gradients (inf also poisons clip_grad_norm_, so treat it the same)
         for name, param in self.named_parameters():
 
             if param.grad is not None:
-                if torch.isnan(param.grad).any():
-                    self.log("nan_gradient_detected", True, on_step=True, on_epoch=False)
-                    print(f"Skipping update due to NaN gradient")
-                    nan_detected = True
-                    break
+                if not torch.isfinite(param.grad).all():
+                    bad_param_names.append(name)
+                    continue
 
                 param_max_grad = param.grad.abs().max().item()
                 if param_max_grad > max_grad_value:
                     max_grad_value = param_max_grad
 
-                if param.grad.abs().max() > max_grad_norm:
-                    self.log(f"large_gradient_detected in {name}", param.grad.abs().max().item(), on_step=True,
+                if param_max_grad > max_grad_norm and not large_detected:
+                    self.log(f"large_gradient_detected in {name}", param_max_grad, on_step=True,
                              on_epoch=False)
                     print(f"large gradient in {name}")
                     large_detected = True
-                    break
 
         self.log("max_gradient", max_grad_value, on_step=True, on_epoch=False)
 
-        if nan_detected or large_detected:
+        if bad_param_names:
+            self.log("nan_gradient_detected", True, on_step=True, on_epoch=False)
+            self.consecutive_bad_grad_skips += 1
+            # Name the culprits: knowing which modules produce NaN/Inf is the only way
+            # to localize the source. Group by top-level module to keep the print short.
+            modules = sorted({".".join(n.split(".")[:3]) for n in bad_param_names})
+            print(
+                f"Skipping update at step {self.global_step} due to NaN/Inf gradients in "
+                f"{len(bad_param_names)} params across modules: {modules[:10]}"
+                f" (consecutive skips: {self.consecutive_bad_grad_skips})"
+            )
             optimizer.zero_grad()  # Clear gradients if skipping the step
+            if self.consecutive_bad_grad_skips >= self.max_consecutive_bad_grad_skips:
+                raise RuntimeError(
+                    f"{self.consecutive_bad_grad_skips} consecutive optimizer steps skipped due to "
+                    f"NaN/Inf gradients (last affected modules: {modules[:10]}). Training is not "
+                    f"making progress; aborting instead of silently spinning."
+                )
         else:
+            self.consecutive_bad_grad_skips = 0
             # Clip gradients to prevent exploding gradients
             torch.nn.utils.clip_grad_norm_(self.parameters(), 0.5)
             optimizer.step()

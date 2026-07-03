@@ -10,12 +10,13 @@ from torch import Tensor, nn
 import math
 
 from .backbone.croco.misc import transpose_to_landscape
-from .heads.fusion_dpt import create_fusion_dpt
+from .heads.sr_encoder_dpt import create_sr_encoder_dpt
 from .heads import head_factory, camera_head_factory
 from ...dataset.shims.bounds_shim import apply_bounds_shim
 from ...dataset.shims.normalize_shim import apply_normalize_shim, inverse_normalize_image, normalize_image
 from ...dataset.shims.patch_shim import apply_patch_shim
 from ...dataset.types import BatchedExample, DataShim
+from ...geometry.camera_emb import get_intrinsic_embedding
 from ...geometry.projection import sample_image_grid
 from ..types import Gaussians
 from ..decoder.cuda_splatting import render_cuda
@@ -29,7 +30,6 @@ from ...misc.cam_utils import camera_normalization, convert_pose_to_4x4, depth_p
     unproject_depth_map_to_point_map_batch
 from .heads.pose_head import PoseHeadCfg
 from .lr_anchor_sr_feature_sampler import LRAnchorSRFeatureSampler
-from .resunet_fusion import ImageNetResUnetFeatureExtractor
 from ..super_resolution import FrozenSwinIRUpsampler
 
 inf = float('inf')
@@ -52,12 +52,7 @@ class SwinIRBranchCfg:
     freeze_lr_branch: bool = True
     share_lr_backbone: bool = False
     output_key: str = "sr_tokens"
-    resunet_enabled: bool = True
-    resunet_output_key: str = "sr_resunet_features"
-    resunet_feature_dims: list[int] = field(default_factory=lambda: [32, 64, 128])
-    freeze_resunet: bool = False
-    fusion_dpt_enabled: bool = True
-    fusion_dpt_output_key: str = "sr_fusion_dpt_feature"
+    encoder_feature_output_key: str = "sr_fusion_dpt_feature"
     anchor_sampler_enabled: bool = True
     anchor_sampler_patch_size: int = 4
     anchor_sampler_padding_mode: str = "border"
@@ -145,8 +140,7 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
 
         self.sr_upsampler = self._build_sr_upsampler(cfg.sr_branch)
         self.sr_backbone = self._build_sr_backbone(cfg.sr_branch)
-        self.sr_resunet = self._build_sr_resunet(cfg.sr_branch)
-        self.sr_fusion_dpt = self._build_sr_fusion_dpt(cfg.sr_branch)
+        self.sr_encoder_dpt = self._build_sr_encoder_dpt(cfg.sr_branch)
         self.lr_anchor_sr_sampler = self._build_lr_anchor_sr_sampler(cfg.sr_branch)
         self.gd_anchor_densifier = self._build_gd_anchor_densifier(cfg.sr_branch)
         self.child_gaussian_decoder = self._build_child_gaussian_decoder(cfg.sr_branch)
@@ -177,30 +171,10 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             return self.backbone
         return deepcopy(self.backbone)
 
-    def _build_sr_resunet(self, cfg: SwinIRBranchCfg) -> nn.Module | None:
-        if not cfg.enabled or not cfg.resunet_enabled:
+    def _build_sr_encoder_dpt(self, cfg: SwinIRBranchCfg) -> nn.Module | None:
+        if not cfg.enabled:
             return None
-
-        feature_dims = tuple(cfg.resunet_feature_dims)
-        if len(feature_dims) != 3:
-            raise ValueError("sr_branch.resunet_feature_dims must contain exactly three channel sizes.")
-
-        resunet = ImageNetResUnetFeatureExtractor(feature_dims=feature_dims)
-        if cfg.freeze_resunet:
-            self._set_trainable(resunet, False)
-        return resunet
-
-    def _build_sr_fusion_dpt(self, cfg: SwinIRBranchCfg) -> nn.Module | None:
-        if not cfg.enabled or not cfg.fusion_dpt_enabled:
-            return None
-        if not cfg.resunet_enabled:
-            raise ValueError("sr_branch.resunet_enabled must be true when fusion_dpt_enabled is true.")
-
-        feature_dims = tuple(cfg.resunet_feature_dims)
-        if len(feature_dims) != 3:
-            raise ValueError("sr_branch.resunet_feature_dims must contain exactly three channel sizes.")
-
-        return create_fusion_dpt(self.sr_backbone, resunet_channels=feature_dims)
+        return create_sr_encoder_dpt(self.sr_backbone)
 
     def _build_lr_anchor_sr_sampler(self, cfg: SwinIRBranchCfg) -> nn.Module | None:
         if not cfg.enabled or not cfg.anchor_sampler_enabled:
@@ -218,8 +192,6 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
     def _build_child_gaussian_decoder(self, cfg: SwinIRBranchCfg) -> nn.Module | None:
         if not cfg.enabled or not cfg.child_gaussian_decoder.enabled:
             return None
-        if not cfg.fusion_dpt_enabled:
-            raise ValueError("sr_branch.fusion_dpt_enabled must be true when child_gaussian_decoder is enabled.")
         return ChildGaussianFeatureDecoder(
             cfg.child_gaussian_decoder,
             d_sh=self.gaussian_adapter.d_sh,
@@ -249,6 +221,9 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
         anchors: Tensor,
         lr_gs_features: Tensor | None,
         sampled_feature_output: dict,
+        extrinsics: Tensor,
+        intrinsics: Tensor,
+        lr_grid_size: tuple[int, int],
     ) -> dict:
         if self.gd_anchor_densifier is None:
             return {}
@@ -263,6 +238,9 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             anchors=anchors,
             lr_gs_features=lr_gs_features,
             sampled_features=sampled_features,
+            extrinsics=extrinsics,
+            intrinsics=intrinsics,
+            lr_grid_size=lr_grid_size,
         )
         return {f"gd_anchor_{key}": value for key, value in densifier_output.items()}
 
@@ -277,7 +255,7 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
         if self.child_gaussian_decoder is None or sr_branch_output is None:
             return {}
         child_centers = gd_anchor_output.get("gd_anchor_child_centers")
-        sr_feature_map = sr_branch_output.get(self.cfg.sr_branch.fusion_dpt_output_key)
+        sr_feature_map = sr_branch_output.get(self.cfg.sr_branch.encoder_feature_output_key)
         if child_centers is None or sr_feature_map is None:
             return {}
 
@@ -290,6 +268,7 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
         )
         return {
             "child_gaussians": child_output["gaussians"],
+            "child_gaussian_centers": child_centers,
             "child_gaussian_features": child_output["features"],
             "child_gaussian_valid": child_output["valid"],
         }
@@ -438,6 +417,71 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             return context_image
         return inverse_normalize_image(context_image, self.cfg.input_mean, self.cfg.input_std).clamp(0, 1)
 
+    def _encode_sr_croco_encoder_only(self, sr_context: dict) -> tuple[list[Tensor], Tensor, Tensor]:
+        if self.sr_backbone is None:
+            raise RuntimeError("SR backbone is not initialized.")
+
+        image = sr_context["image"]
+        b, v, _, _, _ = image.shape
+        images_all = image
+
+        if (
+            getattr(self.sr_backbone, "intrinsics_embed_loc", "none") == "encoder"
+            and getattr(self.sr_backbone, "intrinsics_embed_type", "none") == "pixelwise"
+        ):
+            intrinsic_embedding = get_intrinsic_embedding(
+                sr_context,
+                degree=getattr(self.sr_backbone, "intrinsics_embed_degree", 0),
+            )
+            images_all = torch.cat((images_all, intrinsic_embedding), dim=2)
+
+        intrinsic_embedding_all = None
+        if (
+            getattr(self.sr_backbone, "intrinsics_embed_loc", "none") == "encoder"
+            and getattr(self.sr_backbone, "intrinsics_embed_type", "none") in ("token", "linear")
+        ):
+            intrinsic_embedding = self.sr_backbone.intrinsic_encoder(sr_context["intrinsics"].flatten(2))
+            intrinsic_embedding_all = rearrange(intrinsic_embedding, "b v c -> (b v) c").unsqueeze(1)
+
+        pose_embedding_all = None
+        if (
+            getattr(self.sr_backbone, "pose_embed_loc", "none") == "encoder"
+            and getattr(self.sr_backbone, "pose_embed_type", "none") == "learnable_token"
+        ):
+            pose_embedding = self.sr_backbone.pose_token.expand(b, v, *self.sr_backbone.pose_token.shape[2:])
+            pose_embedding_all = rearrange(pose_embedding, "b v ... -> (b v) ...")
+
+        flat_images = rearrange(images_all, "b v c h w -> (b v) c h w")
+        shape_all = torch.tensor(flat_images.shape[-2:], device=flat_images.device)[None].repeat(b * v, 1)
+        token, pos = self.sr_backbone.patch_embed(flat_images, true_shape=shape_all)
+        patch_token_count = token.shape[1]
+
+        if intrinsic_embedding_all is not None:
+            if getattr(self.sr_backbone, "intrinsics_embed_type", "none") == "linear":
+                token = token + intrinsic_embedding_all
+            elif "token" in getattr(self.sr_backbone, "intrinsics_embed_type", "none"):
+                token = torch.cat((token, intrinsic_embedding_all), dim=1)
+                add_pos = pos[:, 0:1, :].clone()
+                add_pos[:, :, 0] += pos[:, -1, 0].unsqueeze(-1) + 1
+                pos = torch.cat((pos, add_pos), dim=1)
+
+        if pose_embedding_all is not None:
+            token = torch.cat((token, pose_embedding_all), dim=1)
+            add_pos = pos[:, 0:1, :].clone()
+            add_pos[:, :, 0] += pos[:, -1, 0].unsqueeze(-1) + 1
+            pos = torch.cat((pos, add_pos), dim=1)
+
+        sr_tokens = [token[:, :patch_token_count]]
+        for block in self.sr_backbone.enc_blocks:
+            token = block(token, pos)
+            sr_tokens.append(token[:, :patch_token_count])
+        sr_tokens[-1] = self.sr_backbone.enc_norm(sr_tokens[-1])
+        sr_tokens = [rearrange(layer, "(b v) n c -> b v n c", b=b, v=v) for layer in sr_tokens]
+
+        shape = rearrange(shape_all, "(b v) c -> b v c", b=b, v=v)
+        images = rearrange(flat_images, "(b v) c h w -> b v c h w", b=b, v=v)
+        return sr_tokens, shape, images
+
     def _encode_sr_context(
         self,
         context: dict,
@@ -450,22 +494,14 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             "image": normalize_image(sr_image),
             "intrinsics": context["intrinsics"],
         }
-        sr_out = self.sr_backbone(sr_context, target_num_views=0)
+        sr_tokens, sr_shape, _ = self._encode_sr_croco_encoder_only(sr_context)
         output = {
-            self.cfg.sr_branch.output_key: sr_out["dec_feat"],
+            self.cfg.sr_branch.output_key: sr_tokens,
             "sr_image": sr_image,
-            "sr_shape": sr_out["shape"],
+            "sr_shape": sr_shape,
         }
-        sr_resunet_features = None
-        if self.sr_resunet is not None:
-            sr_resunet_features = self.sr_resunet(sr_image)
-            output[self.cfg.sr_branch.resunet_output_key] = sr_resunet_features
-        if self.sr_fusion_dpt is not None:
-            output[self.cfg.sr_branch.fusion_dpt_output_key] = self.sr_fusion_dpt(
-                sr_out["dec_feat"],
-                sr_resunet_features,
-                target_size,
-            )
+        if self.sr_encoder_dpt is not None:
+            output[self.cfg.sr_branch.encoder_feature_output_key] = self.sr_encoder_dpt(sr_tokens, target_size)
         return output
 
     def set_depth_head(self, output_mode, head_type, landscape_only, depth_mode, conf_mode):
@@ -692,6 +728,9 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             anchors=lr_anchors,
             lr_gs_features=lr_gs_features,
             sampled_feature_output=lr_anchor_sr_features,
+            extrinsics=context_extrinsics,
+            intrinsics=context_intrinsics,
+            lr_grid_size=(h, w),
         )
         child_gaussian_output = self._run_child_gaussian_decoder(
             sr_branch_output=sr_branch_output,

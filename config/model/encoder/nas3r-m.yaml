@@ -62,12 +62,7 @@ sr_branch:
   freeze_lr_branch: true
   share_lr_backbone: false
   output_key: sr_tokens
-  resunet_enabled: true
-  resunet_output_key: sr_resunet_features
-  resunet_feature_dims: [32, 64, 128]
-  freeze_resunet: false
-  fusion_dpt_enabled: true
-  fusion_dpt_output_key: sr_fusion_dpt_feature
+  encoder_feature_output_key: sr_fusion_dpt_feature
   anchor_sampler_enabled: true
   anchor_sampler_patch_size: 4
   anchor_sampler_padding_mode: border
@@ -77,16 +72,19 @@ sr_branch:
   gd_densifier:
     enabled: true
     lr_gs_feature_dim: 256
-    sampled_feature_dim: 176
+    # (8 stack channels + 1 z_diff) * 4x4 patch = 144
+    sampled_feature_dim: 144
     hidden_dim: 160
     cross_attn_heads: 16
     point_depth: 2
     point_heads: 8
     point_patch_size: 48
     point_mlp_ratio: 4.0
-    num_offsets: 4
-    offset_knn: 3
+    num_offsets: 16
     offset_init_radius_scale: 0.5
+    # child offsets are norm-bounded by the sphere inscribed in the anchor's
+    # own-view LR pixel frustum; 0.5 = offsets can reach the pixel cell border
+    offset_pixel_radius_scale: 0.5
     offset_init_pattern: sphere
     offset_coordinate_frame: world
   child_gaussian_decoder:
@@ -98,6 +96,6 @@ sr_branch:
     group_norm_groups: 16
     center_fourier_frequencies: 6
     center_fourier_scale: 1.0
-    child_scale_divisor: 1.2
+    child_scale_divisor: 2.0
     clamp_min_scale: 1e-6
     clamp_max_scale: 0.3

@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 
-from ...geometry.projection import project
+from ...geometry.projection import homogenize_points, project, transform_world2cam
 
 
 class LRAnchorSRFeatureSampler(nn.Module):
@@ -36,6 +36,12 @@ class LRAnchorSRFeatureSampler(nn.Module):
         yy, xx = torch.meshgrid(offsets, offsets, indexing="ij")
         return torch.stack((xx, yy), dim=-1).reshape(-1, 2)
 
+    # Channel layout of the feature stack. render_color is omitted: it is a linear
+    # combination of sr_image and render_error, so it adds no information. The depth
+    # channel index is needed in forward() to compute the per-candidate z_diff.
+    DEPTH_CHANNEL = 4  # sr_image (0:3), render_alpha (3), render_depth (4), render_error (5:8)
+    NUM_CHANNELS = 8
+
     def build_feature_stack(
         self,
         sr_image: torch.Tensor,
@@ -51,7 +57,6 @@ class LRAnchorSRFeatureSampler(nn.Module):
         return torch.cat(
             [
                 sr_image,
-                render_color,
                 render_alpha,
                 render_depth,
                 render_error,
@@ -97,8 +102,25 @@ class LRAnchorSRFeatureSampler(nn.Module):
             s=source_views,
         )
 
+        # Camera-space z of each anchor in each target view, for the z_diff cue.
+        # Same metric units as the rendered depth channel (both undo the
+        # scale-invariant near factor).
+        with torch.no_grad():
+            cam_points = transform_world2cam(
+                homogenize_points(points),
+                src_w2cs.unsqueeze(2),
+            )
+            point_z = rearrange(
+                cam_points[..., 2],
+                "(b s) t n -> b s n t",
+                b=b,
+                s=source_views,
+            )
+
         offsets = self._patch_offsets(feature_stack.device, feature_stack.dtype)
-        pixel_scale = point_xy.new_tensor((max(feat_w - 1, 1), max(feat_h - 1, 1)))
+        # point_xy is in normalized image coordinates and grid_sample uses
+        # align_corners=False, where one pixel step corresponds to 1 / W or 1 / H.
+        pixel_scale = point_xy.new_tensor((max(feat_w, 1), max(feat_h, 1)))
         patch_xy = point_xy[:, :, :, :, None] + offsets / pixel_scale
         patch_grid = rearrange(
             patch_xy * 2 - 1,
@@ -113,10 +135,21 @@ class LRAnchorSRFeatureSampler(nn.Module):
         )
         sampled = rearrange(
             sampled,
-            "(b t) c (s n) p -> b s n t (p c)",
+            "(b t) c (s n) p -> b s n t p c",
             b=b,
             t=target_views,
             s=source_views,
             n=num_anchors,
         )
+
+        # Relative depth mismatch between the anchor and the LR-gaussian render at
+        # each candidate pixel: ~0 where the anchor is visible in that view, large
+        # where it is occluded or the render is empty. Clamped because points behind
+        # a camera produce meaningless (unbounded) values.
+        sampled_depth = sampled[..., self.DEPTH_CHANNEL]
+        z_diff = (sampled_depth - point_z[..., None]) / point_z.abs().clamp_min(1e-3)[..., None]
+        z_diff = z_diff.clamp(min=-10.0, max=10.0)
+
+        sampled = torch.cat([sampled, z_diff[..., None]], dim=-1)
+        sampled = rearrange(sampled, "b s n t p c -> b s n t (p c)")
         return sampled.detach()
