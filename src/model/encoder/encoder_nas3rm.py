@@ -20,6 +20,7 @@ from ..types import Gaussians
 from .backbone import Backbone, BackboneCfg, get_backbone
 from .common.gaussian_adapter import GaussianAdapter, GaussianAdapterCfg, UnifiedGaussianAdapter
 from .encoder import Encoder
+from .adaptive_pixel_grid import build_adaptive_pixel_grid, visualize_adaptive_pixel_grid
 from ..super_resolution import FrozenSwinIRUpsampler
 from .visualization.encoder_visualizer_epipolar_cfg import EncoderVisualizerEpipolarCfg
 from ...misc.cam_utils import camera_normalization, convert_pose_to_4x4, depth_projector, \
@@ -69,6 +70,12 @@ class EncoderNAS3RMCfg:
     context_sr_weights: str = "/space0/mengxl/NAS3R-master/pretrained_weights/001_classicalSR_DF2K_s64w8_SwinIR-M_x4.pth"
     context_sr_upscale: int = 4
     context_sr_img_size: int = 64
+    adaptive_grid_enabled: bool = True
+    adaptive_grid_max_level: int = 2
+    adaptive_grid_topk_ratio: float | None = 0.1
+    adaptive_grid_threshold: float | None = None
+    adaptive_grid_visualize: bool = False
+    adaptive_grid_visualize_max_views: int = 2
 
 
 def rearrange_head(feat, patch_size, H, W):
@@ -180,6 +187,7 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             global_step: int = 0,
             visualization_dump: Optional[dict] = None,
             target: Optional[dict] = None,
+            decoder: Optional[nn.Module] = None,
             warmup_pts3d: bool = False,
     ):
         context_image = context.get("image_lr", context["image"])
@@ -192,6 +200,14 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
                 self.cfg.input_std,
             )
             context_image_sr = self.context_sr_upsampler(sr_input)
+            if target is not None and "image" in target and context_image_sr.shape[-2:] != target["image"].shape[-2:]:
+                context_image_sr = F.interpolate(
+                    rearrange(context_image_sr, "b v c h w -> (b v) c h w"),
+                    size=target["image"].shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+                context_image_sr = rearrange(context_image_sr, "(b v) c h w -> b v c h w", b=sr_input.shape[0])
 
         device = context_image.device
         b, v_cxt, _, h, w = context_image.shape
@@ -330,6 +346,38 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
         )
         if context_image_sr is not None:
             encoder_output["context_image_sr"] = context_image_sr.detach()
+            if decoder is not None:
+                with torch.no_grad():
+                    _, _, _, h_sr, w_sr = context_image_sr.shape
+                    context_sr_render = decoder.forward(
+                        encoder_output["gaussians"],
+                        context_extrinsics,
+                        context_intrinsics,
+                        context["near"],
+                        context["far"],
+                        (h_sr, w_sr),
+                    ).color
+                    context_sr_render_error = (context_sr_render - context_image_sr).abs().mean(dim=2)
+                encoder_output["context_sr_render"] = context_sr_render.detach()
+                encoder_output["context_sr_render_error"] = context_sr_render_error.detach()
+                if self.cfg.adaptive_grid_enabled:
+                    adaptive_pixel_grid = build_adaptive_pixel_grid(
+                        context_sr_render_error,
+                        h_lr=h,
+                        w_lr=w,
+                        max_level=self.cfg.adaptive_grid_max_level,
+                        topk_ratio=self.cfg.adaptive_grid_topk_ratio,
+                        threshold=self.cfg.adaptive_grid_threshold,
+                    )
+                    encoder_output["adaptive_pixel_grid"] = adaptive_pixel_grid
+                    if self.cfg.adaptive_grid_visualize:
+                        visualize_adaptive_pixel_grid(
+                            adaptive_pixel_grid,
+                            context_sr_render_error,
+                            context_image_sr=context_image_sr,
+                            context_sr_render=context_sr_render,
+                            max_views=self.cfg.adaptive_grid_visualize_max_views,
+                        )
 
         if self.cfg.estimating_pose:
             encoder_output['extrinsics'] = dict()

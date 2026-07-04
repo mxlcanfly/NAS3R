@@ -196,6 +196,15 @@ class ModelWrapper(LightningModule):
     def _images(self, views: dict) -> Tensor:
         return views[self._image_key(views)]
 
+    def _run_encoder(self, context: dict, visualization_dump: dict, target: dict | None = None):
+        kwargs = {
+            "visualization_dump": visualization_dump,
+            "target": target,
+        }
+        if getattr(self.encoder.cfg, "name", None) == "nas3r-m":
+            kwargs["decoder"] = self.decoder
+        return self.encoder(context, self.global_step, **kwargs)
+
     def training_step(self, batch, batch_idx):
         # combine batch from different dataloaders
         if isinstance(batch, list):
@@ -234,8 +243,11 @@ class ModelWrapper(LightningModule):
 
         # Run the model.
         visualization_dump = {}
-        encoder_output = self.encoder(batch["context"], self.global_step, visualization_dump=visualization_dump,
-                                      target=batch["target"] if self.encoder.cfg.estimating_pose else None)
+        encoder_output = self._run_encoder(
+            batch["context"],
+            visualization_dump,
+            target=batch["target"] if self.encoder.cfg.estimating_pose else None,
+        )
 
         if self.encoder.cfg.estimating_pose:
             pred_extrinsics, pred_extrinsics_cwt = encoder_output['extrinsics']['c'], encoder_output['extrinsics'][
@@ -354,8 +366,11 @@ class ModelWrapper(LightningModule):
                     target_data["image_lr"] = batch["target"]["image_lr"][:, target_view:target_view + 1]
 
                 with self.benchmarker.time("encoder"):
-                    encoder_output = self.encoder(batch["context"], self.global_step,
-                                                  visualization_dump=visualization_dump, target=target_data)
+                    encoder_output = self._run_encoder(
+                        batch["context"],
+                        visualization_dump,
+                        target=target_data,
+                    )
 
                 pred_extrinsics_cwt = encoder_output['extrinsics']['cwt']
                 gaussians = encoder_output["gaussians"]
@@ -392,7 +407,7 @@ class ModelWrapper(LightningModule):
         else:
             # Render Gaussians.
             with self.benchmarker.time("encoder"):
-                encoder_output = self.encoder(batch["context"], self.global_step, visualization_dump=visualization_dump)
+                encoder_output = self._run_encoder(batch["context"], visualization_dump)
 
             target_extrinsics = batch["target"]["extrinsics"]
 
@@ -627,8 +642,11 @@ class ModelWrapper(LightningModule):
         assert b == 1
 
         visualization_dump = {}
-        encoder_output = self.encoder(batch["context"], self.global_step, visualization_dump=visualization_dump,
-                                      target=batch["target"] if self.encoder.cfg.estimating_pose else None)
+        encoder_output = self._run_encoder(
+            batch["context"],
+            visualization_dump,
+            target=batch["target"] if self.encoder.cfg.estimating_pose else None,
+        )
 
         if self.encoder.cfg.estimating_pose:
             pred_extrinsics, pred_extrinsics_cwt = encoder_output['extrinsics']['c'], encoder_output['extrinsics'][
@@ -823,8 +841,7 @@ class ModelWrapper(LightningModule):
         _, v_cxt, _, _ = batch["context"]["extrinsics"].shape
 
         visualization_dump = {}
-        encoder_output = self.encoder(batch["context"], self.global_step, visualization_dump=visualization_dump,
-                                      target=None)
+        encoder_output = self._run_encoder(batch["context"], visualization_dump, target=None)
         gaussians = encoder_output['gaussians']
 
         if self.encoder.cfg.estimating_pose:
