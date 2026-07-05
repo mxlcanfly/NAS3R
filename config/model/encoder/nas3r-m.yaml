@@ -52,3 +52,12 @@ depth_activation: 'sigmoid'
 
 equal_fxfy: true
 equal_view_intrinsics: true
+
+visualize_hf_energy: true
+hf_energy_sigma_sq: null
+hf_energy_auto_sigma_sq: true
+hf_energy_sigma_quantile: 0.90
+hf_energy_show_once: true
+hf_energy_save_dir: outputs/hf_energy_debug
+hf_energy_show_plot: true
+hf_energy_max_visualizations: 32
