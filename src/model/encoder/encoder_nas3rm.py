@@ -1,10 +1,10 @@
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, Optional
 
 import torch
 import torch.nn.functional as F
-from einops import rearrange
+from einops import rearrange, repeat
 from jaxtyping import Float
 from torch import Tensor, nn
 import math
@@ -24,6 +24,21 @@ from .visualization.encoder_visualizer_epipolar_cfg import EncoderVisualizerEpip
 from ...misc.cam_utils import camera_normalization, convert_pose_to_4x4, depth_projector, \
     unproject_depth_map_to_point_map_batch
 from .heads.pose_head import PoseHeadCfg
+from ..utils import (
+    build_lr_context_feature_stack,
+    GDCrossAttentionCfg,
+    GDGaussianFeatureCrossAttention,
+    GDStyleGaussianChildDecoder,
+    GDStyleGaussianChildDecoderCfg,
+    HiSplatSingleViewFeatureCfg,
+    ReSplatGaussianPointTransformer,
+    ReSplatPointTransformerCfg,
+    render_gaussians_to_context,
+    sample_lr_gaussian_point_features,
+    SingleViewSRFeatureExtractor,
+)
+from ..super_resolution import FrozenSwinIRUpsampler
+from ...misc.hf_energy_utils import sr_residual_lr_map
 
 inf = float('inf')
 
@@ -64,6 +79,23 @@ class EncoderNAS3RMCfg:
 
     equal_fxfy: bool = True
     equal_view_intrinsics: bool = True
+    gd_cross_attn: GDCrossAttentionCfg = field(default_factory=GDCrossAttentionCfg)
+    resplat_pt: ReSplatPointTransformerCfg = field(default_factory=ReSplatPointTransformerCfg)
+    gaussian_child_decoder: GDStyleGaussianChildDecoderCfg = field(default_factory=GDStyleGaussianChildDecoderCfg)
+    freeze_original_lr_network: bool = True
+    trainable_new_modules: list[str] = field(default_factory=lambda: [
+        "gd_cross_attn",
+        "resplat_pt",
+        "gaussian_child_decoder",
+        "hisplat_sr_feature_extractor",
+    ])
+    swinir_weight_path: str = "/space0/mengxl/NAS3R-master/pretrained_weights/001_classicalSR_DF2K_s64w8_SwinIR-M_x4.pth"
+    swinir_upscale: int = 4
+    swinir_img_size: int = 64
+    swinir_window_size: int = 8
+    sr_residual_need_sigma_sq: float | None = None
+    sr_residual_need_ksize: int = 3
+    hisplat_sr_features: HiSplatSingleViewFeatureCfg = field(default_factory=HiSplatSingleViewFeatureCfg)
 
 
 def rearrange_head(feat, patch_size, H, W):
@@ -80,7 +112,6 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
 
     def __init__(self, cfg: EncoderNAS3RMCfg) -> None:
         super().__init__(cfg)
-
         self.backbone = get_backbone(cfg.backbone, 3)
 
         self.pose_free = cfg.pose_free
@@ -92,6 +123,36 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
         self.patch_size = self.backbone.patch_embed.patch_size[0]
 
         self.raw_gs_dim = 1 + self.gaussian_adapter.d_in  # base (1 for opacity)
+        self.gd_cross_attn = (
+            GDGaussianFeatureCrossAttention(cfg.gd_cross_attn)
+            if cfg.gd_cross_attn.enabled
+            else None
+        )
+        self.resplat_pt_input_dim = cfg.gd_cross_attn.hidden_dim * 2
+        self.resplat_pt = (
+            ReSplatGaussianPointTransformer(cfg.resplat_pt, input_dim=self.resplat_pt_input_dim)
+            if cfg.resplat_pt.enabled
+            else None
+        )
+        self.gaussian_child_decoder = (
+            GDStyleGaussianChildDecoder(
+                cfg.gaussian_child_decoder,
+                sh_degree=cfg.gaussian_adapter.sh_degree,
+            )
+            if cfg.gaussian_child_decoder.enabled
+            else None
+        )
+        self.swinir_upsampler = FrozenSwinIRUpsampler(
+            cfg.swinir_weight_path,
+            upscale=cfg.swinir_upscale,
+            img_size=cfg.swinir_img_size,
+            window_size=cfg.swinir_window_size,
+        )
+        self.hisplat_sr_feature_extractor = (
+            SingleViewSRFeatureExtractor(cfg.hisplat_sr_features)
+            if cfg.hisplat_sr_features.enabled
+            else None
+        )
 
         self.gs_params_head_type = cfg.gs_params_head_type
 
@@ -108,6 +169,9 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
 
         if self.cfg.estimating_pose:
             self.set_pose_head(cfg, cfg.pose_head_type)
+
+        if cfg.freeze_original_lr_network:
+            self.freeze_original_lr_network()
 
     def set_depth_head(self, output_mode, head_type, landscape_only, depth_mode, conf_mode):
         self.backbone.depth_mode = depth_mode
@@ -161,6 +225,43 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
         head = getattr(self, f'depth_head{head_num}')
         return head(decout, img_shape, ray_embedding=ray_embedding)
 
+    def run_resplat_pt(
+            self,
+            points: Tensor,
+            features: Tensor,
+            offsets: Optional[Tensor] = None,
+    ) -> Tensor:
+        if self.resplat_pt is None:
+            raise RuntimeError("ReSplat point transformer is disabled in cfg.resplat_pt.")
+        return self.resplat_pt(points, features, offsets=offsets)
+
+    def freeze_original_lr_network(self) -> None:
+        for parameter in self.parameters():
+            parameter.requires_grad = False
+
+        for module_name in self.cfg.trainable_new_modules:
+            module = getattr(self, module_name, None)
+            if module is not None:
+                module.requires_grad_(True)
+
+        # SwinIR is a fixed SR prior in this stage even though it is newly attached.
+        self.swinir_upsampler.requires_grad_(False)
+        self.swinir_upsampler.eval()
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.cfg.freeze_original_lr_network:
+            trainable = set(self.cfg.trainable_new_modules)
+            for module_name, module in self.named_children():
+                if module_name not in trainable:
+                    module.eval()
+            for module_name in trainable:
+                module = getattr(self, module_name, None)
+                if module is not None:
+                    module.train(mode)
+            self.swinir_upsampler.eval()
+        return self
+
     def forward(
             self,
             context: dict,
@@ -171,6 +272,20 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
     ):
         context_image = context.get("image_lr", context["image"])
         target_image = target.get("image_lr", target["image"]) if target is not None else None
+        context_image_sr = self.swinir_upsampler(context_image)
+        sr_residual_maps = sr_residual_lr_map(
+            context_image,
+            context_image_sr,
+            scale_factor=self.cfg.swinir_upscale,
+        )
+        context_sr_features = None
+        if self.hisplat_sr_feature_extractor is not None:
+            context_sr_features = self.hisplat_sr_feature_extractor(
+                context_image,
+                context_image_sr,
+                self.backbone,
+                croco_image_sr=normalize_image(context_image_sr),
+            )
 
         device = context_image.device
         b, v_cxt, _, h, w = context_image.shape
@@ -197,6 +312,7 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
         with torch.amp.autocast('cuda', enabled=False):
             all_other_params = []
             all_depth_res = []
+            all_gaussian_img_feats = []
 
             if self.cfg.estimating_pose:
                 all_pose_params = []
@@ -214,11 +330,13 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             if 'dpt' in self.gs_params_head_type:
                 GS_res1 = self.gaussian_param_head([tok[:, 0].float() for tok in dec_feat], images[:, 0, :3],
                                                    shape[0, 0].cpu().tolist())
+                all_gaussian_img_feats.append(self.gaussian_param_head.dpt.last_point_feat)
                 GS_res1 = rearrange(GS_res1, "b d h w -> b (h w) d")
                 all_other_params.append(GS_res1)
                 for i in range(1, v_cxt):
                     GS_res2 = self.gaussian_param_head2([tok[:, i].float() for tok in dec_feat], images[:, i, :3],
                                                         shape[0, i].cpu().tolist())
+                    all_gaussian_img_feats.append(self.gaussian_param_head2.dpt.last_point_feat)
                     GS_res2 = rearrange(GS_res2, "b d h w -> b (h w) d")
                     all_other_params.append(GS_res2)
             else:
@@ -279,6 +397,96 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             self.map_pdf_to_opacity(densities, global_step),
             rearrange(gaussian_params[..., 1:], "b v r srf c -> b v r srf () c"),
         )
+        gaussian_img_feats = torch.stack(all_gaussian_img_feats, dim=1)
+        lr_gaussian_img_feats = rearrange(
+            gaussian_img_feats,
+            "b v c h w -> b v (h w) c",
+            h=h,
+            w=w,
+        )
+        _, _, _, num_surfaces_actual, gaussians_per_pixel_actual, _ = gaussians.means.shape
+        lr_gaussian_img_feats = repeat(
+            lr_gaussian_img_feats,
+            "b v r c -> b v (r srf spp) c",
+            srf=num_surfaces_actual,
+            spp=gaussians_per_pixel_actual,
+        )
+        flat_lr_gaussians = Gaussians(
+            rearrange(gaussians.means, "b v r srf spp xyz -> b (v r srf spp) xyz"),
+            rearrange(gaussians.covariances, "b v r srf spp i j -> b (v r srf spp) i j"),
+            rearrange(gaussians.rotations, "b v r srf spp i -> b (v r srf spp) i"),
+            rearrange(gaussians.scales, "b v r srf spp i -> b (v r srf spp) i"),
+            rearrange(gaussians.harmonics, "b v r srf spp c d_sh -> b (v r srf spp) c d_sh"),
+            rearrange(gaussians.opacities, "b v r srf spp -> b (v r srf spp)"),
+        )
+        lr_context_render = render_gaussians_to_context(
+            flat_lr_gaussians,
+            context_extrinsics,
+            context_intrinsics,
+            context["near"],
+            context["far"],
+            (h, w),
+        )
+        lr_context_feature_stack = build_lr_context_feature_stack(
+            context_image,
+            lr_context_render,
+            sr_residual_maps["residual_lr"],
+        )
+        lr_gaussian_points = rearrange(
+            gaussians.means,
+            "b v r srf spp xyz -> b v (r srf spp) xyz",
+        )
+        camera_rotation = context_extrinsics[..., :3, :3]
+        camera_centers = context_extrinsics[..., :3, 3]
+        camera_rights = torch.nn.functional.normalize(camera_rotation[..., :, 0], dim=-1, eps=1e-6)
+        camera_ups = torch.nn.functional.normalize(camera_rotation[..., :, 1], dim=-1, eps=1e-6)
+        num_lr_gaussian_points = lr_gaussian_points.shape[2]
+        anchor_camera_centers = rearrange(
+            repeat(camera_centers, "b v xyz -> b v n xyz", n=num_lr_gaussian_points),
+            "b v n xyz -> b (v n) xyz",
+        )
+        anchor_camera_rights = rearrange(
+            repeat(camera_rights, "b v xyz -> b v n xyz", n=num_lr_gaussian_points),
+            "b v n xyz -> b (v n) xyz",
+        )
+        anchor_camera_ups = rearrange(
+            repeat(camera_ups, "b v xyz -> b v n xyz", n=num_lr_gaussian_points),
+            "b v n xyz -> b (v n) xyz",
+        )
+        lr_gaussian_point_feats = sample_lr_gaussian_point_features(
+            lr_gaussian_points,
+            lr_context_feature_stack,
+            context_extrinsics,
+            context_intrinsics,
+        )
+        lr_gaussian_cross_attn = None
+        lr_gaussian_pt_feats = None
+        lr_child_decode = None
+        if self.gd_cross_attn is not None:
+            lr_gaussian_cross_attn = self.gd_cross_attn(
+                lr_gaussian_img_feats,
+                lr_gaussian_point_feats,
+            )
+            lr_gaussian_pt_input_feats = lr_gaussian_cross_attn["pt_input_feats"]
+            if self.resplat_pt is not None:
+                lr_gaussian_pt_feats = self.resplat_pt(
+                    rearrange(lr_gaussian_points, "b v n xyz -> b (v n) xyz"),
+                    rearrange(lr_gaussian_pt_input_feats, "b v n c -> b (v n) c"),
+                )
+                lr_gaussian_pt_feats = rearrange(
+                    lr_gaussian_pt_feats,
+                    "(b n) c -> b n c",
+                    b=b,
+                )
+                if self.gaussian_child_decoder is not None:
+                    lr_child_decode = self.gaussian_child_decoder(
+                        flat_lr_gaussians.means,
+                        lr_gaussian_pt_feats,
+                        flat_lr_gaussians,
+                        camera_centers=anchor_camera_centers,
+                        camera_rights=anchor_camera_rights,
+                        camera_ups=anchor_camera_ups,
+                    )
 
         # Dump visualizations if needed.
         if visualization_dump is not None:
@@ -298,15 +506,32 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             )  # (b, v, h, w, 1, 1)
 
         encoder_output = dict()
+        encoder_output["image_sr"] = context_image_sr
+        encoder_output["sr_residual_lr"] = sr_residual_maps["residual_lr"]
+        encoder_output["lr_gaussian_img_feats"] = lr_gaussian_img_feats
+        encoder_output["lr_context_render"] = {
+            "color": lr_context_render.color.detach(),
+            "alpha": lr_context_render.alpha.detach(),
+            "depth": lr_context_render.depth.detach(),
+        }
+        encoder_output["lr_dpt_depth"] = depths_per_view.detach()
+        encoder_output["lr_gaussian_point_feats"] = lr_gaussian_point_feats
+        if lr_gaussian_cross_attn is not None:
+            encoder_output["lr_gaussian_cross_attn"] = lr_gaussian_cross_attn
+        if lr_gaussian_pt_feats is not None:
+            encoder_output["lr_gaussian_pt_feats"] = lr_gaussian_pt_feats
+        if lr_child_decode is not None:
+            encoder_output["lr_child_gaussians"] = lr_child_decode["gaussians"]
+            encoder_output["lr_child_gaussian_features"] = lr_child_decode["features"]
+            encoder_output["lr_child_decode"] = {
+                "delta_means": lr_child_decode["delta_means"],
+                "knn_scale": lr_child_decode["knn_scale"],
+                "delta_attrs": lr_child_decode["delta_attrs"],
+            }
+        if context_sr_features is not None:
+            encoder_output["sr_features"] = context_sr_features
 
-        encoder_output["gaussians"] = Gaussians(
-            rearrange(gaussians.means, "b v r srf spp xyz -> b (v r srf spp) xyz"),
-            rearrange(gaussians.covariances, "b v r srf spp i j -> b (v r srf spp) i j"),
-            rearrange(gaussians.rotations, "b v r srf spp i  -> b (v r srf spp) i "),
-            rearrange(gaussians.scales, "b v r srf spp i  -> b (v r srf spp) i "),
-            rearrange(gaussians.harmonics, "b v r srf spp c d_sh -> b (v r srf spp) c d_sh"),
-            rearrange(gaussians.opacities, "b v r srf spp -> b (v r srf spp)"),
-        )
+        encoder_output["gaussians"] = flat_lr_gaussians
 
         if self.cfg.estimating_pose:
             encoder_output['extrinsics'] = dict()

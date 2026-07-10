@@ -52,3 +52,49 @@ depth_activation: 'sigmoid'
 
 equal_fxfy: true
 equal_view_intrinsics: true
+
+gd_cross_attn:
+  enabled: true
+  gaussian_feat_dim: 256
+  cond_dim: 10
+  hidden_dim: 160
+  num_heads: 16
+
+freeze_original_lr_network: true
+trainable_new_modules:
+  - gd_cross_attn
+  - resplat_pt
+  - gaussian_child_decoder
+  - hisplat_sr_feature_extractor
+
+resplat_pt:
+  enabled: true
+  channels: 512
+  knn_samples: 16
+  num_blocks: 4
+  attn_proj_channels: 64
+  input_dim: null
+
+gaussian_child_decoder:
+  enabled: true
+  input_dim: 512
+  hidden_dim: 512
+  child_feat_dim: 320
+  num_children: 16
+  n_frequencies: 15
+  knn_k: 8
+  scale_min: 1.0e-6
+  scale_init_divisor: 2.0
+  offset_residual_bound: 0.5
+
+swinir_weight_path: /space0/mengxl/NAS3R-master/pretrained_weights/001_classicalSR_DF2K_s64w8_SwinIR-M_x4.pth
+swinir_upscale: 4
+swinir_img_size: 64
+swinir_window_size: 8
+
+hisplat_sr_features:
+  enabled: true
+  resunet_dims: [32, 64, 128]
+  croco_dim: 1024
+  out_dim_64: 128
+  out_dim_256: 64

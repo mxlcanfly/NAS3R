@@ -65,6 +65,7 @@ train:
   random_drop_target_views: true
 
   pretrain_camera_head: false
+  child_gaussian_lowfreq_supervision: false
 
 
 test:

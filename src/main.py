@@ -10,6 +10,7 @@ from lightning.pytorch.callbacks import Callback
 from jaxtyping import install_import_hook
 from lightning.pytorch import Trainer
 from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
+from lightning.pytorch.loggers import TensorBoardLogger
 from lightning.pytorch.loggers.wandb import WandbLogger
 from lightning.pytorch.plugins.environments import SLURMEnvironment
 from omegaconf import DictConfig, OmegaConf
@@ -72,15 +73,21 @@ def train(cfg_dict: DictConfig):
     )
     print(cyan(f"Saving outputs to {output_dir}."))
 
-    # Set up logging with wandb.
+    # Set up logging.
     callbacks = []
+    tensorboard_logger = TensorBoardLogger(
+        save_dir=output_dir,
+        name="tensorboard",
+        version=".",
+        default_hp_metric=False,
+    )
     if cfg_dict.wandb.mode != "disabled":
 
         if cfg.checkpointing.load is not None and cfg.checkpointing.resume:
             print(cfg.checkpointing.load, Path(cfg.checkpointing.load).parent.parent)
             with open(Path(cfg.checkpointing.load).parent.parent / "wandb_run_id.txt") as f:
                 resume_id = f.read().strip()
-            logger = WandbLogger(
+            wandb_logger = WandbLogger(
                 project=cfg_dict.wandb.project,
                 mode=cfg_dict.wandb.mode,
                 name=f"{cfg_dict.wandb.name} ({output_dir.parent.name}/{output_dir.name})",
@@ -100,7 +107,7 @@ def train(cfg_dict: DictConfig):
 
         else:
             new_id = uuid.uuid4().hex
-            logger = WandbLogger(
+            wandb_logger = WandbLogger(
                 project=cfg_dict.wandb.project,
                 mode=cfg_dict.wandb.mode,
                 name=f"{cfg_dict.wandb.name} ({output_dir.parent.name}/{output_dir.name})",
@@ -116,6 +123,7 @@ def train(cfg_dict: DictConfig):
                 with open(id_path, "w") as f:
                     f.write(str(new_id))
 
+        logger = [wandb_logger, tensorboard_logger]
         callbacks.append(LearningRateMonitor("step", True))
         callbacks.append(IterationTimer())
 
@@ -123,7 +131,7 @@ def train(cfg_dict: DictConfig):
         if wandb.run is not None:
             wandb.run.log_code("src")
     else:
-        logger = LocalLogger()
+        logger = [LocalLogger(), tensorboard_logger]
 
     # Set up checkpointing.
     callbacks.append(
