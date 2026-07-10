@@ -38,7 +38,6 @@ from ..utils import (
     SingleViewSRFeatureExtractor,
 )
 from ..super_resolution import FrozenSwinIRUpsampler
-from ...misc.hf_energy_utils import sr_residual_lr_map
 
 inf = float('inf')
 
@@ -93,8 +92,6 @@ class EncoderNAS3RMCfg:
     swinir_upscale: int = 4
     swinir_img_size: int = 64
     swinir_window_size: int = 8
-    sr_residual_need_sigma_sq: float | None = None
-    sr_residual_need_ksize: int = 3
     hisplat_sr_features: HiSplatSingleViewFeatureCfg = field(default_factory=HiSplatSingleViewFeatureCfg)
 
 
@@ -273,11 +270,6 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
         context_image = context.get("image_lr", context["image"])
         target_image = target.get("image_lr", target["image"]) if target is not None else None
         context_image_sr = self.swinir_upsampler(context_image)
-        sr_residual_maps = sr_residual_lr_map(
-            context_image,
-            context_image_sr,
-            scale_factor=self.cfg.swinir_upscale,
-        )
         context_sr_features = None
         if self.hisplat_sr_feature_extractor is not None:
             context_sr_features = self.hisplat_sr_feature_extractor(
@@ -430,7 +422,6 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
         lr_context_feature_stack = build_lr_context_feature_stack(
             context_image,
             lr_context_render,
-            sr_residual_maps["residual_lr"],
         )
         lr_gaussian_points = rearrange(
             gaussians.means,
@@ -486,6 +477,7 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
                         camera_centers=anchor_camera_centers,
                         camera_rights=anchor_camera_rights,
                         camera_ups=anchor_camera_ups,
+                        points_per_view=num_lr_gaussian_points,
                     )
 
         # Dump visualizations if needed.
@@ -507,7 +499,6 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
 
         encoder_output = dict()
         encoder_output["image_sr"] = context_image_sr
-        encoder_output["sr_residual_lr"] = sr_residual_maps["residual_lr"]
         encoder_output["lr_gaussian_img_feats"] = lr_gaussian_img_feats
         encoder_output["lr_context_render"] = {
             "color": lr_context_render.color.detach(),

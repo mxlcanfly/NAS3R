@@ -53,7 +53,7 @@ optimizer:
 
 data_loader:
   train:
-    batch_size: 6
+    batch_size: 20
 trainer:
   max_steps: 75001
   val_check_interval: 5000
@@ -68,7 +68,8 @@ train:
   training_context: false
   child_gaussian_lowfreq_supervision: true
   child_lowfreq_visualization_interval: 500
-  child_depth_consistency_weight: 0.005
+  # Temporarily disable child-rendered-depth to LR-DPT-depth supervision.
+  child_depth_consistency_weight: 0.0
 
 
 test:

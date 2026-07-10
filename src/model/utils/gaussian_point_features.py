@@ -23,20 +23,18 @@ LR_IMAGE_CHANNELS = 3
 LR_RENDER_COLOR_CHANNELS = 3
 LR_RENDER_ALPHA_CHANNELS = 1
 LR_RENDER_DEPTH_CHANNELS = 1
-LR_SR_RESIDUAL_CHANNELS = 1
 LR_IMAGE_CHANNEL_START = 0
 LR_RENDER_COLOR_CHANNEL_START = LR_IMAGE_CHANNEL_START + LR_IMAGE_CHANNELS
 LR_RENDER_ALPHA_CHANNEL = LR_RENDER_COLOR_CHANNEL_START + LR_RENDER_COLOR_CHANNELS
 LR_RENDER_DEPTH_CHANNEL = LR_RENDER_ALPHA_CHANNEL + LR_RENDER_ALPHA_CHANNELS
-LR_SR_RESIDUAL_CHANNEL = LR_RENDER_DEPTH_CHANNEL + LR_RENDER_DEPTH_CHANNELS
-LR_CONTEXT_FEATURE_CHANNELS = LR_SR_RESIDUAL_CHANNEL + LR_SR_RESIDUAL_CHANNELS
+LR_CONTEXT_FEATURE_CHANNELS = LR_RENDER_DEPTH_CHANNEL + LR_RENDER_DEPTH_CHANNELS
 
 
 @dataclass
 class GDCrossAttentionCfg:
     enabled: bool = True
     gaussian_feat_dim: int = 256
-    cond_dim: int = 10
+    cond_dim: int = 9
     hidden_dim: int = 160
     num_heads: int = 16
 
@@ -186,18 +184,14 @@ def render_gaussians_to_context(
 def build_lr_context_feature_stack(
     image_lr: Tensor,
     render: ContextGaussianRender,
-    sr_residual_lr: Tensor,
 ) -> Tensor:
     """Stack per-view LR conditioning maps before point sampling."""
-    if sr_residual_lr.ndim == 4:
-        sr_residual_lr = sr_residual_lr.unsqueeze(2)
     feature_stack = torch.cat(
         [
             image_lr,
             render.color,
             render.alpha,
             render.depth,
-            sr_residual_lr,
         ],
         dim=2,
     )

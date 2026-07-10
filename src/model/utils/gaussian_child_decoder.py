@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+import pointops
 import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
@@ -136,17 +137,42 @@ class GDStyleGaussianChildDecoder(nn.Module):
         nn.init.zeros_(last.weight)
         nn.init.zeros_(last.bias)
 
-    def _knn_mean_distance(self, points: Tensor) -> Tensor:
+    def _knn_mean_distance(self, points: Tensor, points_per_view: int | None = None) -> Tensor:
+        if points_per_view is not None:
+            if points_per_view <= 0:
+                raise ValueError(f"points_per_view must be positive, got {points_per_view}")
+            if points.shape[1] % points_per_view != 0:
+                raise ValueError(
+                    "points_per_view must divide the flattened point count: "
+                    f"{points_per_view} vs {points.shape[1]}"
+                )
+            num_views = points.shape[1] // points_per_view
+            grouped_points = rearrange(points, "b (v n) c -> (b v) n c", v=num_views, n=points_per_view)
+            grouped_scale = self._knn_mean_distance(grouped_points)
+            return rearrange(grouped_scale, "(b v) n c -> b (v n) c", b=points.shape[0], v=num_views)
+
         b, n, _ = points.shape
         if n <= 1:
             return points.new_ones(b, n, 1)
-        k = min(self.cfg.knn_k + 1, n)
-        means = []
-        for point_i in points.detach():
-            dist = torch.cdist(point_i.float(), point_i.float())
-            knn_dist = dist.topk(k=k, largest=False).values[:, 1:]
-            means.append(knn_dist.mean(dim=-1, keepdim=True).to(points.dtype))
-        return torch.stack(means, dim=0).clamp_min(1e-6)
+
+        # Use the same pointops CUDA KNN query as the ReSplat point transformer.
+        # It returns only K neighbours per point rather than materializing [N, N]
+        # distances, and `points_per_view` above makes each view its own segment.
+        num_neighbors = min(self.cfg.knn_k, n - 1)
+        with torch.no_grad():
+            flat_points = points.detach().float().reshape(b * n, 3).contiguous()
+            offsets = torch.arange(1, b + 1, device=points.device, dtype=torch.long) * n
+            # Query K + 1 because the first neighbour of each query is itself.
+            _, distances = pointops.knn_query(
+                num_neighbors + 1,
+                flat_points,
+                offsets,
+                flat_points,
+                offsets,
+            )
+        return (
+            distances[:, 1:].mean(dim=-1).reshape(b, n, 1).to(points.dtype).clamp_min(1e-6)
+        )
 
     def _ray_tangent_basis(
         self,
@@ -241,6 +267,7 @@ class GDStyleGaussianChildDecoder(nn.Module):
         camera_centers: Tensor | None = None,
         camera_rights: Tensor | None = None,
         camera_ups: Tensor | None = None,
+        points_per_view: int | None = None,
     ) -> dict[str, Tensor | Gaussians]:
         if points.shape[:2] != features.shape[:2]:
             raise ValueError(f"points/features shape mismatch: {tuple(points.shape)} vs {tuple(features.shape)}")
@@ -251,7 +278,7 @@ class GDStyleGaussianChildDecoder(nn.Module):
         k = self.cfg.num_children
         in_f = self.in_norm(features)
 
-        knn_scale = self._knn_mean_distance(points)
+        knn_scale = self._knn_mean_distance(points, points_per_view=points_per_view)
         bias_xyz = self._tangent_template_to_world(
             points,
             camera_centers,

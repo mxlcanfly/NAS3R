@@ -56,7 +56,7 @@ equal_view_intrinsics: true
 gd_cross_attn:
   enabled: true
   gaussian_feat_dim: 256
-  cond_dim: 10
+  cond_dim: 9
   hidden_dim: 160
   num_heads: 16
 
@@ -80,7 +80,7 @@ gaussian_child_decoder:
   input_dim: 512
   hidden_dim: 512
   child_feat_dim: 320
-  num_children: 16
+  num_children: 8
   n_frequencies: 15
   knn_k: 8
   scale_min: 1.0e-6
