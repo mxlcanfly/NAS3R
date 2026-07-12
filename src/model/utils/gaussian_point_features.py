@@ -34,7 +34,7 @@ LR_CONTEXT_FEATURE_CHANNELS = LR_RENDER_DEPTH_CHANNEL + LR_RENDER_DEPTH_CHANNELS
 class GDCrossAttentionCfg:
     enabled: bool = True
     gaussian_feat_dim: int = 256
-    cond_dim: int = 9
+    cond_dim: int = 8
     hidden_dim: int = 160
     num_heads: int = 16
 
@@ -267,4 +267,4 @@ def sample_lr_gaussian_point_features(
     render_depth = sampled[..., LR_RENDER_DEPTH_CHANNEL]
     z_diff = (render_depth - point_z).abs()
 
-    return torch.cat([sampled, z_diff[..., None]], dim=-1).detach()
+    return torch.cat([sampled[...,:-1], z_diff[..., None]], dim=-1).detach()

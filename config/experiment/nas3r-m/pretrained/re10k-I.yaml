@@ -79,3 +79,6 @@ test:
   save_image: true
   save_video: false
   save_compare: false
+  # false: legacy parent-GS render at image_lr resolution (fast baseline).
+  # true: child-GS render at HR target resolution (SR evaluation).
+  child_hr_evaluation: true

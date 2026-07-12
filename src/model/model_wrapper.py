@@ -70,6 +70,7 @@ class TestCfg:
     save_image: bool
     save_video: bool
     save_compare: bool
+    child_hr_evaluation: bool = False
 
 
 @dataclass
@@ -686,14 +687,19 @@ class ModelWrapper(LightningModule):
 
     def test_step(self, batch, batch_idx):
         v_cxt = batch["context"]["image"].shape[1]
-        target_image = self._images(batch["target"])
-        b, v_tgt, _, h, w = target_image.shape
+        # NAS3R-M normally uses image_lr through _images(). Child HR evaluation
+        # is opt-in because it is substantially more expensive than the legacy
+        # parent-GS 64px evaluation.
+        target_image_lr = self._images(batch["target"])
+        target_image_hr = batch["target"]["image"]
+        b, v_tgt, _, h_lr, w_lr = target_image_lr.shape
         assert b == 1
 
         if batch_idx % 100 == 0:
             print(f"Test step {batch_idx:0>6}.")
 
         visualization_dump = {}
+        use_child_hr_evaluation = False
 
         if self.encoder.cfg.estimating_pose:
             # Render Gaussians.
@@ -716,6 +722,17 @@ class ModelWrapper(LightningModule):
 
                 pred_extrinsics_cwt = encoder_output['extrinsics']['cwt']
                 gaussians = encoder_output["gaussians"]
+                use_child_hr_evaluation = (
+                    self.test_cfg.child_hr_evaluation
+                    and
+                    self.train_cfg.child_gaussian_lowfreq_supervision
+                    and "lr_child_gaussians" in encoder_output
+                )
+                if use_child_hr_evaluation:
+                    gaussians = encoder_output["lr_child_gaussians"]
+                    render_shape = target_data["image"].shape[-2:]
+                else:
+                    render_shape = (h_lr, w_lr)
 
                 if self.encoder.cfg.estimating_focal:
                     pred_intrinsics_cwt = encoder_output['intrinsics']['cwt']
@@ -736,7 +753,7 @@ class ModelWrapper(LightningModule):
                             target_intrinsics,
                             batch["target"]["near"][:, target_view:target_view + 1],
                             batch["target"]["far"][:, target_view:target_view + 1],
-                            (h, w),
+                            render_shape,
                         )
 
                 extrinsics_list.append(pred_extrinsics_cwt[:, v_cxt:])
@@ -761,6 +778,17 @@ class ModelWrapper(LightningModule):
                 target_intrinsics = batch["target"]["intrinsics"]
 
             gaussians = encoder_output['gaussians']
+            use_child_hr_evaluation = (
+                self.test_cfg.child_hr_evaluation
+                and
+                self.train_cfg.child_gaussian_lowfreq_supervision
+                and "lr_child_gaussians" in encoder_output
+            )
+            if use_child_hr_evaluation:
+                gaussians = encoder_output["lr_child_gaussians"]
+                render_shape = target_image_hr.shape[-2:]
+            else:
+                render_shape = (h_lr, w_lr)
 
             # align the target pose
             if self.test_cfg.align_pose:
@@ -773,12 +801,12 @@ class ModelWrapper(LightningModule):
                         target_intrinsics,
                         batch["target"]["near"],
                         batch["target"]["far"],
-                        (h, w),
+                        render_shape,
                     )
             rgb_pred = output.color[0]  # (v, 3, h, w)
 
         (scene,) = batch["scene"]
-        rgb_gt = target_image[0]
+        rgb_gt = (target_image_hr if use_child_hr_evaluation else target_image_lr)[0]
 
         # compute scores
         if self.test_cfg.compute_scores:

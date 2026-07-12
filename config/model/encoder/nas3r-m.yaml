@@ -56,7 +56,7 @@ equal_view_intrinsics: true
 gd_cross_attn:
   enabled: true
   gaussian_feat_dim: 256
-  cond_dim: 9
+  cond_dim: 8
   hidden_dim: 160
   num_heads: 16
 
