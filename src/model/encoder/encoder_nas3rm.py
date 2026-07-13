@@ -1,5 +1,6 @@
 from copy import deepcopy
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Literal, Optional
 
 import torch
@@ -40,6 +41,61 @@ from ..utils import (
 from ..super_resolution import FrozenSwinIRUpsampler
 
 inf = float('inf')
+
+
+def _write_pixel_grid_2d_debug_image(
+    image_shape: tuple[int, int],
+    path: Path,
+    max_cells: int = 16,
+    child_offsets_uv: Tensor | None = None,
+) -> None:
+    """Draw the normalized 2D grid used by unproject_depth_map_to_point_map_batch."""
+    import matplotlib.pyplot as plt
+
+    h, w = image_shape
+    cells_h = min(h, max_cells)
+    cells_w = min(w, max_cells)
+    xs = torch.arange(cells_w, dtype=torch.float32)
+    ys = torch.arange(cells_h, dtype=torch.float32)
+    grid_x, grid_y = torch.meshgrid(xs, ys, indexing="xy")
+    current_x = grid_x / w
+    current_y = grid_y / h
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(7, 7))
+    for x in range(cells_w + 1):
+        ax.axvline(x / w, color="0.82", linewidth=1)
+    for y in range(cells_h + 1):
+        ax.axhline(y / h, color="0.82", linewidth=1)
+    ax.scatter(current_x.flatten(), current_y.flatten(), c="#e3342f", s=34, label="current: u/W, v/H")
+    if child_offsets_uv is not None:
+        child_offsets_uv = child_offsets_uv.detach().cpu()
+        radii = child_offsets_uv.square().sum(dim=-1).sqrt()
+        ring_radii = torch.unique(radii.round(decimals=5), sorted=True)
+        colors = plt.get_cmap("tab10")
+        for ring_idx, ring_radius in enumerate(ring_radii):
+            ring_mask = torch.isclose(radii, ring_radius, atol=1e-4, rtol=0.0)
+            ring_offsets = child_offsets_uv[ring_mask]
+            child_x = current_x[..., None] + ring_offsets[:, 0] / w
+            child_y = current_y[..., None] + ring_offsets[:, 1] / h
+            ax.scatter(
+                child_x.flatten(),
+                child_y.flatten(),
+                color=colors(ring_idx % 10),
+                s=12,
+                label=f"child ring {ring_idx + 1}",
+                zorder=3,
+            )
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xlim(-0.25 / w, (cells_w + 0.75) / w)
+    ax.set_ylim((cells_h + 0.75) / h, -0.25 / h)
+    ax.set_xlabel("normalized x")
+    ax.set_ylabel("normalized y")
+    ax.set_title(f"2D pixel grid used before unprojection, showing {cells_h}x{cells_w} of {h}x{w}")
+    ax.legend(loc="upper right")
+    fig.tight_layout()
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
 
 
 @dataclass
@@ -374,6 +430,23 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
                                                                                 "b v ... -> (b v ) ..."),
                                                                       rearrange(context_intrinsics,
                                                                                 "b v ... -> (b v ) ..."))
+        if not getattr(self, "_did_write_debug_pixel_image", False):
+            debug_path = Path("outputs/debug/nas3rm_pixel_grid_debug.png")
+            _write_pixel_grid_2d_debug_image(
+                (h, w),
+                debug_path,
+                child_offsets_uv=(
+                    self.gaussian_child_decoder.initial_local_offset_uv()
+                    if self.gaussian_child_decoder is not None
+                    else None
+                ),
+            )
+            print(
+                "[NAS3RM pixel debug] wrote "
+                f"{debug_path} with red=current 2D grid, green=pixel center grid, "
+                "max_cells=16"
+            )
+            self._did_write_debug_pixel_image = True
 
         depth_to_pts_all = rearrange(point_map_from_depth, "(b v) ... -> b v ...", b=b, v=v_cxt)
         depth_to_pts_all = rearrange(depth_to_pts_all, "b v h w xyz -> b v (h w) xyz")
@@ -427,22 +500,24 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             gaussians.means,
             "b v r srf spp xyz -> b v (r srf spp) xyz",
         )
-        camera_rotation = context_extrinsics[..., :3, :3]
-        camera_centers = context_extrinsics[..., :3, 3]
-        camera_rights = torch.nn.functional.normalize(camera_rotation[..., :, 0], dim=-1, eps=1e-6)
-        camera_ups = torch.nn.functional.normalize(camera_rotation[..., :, 1], dim=-1, eps=1e-6)
         num_lr_gaussian_points = lr_gaussian_points.shape[2]
-        anchor_camera_centers = rearrange(
-            repeat(camera_centers, "b v xyz -> b v n xyz", n=num_lr_gaussian_points),
-            "b v n xyz -> b (v n) xyz",
+        children_per_pixel = num_surfaces_actual * gaussians_per_pixel_actual
+        pixel_u, pixel_v = torch.meshgrid(
+            torch.arange(w, device=device, dtype=depth_all.dtype),
+            torch.arange(h, device=device, dtype=depth_all.dtype),
+            indexing="xy",
         )
-        anchor_camera_rights = rearrange(
-            repeat(camera_rights, "b v xyz -> b v n xyz", n=num_lr_gaussian_points),
-            "b v n xyz -> b (v n) xyz",
+        parent_uv_per_pixel = torch.stack((pixel_u / w, pixel_v / h), dim=-1)
+        parent_uv_per_view = repeat(
+            parent_uv_per_pixel,
+            "h w xy -> (h w q) xy",
+            q=children_per_pixel,
         )
-        anchor_camera_ups = rearrange(
-            repeat(camera_ups, "b v xyz -> b v n xyz", n=num_lr_gaussian_points),
-            "b v n xyz -> b (v n) xyz",
+        parent_uv = repeat(parent_uv_per_view, "n xy -> b (v n) xy", b=b, v=v_cxt)
+        parent_depths = repeat(
+            depth_all,
+            "b v h w -> b (v h w q)",
+            q=children_per_pixel,
         )
         lr_gaussian_point_feats = sample_lr_gaussian_point_features(
             lr_gaussian_points,
@@ -474,9 +549,11 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
                         flat_lr_gaussians.means,
                         lr_gaussian_pt_feats,
                         flat_lr_gaussians,
-                        camera_centers=anchor_camera_centers,
-                        camera_rights=anchor_camera_rights,
-                        camera_ups=anchor_camera_ups,
+                        parent_uv=parent_uv,
+                        parent_depths=parent_depths,
+                        extrinsics=context_extrinsics,
+                        intrinsics=context_intrinsics,
+                        image_shape=(h, w),
                         points_per_view=num_lr_gaussian_points,
                     )
 
@@ -516,7 +593,9 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             encoder_output["lr_child_gaussian_features"] = lr_child_decode["features"]
             encoder_output["lr_child_decode"] = {
                 "delta_means": lr_child_decode["delta_means"],
-                "knn_scale": lr_child_decode["knn_scale"],
+                "local_offset_uv": lr_child_decode["local_offset_uv"],
+                "predicted_delta_z": lr_child_decode["predicted_delta_z"],
+                "child_depths": lr_child_decode["child_depths"],
                 "delta_attrs": lr_child_decode["delta_attrs"],
             }
         if context_sr_features is not None:

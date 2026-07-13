@@ -53,7 +53,7 @@ optimizer:
 
 data_loader:
   train:
-    batch_size: 20
+    batch_size: 2
 trainer:
   max_steps: 75001
   val_check_interval: 5000

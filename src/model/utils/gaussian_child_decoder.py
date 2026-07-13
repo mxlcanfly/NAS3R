@@ -3,9 +3,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-import pointops
 import torch
-import torch.nn.functional as F
 from einops import rearrange, repeat
 from torch import Tensor, nn
 
@@ -20,10 +18,11 @@ class GDStyleGaussianChildDecoderCfg:
     child_feat_dim: int = 320
     num_children: int = 4
     n_frequencies: int = 10
-    knn_k: int = 4
     scale_min: float = 1e-6
     scale_init_divisor: float = 1.6
     offset_residual_bound: float = 0.5
+    num_rings: int | None = None
+    max_radius_pixel: float = 0.95
 
 
 def positional_encoding(base_freq: Tensor, x: Tensor) -> Tensor:
@@ -31,26 +30,36 @@ def positional_encoding(base_freq: Tensor, x: Tensor) -> Tensor:
     return torch.cat([torch.sin(fx), torch.cos(fx)], dim=-1)
 
 
-def make_deformable_ring_template(num_children: int, device: torch.device, dtype: torch.dtype) -> Tensor:
-    """Create a Deformable-DETR-style 2D offset template.
-
-    Returns:
-        template: [K, 2], flattened in [head, point] order and truncated to K.
-    """
+def build_quarter_ring_uv_bias(
+    num_children: int,
+    num_rings: int | None = None,
+    max_radius_pixel: float = 0.95,
+    eps: float = 1e-4,
+    return_pre_sigmoid: bool = True,
+    dtype: torch.dtype = torch.float32,
+) -> Tensor:
+    """Build lower-right quarter-ring offsets in LR-pixel coordinates."""
     if num_children < 1:
         raise ValueError(f"num_children must be positive, got {num_children}")
-    num_points = max(1, int(math.floor(math.sqrt(num_children))))
-    num_heads = int(math.ceil(num_children / num_points))
+    if num_rings is None:
+        num_rings = max(1, math.ceil(math.sqrt(num_children)))
+    if num_rings < 1 or num_rings > num_children:
+        raise ValueError(f"num_rings must be in [1, num_children], got {num_rings}")
+    if not 0.0 < max_radius_pixel < 1.0:
+        raise ValueError(f"max_radius_pixel must be in (0, 1), got {max_radius_pixel}")
+    if not 0.0 < eps < 0.5:
+        raise ValueError(f"eps must be in (0, 0.5), got {eps}")
 
-    theta = torch.arange(num_heads, device=device, dtype=dtype) * (2.0 * math.pi / num_heads)
-    directions = torch.stack([theta.cos(), theta.sin()], dim=-1)
-    directions = directions / directions.abs().amax(dim=-1, keepdim=True).clamp_min(1e-6)
+    base, remainder = divmod(num_children, num_rings)
+    rings = []
+    for ring_idx in range(num_rings):
+        count = base + int(ring_idx < remainder)
+        radius = max_radius_pixel * (ring_idx + 1) / num_rings
+        theta = (torch.arange(count, dtype=dtype) + 0.5) / count * (math.pi / 2.0)
+        rings.append(radius * torch.stack((theta.cos(), theta.sin()), dim=-1))
 
-    # Normalize the ring radii here, so the outer ring has radius 1.0.
-    # The real metric radius is applied later as d_n * offset_xyz.
-    radii = torch.arange(1, num_points + 1, device=device, dtype=dtype) / num_points
-    template = directions[:, None, :] * radii[None, :, None]
-    return rearrange(template, "h p xy -> (h p) xy")[:num_children]
+    template_uv = torch.cat(rings, dim=0).clamp(eps, 1.0 - eps)
+    return torch.logit(template_uv) if return_pre_sigmoid else template_uv
 
 
 def quaternion_to_matrix(quaternions: Tensor, eps: float = 1e-8) -> Tensor:
@@ -101,12 +110,7 @@ class GDStyleGaussianChildDecoder(nn.Module):
             nn.GELU(),
             nn.Linear(cfg.hidden_dim, 3 * cfg.num_children),
         )
-        self._init_delta_x_as_zero_residual()
-        self.register_buffer(
-            "offset_template_2d",
-            make_deformable_ring_template(cfg.num_children, device=torch.device("cpu"), dtype=torch.float32),
-            persistent=False,
-        )
+        self._init_delta_x_deformable_bias()
         self.skip = nn.Linear(cfg.input_dim, cfg.child_feat_dim)
 
         pe_dim = 3 * 2 * cfg.n_frequencies if cfg.n_frequencies > 0 else 3
@@ -130,117 +134,61 @@ class GDStyleGaussianChildDecoder(nn.Module):
         if cfg.n_frequencies > 0:
             self.register_buffer("frequencies", 2.0 ** torch.arange(cfg.n_frequencies), persistent=False)
 
-    def _init_delta_x_as_zero_residual(self) -> None:
+    def _init_delta_x_deformable_bias(self) -> None:
         last = self.delta_x[-1]
         if not isinstance(last, nn.Linear):
             raise TypeError("delta_x is expected to end with nn.Linear")
         nn.init.zeros_(last.weight)
-        nn.init.zeros_(last.bias)
-
-    def _knn_mean_distance(self, points: Tensor, points_per_view: int | None = None) -> Tensor:
-        if points_per_view is not None:
-            if points_per_view <= 0:
-                raise ValueError(f"points_per_view must be positive, got {points_per_view}")
-            if points.shape[1] % points_per_view != 0:
-                raise ValueError(
-                    "points_per_view must divide the flattened point count: "
-                    f"{points_per_view} vs {points.shape[1]}"
-                )
-            num_views = points.shape[1] // points_per_view
-            grouped_points = rearrange(points, "b (v n) c -> (b v) n c", v=num_views, n=points_per_view)
-            grouped_scale = self._knn_mean_distance(grouped_points)
-            return rearrange(grouped_scale, "(b v) n c -> b (v n) c", b=points.shape[0], v=num_views)
-
-        b, n, _ = points.shape
-        if n <= 1:
-            return points.new_ones(b, n, 1)
-
-        # Use the same pointops CUDA KNN query as the ReSplat point transformer.
-        # It returns only K neighbours per point rather than materializing [N, N]
-        # distances, and `points_per_view` above makes each view its own segment.
-        num_neighbors = min(self.cfg.knn_k, n - 1)
+        uv_bias = build_quarter_ring_uv_bias(
+            num_children=self.cfg.num_children,
+            num_rings=self.cfg.num_rings,
+            max_radius_pixel=self.cfg.max_radius_pixel,
+            return_pre_sigmoid=True,
+            dtype=last.bias.dtype,
+        )
+        uvz_bias = torch.zeros(
+            self.cfg.num_children,
+            3,
+            device=last.bias.device,
+            dtype=last.bias.dtype,
+        )
+        uvz_bias[:, :2] = uv_bias
         with torch.no_grad():
-            flat_points = points.detach().float().reshape(b * n, 3).contiguous()
-            offsets = torch.arange(1, b + 1, device=points.device, dtype=torch.long) * n
-            # Query K + 1 because the first neighbour of each query is itself.
-            _, distances = pointops.knn_query(
-                num_neighbors + 1,
-                flat_points,
-                offsets,
-                flat_points,
-                offsets,
-            )
-        return (
-            distances[:, 1:].mean(dim=-1).reshape(b, n, 1).to(points.dtype).clamp_min(1e-6)
-        )
+            last.bias.copy_(uvz_bias.reshape(-1))
 
-    def _ray_tangent_basis(
-        self,
-        points: Tensor,
-        camera_centers: Tensor,
-        camera_rights: Tensor,
-        camera_ups: Tensor,
-    ) -> tuple[Tensor, Tensor, Tensor]:
-        """Build a ray-local frame from reference camera axes.
+    def initial_local_offset_uv(self) -> Tensor:
+        """Return the quarter-ring template currently stored in the offset-head bias."""
+        last = self.delta_x[-1]
+        if not isinstance(last, nn.Linear):
+            raise TypeError("delta_x is expected to end with nn.Linear")
+        return torch.sigmoid(last.bias.reshape(self.cfg.num_children, 3)[:, :2])
 
-        Shapes:
-            points/camera_*: [B, N, 3]
-            returns ray_dir/t1/t2: [B, N, 3]
-        """
-        ray_dir = F.normalize(points.detach() - camera_centers.detach(), dim=-1, eps=1e-6)
-
-        def project_to_tangent(vector: Tensor) -> Tensor:
-            return vector - (vector * ray_dir).sum(dim=-1, keepdim=True) * ray_dir
-
-        t1_from_right = project_to_tangent(camera_rights.detach())
-        t1_from_up = project_to_tangent(camera_ups.detach())
-
-        x_axis = torch.zeros_like(ray_dir)
-        x_axis[..., 0] = 1.0
-        y_axis = torch.zeros_like(ray_dir)
-        y_axis[..., 1] = 1.0
-        fallback_axis = torch.where(ray_dir[..., :1].abs() < 0.9, x_axis, y_axis)
-        t1_fallback = project_to_tangent(fallback_axis)
-
-        right_valid = t1_from_right.norm(dim=-1, keepdim=True) > 1e-6
-        up_valid = t1_from_up.norm(dim=-1, keepdim=True) > 1e-6
-        t1 = torch.where(right_valid, t1_from_right, torch.where(up_valid, t1_from_up, t1_fallback))
-        t1 = F.normalize(t1, dim=-1, eps=1e-6)
-        t2 = F.normalize(torch.cross(ray_dir, t1, dim=-1), dim=-1, eps=1e-6)
-        t1 = F.normalize(torch.cross(t2, ray_dir, dim=-1), dim=-1, eps=1e-6)
-        return ray_dir, t1, t2
-
-    def _tangent_template_to_world(
-        self,
-        points: Tensor,
-        camera_centers: Tensor | None,
-        camera_rights: Tensor | None,
-        camera_ups: Tensor | None,
+    @staticmethod
+    def _unproject_child_uv(
+        child_uv: Tensor,
+        child_depths: Tensor,
+        extrinsics: Tensor,
+        intrinsics: Tensor,
+        points_per_view: int,
     ) -> Tensor:
-        """Map the fixed Deformable-style 2D ring template to tangent-plane xyz.
-
-        Shapes:
-            template: [K, 2]
-            t1/t2: [B, N, 3]
-            bias_xyz: [B, N, K, 3]
-        """
-        if camera_centers is None or camera_rights is None or camera_ups is None:
-            return points.new_zeros(points.shape[0], points.shape[1], self.cfg.num_children, 3)
-
-        if camera_centers.shape != points.shape:
-            raise ValueError(f"camera_centers shape mismatch: {tuple(camera_centers.shape)} vs {tuple(points.shape)}")
-        if camera_rights.shape != points.shape or camera_ups.shape != points.shape:
-            raise ValueError(
-                "camera_rights/camera_ups must match points shape: "
-                f"{tuple(camera_rights.shape)}, {tuple(camera_ups.shape)}, {tuple(points.shape)}"
-            )
-
-        _, t1, t2 = self._ray_tangent_basis(points, camera_centers, camera_rights, camera_ups)
-        template = self.offset_template_2d.to(device=points.device, dtype=points.dtype)
-        return (
-            template[None, None, :, 0:1] * t1[:, :, None, :]
-            + template[None, None, :, 1:2] * t2[:, :, None, :]
+        """Unproject child UV and child z-depth into world coordinates."""
+        b, total_points, k, _ = child_uv.shape
+        if total_points % points_per_view != 0:
+            raise ValueError("points_per_view must divide the flattened point count")
+        num_views = total_points // points_per_view
+        child_uv = rearrange(child_uv, "b (v n) k xy -> b v n k xy", v=num_views, n=points_per_view)
+        child_depths = rearrange(
+            child_depths,
+            "b (v n) k one -> b v n k one",
+            v=num_views,
+            n=points_per_view,
         )
+        pixel_h = torch.cat((child_uv, torch.ones_like(child_uv[..., :1])), dim=-1)
+        rays = torch.einsum("bvij,bvnkj->bvnki", torch.linalg.inv(intrinsics), pixel_h)
+        camera_points = rays * child_depths
+        camera_points_h = torch.cat((camera_points, torch.ones_like(camera_points[..., :1])), dim=-1)
+        world_points = torch.einsum("bvij,bvnkj->bvnki", extrinsics, camera_points_h)[..., :3]
+        return rearrange(world_points, "b v n k xyz -> b (v n) k xyz")
 
     def _expand_base_gaussians(self, gaussians: Gaussians, num_children: int) -> dict[str, Tensor]:
         if self.cfg.scale_init_divisor <= 0:
@@ -264,10 +212,12 @@ class GDStyleGaussianChildDecoder(nn.Module):
         points: Tensor,
         features: Tensor,
         gaussians: Gaussians,
-        camera_centers: Tensor | None = None,
-        camera_rights: Tensor | None = None,
-        camera_ups: Tensor | None = None,
-        points_per_view: int | None = None,
+        parent_uv: Tensor,
+        parent_depths: Tensor,
+        extrinsics: Tensor,
+        intrinsics: Tensor,
+        image_shape: tuple[int, int],
+        points_per_view: int,
     ) -> dict[str, Tensor | Gaussians]:
         if points.shape[:2] != features.shape[:2]:
             raise ValueError(f"points/features shape mismatch: {tuple(points.shape)} vs {tuple(features.shape)}")
@@ -278,18 +228,21 @@ class GDStyleGaussianChildDecoder(nn.Module):
         k = self.cfg.num_children
         in_f = self.in_norm(features)
 
-        knn_scale = self._knn_mean_distance(points, points_per_view=points_per_view)
-        bias_xyz = self._tangent_template_to_world(
-            points,
-            camera_centers,
-            camera_rights,
-            camera_ups,
+        predicted_offset_uvz = self.delta_x(in_f).reshape(b, n, k, 3)
+        local_offset_uv = torch.sigmoid(predicted_offset_uvz[..., :2])
+        predicted_delta_z = predicted_offset_uvz[..., 2:3]
+        h, w = image_shape
+        pixel_size = points.new_tensor((1.0 / w, 1.0 / h))
+        child_uv = parent_uv.detach()[:, :, None, :] + local_offset_uv * pixel_size
+        child_depths = parent_depths.detach()[:, :, None, None] + predicted_delta_z
+        child_means_seed = self._unproject_child_uv(
+            child_uv,
+            child_depths,
+            extrinsics,
+            intrinsics,
+            points_per_view,
         )
-
-        # child_xyz = anchor_xyz + d_n * offset. The template is normalized in
-        # make_deformable_ring_template, so the outer ring is one local KNN spacing.
-        delta_xyz = knn_scale[:, :, None, :] * torch.tanh(bias_xyz + self.delta_x(in_f).reshape(b, n, k, 3))
-        child_means_seed = points.detach()[:, :, None, :] + delta_xyz
+        delta_xyz = child_means_seed - points.detach()[:, :, None, :]
         delta_xyz = rearrange(delta_xyz, "b n k xyz -> b (n k) xyz")
         child_means_seed = rearrange(child_means_seed, "b n k xyz -> b (n k) xyz")
 
@@ -329,6 +282,8 @@ class GDStyleGaussianChildDecoder(nn.Module):
             "gaussians": child_gaussians,
             "features": child_features,
             "delta_means": delta_xyz,
-            "knn_scale": knn_scale,
+            "local_offset_uv": local_offset_uv,
+            "predicted_delta_z": predicted_delta_z,
+            "child_depths": child_depths,
             "delta_attrs": delta_attrs,
         }

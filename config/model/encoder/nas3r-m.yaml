@@ -82,10 +82,11 @@ gaussian_child_decoder:
   child_feat_dim: 320
   num_children: 8
   n_frequencies: 15
-  knn_k: 8
   scale_min: 1.0e-6
   scale_init_divisor: 2.0
   offset_residual_bound: 0.5
+  num_rings: null
+  max_radius_pixel: 0.95
 
 swinir_weight_path: /space0/mengxl/NAS3R-master/pretrained_weights/001_classicalSR_DF2K_s64w8_SwinIR-M_x4.pth
 swinir_upscale: 4
