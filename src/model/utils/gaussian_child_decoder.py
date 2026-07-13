@@ -19,6 +19,7 @@ class GDStyleGaussianChildDecoderCfg:
     num_children: int = 4
     n_frequencies: int = 10
     scale_min: float = 1e-6
+    scale_max: float = 0.3
     scale_init_divisor: float = 1.6
     offset_residual_bound: float = 0.5
     num_rings: int | None = None
@@ -157,11 +158,17 @@ class GDStyleGaussianChildDecoder(nn.Module):
             last.bias.copy_(uvz_bias.reshape(-1))
 
     def initial_local_offset_uv(self) -> Tensor:
-        """Return the quarter-ring template currently stored in the offset-head bias."""
+        """Return the immutable quarter-ring initialization template."""
         last = self.delta_x[-1]
         if not isinstance(last, nn.Linear):
             raise TypeError("delta_x is expected to end with nn.Linear")
-        return torch.sigmoid(last.bias.reshape(self.cfg.num_children, 3)[:, :2])
+        return build_quarter_ring_uv_bias(
+            num_children=self.cfg.num_children,
+            num_rings=self.cfg.num_rings,
+            max_radius_pixel=self.cfg.max_radius_pixel,
+            return_pre_sigmoid=False,
+            dtype=last.bias.dtype,
+        ).to(last.bias.device)
 
     @staticmethod
     def _unproject_child_uv(
@@ -193,15 +200,18 @@ class GDStyleGaussianChildDecoder(nn.Module):
     def _expand_base_gaussians(self, gaussians: Gaussians, num_children: int) -> dict[str, Tensor]:
         if self.cfg.scale_init_divisor <= 0:
             raise ValueError(f"scale_init_divisor must be positive, got {self.cfg.scale_init_divisor}")
+        if self.cfg.scale_max <= self.cfg.scale_min:
+            raise ValueError(
+                "scale_max must be greater than scale_min, got "
+                f"{self.cfg.scale_max} <= {self.cfg.scale_min}"
+            )
         base_opacity = gaussians.opacities.detach().clamp(1e-6, 1.0 - 1e-6)
-        child_opacity = 1.0 - (1.0 - base_opacity).pow(1.0 / num_children)
-        base_opacity_raw = torch.logit(child_opacity, eps=1e-6).unsqueeze(-1)
+        base_opacity_raw = torch.logit(base_opacity, eps=1e-6).unsqueeze(-1)
         base_scales = (gaussians.scales.detach() / self.cfg.scale_init_divisor).clamp_min(self.cfg.scale_min)
-        base_log_scales = base_scales.log()
         base_sh = rearrange(gaussians.harmonics.detach(), "b n c d -> b n (c d)")
         return {
             "means": repeat(gaussians.means.detach(), "b n c -> b (n k) c", k=num_children),
-            "log_scales": repeat(base_log_scales, "b n c -> b (n k) c", k=num_children),
+            "scales": repeat(base_scales, "b n c -> b (n k) c", k=num_children),
             "rotations": repeat(gaussians.rotations.detach(), "b n c -> b (n k) c", k=num_children),
             "opacities_raw": repeat(base_opacity_raw, "b n c -> b (n k) c", k=num_children),
             "sh": repeat(base_sh, "b n c -> b (n k) c", k=num_children),
@@ -262,8 +272,10 @@ class GDStyleGaussianChildDecoder(nn.Module):
         base = self._expand_base_gaussians(gaussians, k)
 
         child_means = child_means_seed
-        child_log_scales = base["log_scales"] + delta_scales
-        child_scales = child_log_scales.exp().clamp_min(self.cfg.scale_min)
+        child_scales = (base["scales"].detach() + delta_scales).clamp(
+            min=self.cfg.scale_min,
+            max=self.cfg.scale_max,
+        )
         child_rotations_unnorm = base["rotations"] + delta_rotations
         child_rotations = child_rotations_unnorm / (child_rotations_unnorm.norm(dim=-1, keepdim=True) + 1e-8)
         child_opacities_raw = base["opacities_raw"] + delta_opacities

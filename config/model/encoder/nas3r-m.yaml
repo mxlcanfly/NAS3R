@@ -81,8 +81,9 @@ gaussian_child_decoder:
   hidden_dim: 512
   child_feat_dim: 320
   num_children: 8
-  n_frequencies: 15
+  n_frequencies: 10
   scale_min: 1.0e-6
+  scale_max: 0.3
   scale_init_divisor: 2.0
   offset_residual_bound: 0.5
   num_rings: null

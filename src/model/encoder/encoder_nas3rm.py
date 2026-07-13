@@ -47,9 +47,11 @@ def _write_pixel_grid_2d_debug_image(
     image_shape: tuple[int, int],
     path: Path,
     max_cells: int = 16,
-    child_offsets_uv: Tensor | None = None,
+    initial_child_offsets_uv: Tensor | None = None,
+    updated_child_offsets_uv: Tensor | None = None,
+    parents_per_pixel: int = 1,
 ) -> None:
-    """Draw the normalized 2D grid used by unproject_depth_map_to_point_map_batch."""
+    """Compare initial and predicted child UV positions on the LR pixel grid."""
     import matplotlib.pyplot as plt
 
     h, w = image_shape
@@ -61,38 +63,151 @@ def _write_pixel_grid_2d_debug_image(
     current_x = grid_x / w
     current_y = grid_y / h
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fig, ax = plt.subplots(figsize=(7, 7))
-    for x in range(cells_w + 1):
-        ax.axvline(x / w, color="0.82", linewidth=1)
-    for y in range(cells_h + 1):
-        ax.axhline(y / h, color="0.82", linewidth=1)
-    ax.scatter(current_x.flatten(), current_y.flatten(), c="#e3342f", s=34, label="current: u/W, v/H")
-    if child_offsets_uv is not None:
-        child_offsets_uv = child_offsets_uv.detach().cpu()
-        radii = child_offsets_uv.square().sum(dim=-1).sqrt()
-        ring_radii = torch.unique(radii.round(decimals=5), sorted=True)
+    if initial_child_offsets_uv is None:
+        initial_child_offsets_uv = torch.empty(0, 2)
+    initial_child_offsets_uv = initial_child_offsets_uv.detach().float().cpu()
+    radii = initial_child_offsets_uv.square().sum(dim=-1).sqrt()
+    ring_radii = torch.unique(radii.round(decimals=5), sorted=True)
+    ring_masks = [
+        torch.isclose(radii, ring_radius, atol=1e-4, rtol=0.0)
+        for ring_radius in ring_radii
+    ]
+
+    if updated_child_offsets_uv is not None:
+        expected_points = h * w * parents_per_pixel
+        if updated_child_offsets_uv.shape[:1] != (expected_points,):
+            raise ValueError(
+                "updated_child_offsets_uv must contain one view of LR points: "
+                f"expected first dimension {expected_points}, got {tuple(updated_child_offsets_uv.shape)}"
+            )
+        updated_child_offsets_uv = rearrange(
+            updated_child_offsets_uv.detach().float().cpu(),
+            "(h w q) k xy -> h w q k xy",
+            h=h,
+            w=w,
+            q=parents_per_pixel,
+        )[:cells_h, :cells_w]
+        offset_delta_l2 = (
+            updated_child_offsets_uv - initial_child_offsets_uv[None, None, None]
+        ).norm(dim=-1)
+        updated_title = (
+            "Updated XY after bias + predicted residual\n"
+            f"delta L2 in LR pixels: mean={offset_delta_l2.mean():.4f}, "
+            f"max={offset_delta_l2.amax():.4f}"
+        )
+
+    def draw_panel(ax, offsets_uv: Tensor, title: str) -> None:
+        for x in range(cells_w + 1):
+            ax.axvline(x / w, color="0.82", linewidth=1)
+        for y in range(cells_h + 1):
+            ax.axhline(y / h, color="0.82", linewidth=1)
+        ax.scatter(
+            current_x.flatten(),
+            current_y.flatten(),
+            c="#e3342f",
+            s=30,
+            label="parent: u/W, v/H",
+            zorder=4,
+        )
         colors = plt.get_cmap("tab10")
-        for ring_idx, ring_radius in enumerate(ring_radii):
-            ring_mask = torch.isclose(radii, ring_radius, atol=1e-4, rtol=0.0)
-            ring_offsets = child_offsets_uv[ring_mask]
-            child_x = current_x[..., None] + ring_offsets[:, 0] / w
-            child_y = current_y[..., None] + ring_offsets[:, 1] / h
+        for ring_idx, ring_mask in enumerate(ring_masks):
+            if offsets_uv.ndim == 2:
+                ring_offsets = offsets_uv[ring_mask]
+                child_x = current_x[..., None] + ring_offsets[:, 0] / w
+                child_y = current_y[..., None] + ring_offsets[:, 1] / h
+            else:
+                ring_offsets = offsets_uv[..., ring_mask, :]
+                child_x = current_x[..., None, None] + ring_offsets[..., 0] / w
+                child_y = current_y[..., None, None] + ring_offsets[..., 1] / h
             ax.scatter(
                 child_x.flatten(),
                 child_y.flatten(),
                 color=colors(ring_idx % 10),
-                s=12,
+                s=10,
                 label=f"child ring {ring_idx + 1}",
                 zorder=3,
             )
-    ax.set_aspect("equal", adjustable="box")
-    ax.set_xlim(-0.25 / w, (cells_w + 0.75) / w)
-    ax.set_ylim((cells_h + 0.75) / h, -0.25 / h)
-    ax.set_xlabel("normalized x")
-    ax.set_ylabel("normalized y")
-    ax.set_title(f"2D pixel grid used before unprojection, showing {cells_h}x{cells_w} of {h}x{w}")
-    ax.legend(loc="upper right")
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xlim(-0.25 / w, (cells_w + 0.75) / w)
+        ax.set_ylim((cells_h + 0.75) / h, -0.25 / h)
+        ax.set_xlabel("normalized x")
+        ax.set_ylabel("normalized y")
+        ax.set_title(title)
+        ax.legend(loc="upper right")
+
+    def draw_single_pixel_panel(ax, offsets_uv: Tensor) -> None:
+        pixel_y = cells_h // 2
+        pixel_x = cells_w // 2
+        updated = offsets_uv[pixel_y, pixel_x, 0]
+        if updated.shape != initial_child_offsets_uv.shape:
+            raise ValueError(
+                "Initial/updated child count mismatch in UV visualization: "
+                f"{tuple(initial_child_offsets_uv.shape)} vs {tuple(updated.shape)}"
+            )
+        colors = plt.get_cmap("tab10")
+        for child_idx, (initial_uv, updated_uv) in enumerate(
+            zip(initial_child_offsets_uv, updated)
+        ):
+            color = colors(child_idx % 10)
+            ax.annotate(
+                "",
+                xy=updated_uv.tolist(),
+                xytext=initial_uv.tolist(),
+                arrowprops={"arrowstyle": "->", "color": color, "linewidth": 1.2},
+                zorder=2,
+            )
+            ax.scatter(
+                initial_uv[0],
+                initial_uv[1],
+                marker="x",
+                color=color,
+                s=45,
+                zorder=3,
+            )
+            ax.scatter(
+                updated_uv[0],
+                updated_uv[1],
+                marker="o",
+                color=color,
+                edgecolors="white",
+                linewidths=0.7,
+                s=55,
+                zorder=4,
+            )
+            ax.annotate(
+                str(child_idx + 1),
+                updated_uv.tolist(),
+                xytext=(4, 4),
+                textcoords="offset points",
+                color=color,
+                fontsize=9,
+                weight="bold",
+                zorder=5,
+            )
+        ax.scatter(0.0, 0.0, marker="+", color="#e3342f", s=90, linewidths=2, zorder=6)
+        ax.set_xlim(-0.03, 1.03)
+        ax.set_ylim(1.03, -0.03)
+        ax.set_aspect("equal", adjustable="box")
+        ax.grid(color="0.85", linewidth=1)
+        ax.set_xlabel("local offset u in LR pixels")
+        ax.set_ylabel("local offset v in LR pixels")
+        ax.set_title(
+            f"Single-pixel child motion at LR pixel ({pixel_x}, {pixel_y})\n"
+            "x = initialization, o = updated, arrow = motion"
+        )
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    panel_count = 3 if updated_child_offsets_uv is not None else 1
+    fig, axes = plt.subplots(1, panel_count, figsize=(7 * panel_count, 7), squeeze=False)
+    draw_panel(axes[0, 0], initial_child_offsets_uv, "Initial XY from quarter-ring bias")
+    if updated_child_offsets_uv is not None:
+        draw_panel(
+            axes[0, 1],
+            updated_child_offsets_uv,
+            updated_title,
+        )
+        draw_single_pixel_panel(axes[0, 2], updated_child_offsets_uv)
+    fig.suptitle(f"LR pixel grid: showing {cells_h}x{cells_w} of {h}x{w}")
     fig.tight_layout()
     fig.savefig(path, dpi=180)
     plt.close(fig)
@@ -430,24 +545,6 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
                                                                                 "b v ... -> (b v ) ..."),
                                                                       rearrange(context_intrinsics,
                                                                                 "b v ... -> (b v ) ..."))
-        if not getattr(self, "_did_write_debug_pixel_image", False):
-            debug_path = Path("outputs/debug/nas3rm_pixel_grid_debug.png")
-            _write_pixel_grid_2d_debug_image(
-                (h, w),
-                debug_path,
-                child_offsets_uv=(
-                    self.gaussian_child_decoder.initial_local_offset_uv()
-                    if self.gaussian_child_decoder is not None
-                    else None
-                ),
-            )
-            print(
-                "[NAS3RM pixel debug] wrote "
-                f"{debug_path} with red=current 2D grid, green=pixel center grid, "
-                "max_cells=16"
-            )
-            self._did_write_debug_pixel_image = True
-
         depth_to_pts_all = rearrange(point_map_from_depth, "(b v) ... -> b v ...", b=b, v=v_cxt)
         depth_to_pts_all = rearrange(depth_to_pts_all, "b v h w xyz -> b v (h w) xyz")
         # print("depth_to_pts_all", depth_to_pts_all[0,0,0])
@@ -616,6 +713,39 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
                 encoder_output['intrinsics']['cwt'] = pred_intrinsics
 
         return encoder_output
+
+    def predict_dpt_depth(self, images: Tensor, intrinsics: Tensor) -> Tensor:
+        """Predict DPT z-depth without running Gaussian or child branches."""
+        if images.ndim != 5:
+            raise ValueError(f"images must have shape [B,V,3,H,W], got {tuple(images.shape)}")
+        b, num_views, _, _, _ = images.shape
+        backbone_output = self.backbone(
+            {
+                "image": normalize_image(images),
+                "intrinsics": intrinsics,
+            }
+        )
+        dec_feat = backbone_output["dec_feat"]
+        shape = backbone_output["shape"]
+
+        depth_outputs = []
+        with torch.amp.autocast("cuda", enabled=False):
+            depth_outputs.append(
+                self._downstream_depth_head(
+                    1,
+                    [tokens[:, 0].float() for tokens in dec_feat],
+                    shape[:, 0],
+                )["depth"]
+            )
+            for view_idx in range(1, num_views):
+                depth_outputs.append(
+                    self._downstream_depth_head(
+                        2,
+                        [tokens[:, view_idx].float() for tokens in dec_feat],
+                        shape[:, view_idx],
+                    )["depth"]
+                )
+        return torch.stack(depth_outputs, dim=1).squeeze(-1)
 
     def process_pose(self, pose_enc, context_views):
         # pose_enc: (b v 9)

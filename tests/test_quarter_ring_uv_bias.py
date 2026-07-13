@@ -8,6 +8,7 @@ from src.model.utils.gaussian_child_decoder import (
     GDStyleGaussianChildDecoder,
     GDStyleGaussianChildDecoderCfg,
 )
+from src.model.types import Gaussians
 
 
 @pytest.mark.parametrize("num_children", [4, 8, 10, 16, 20])
@@ -60,3 +61,42 @@ def test_decoder_initializes_offset_head_bias_from_template() -> None:
     torch.testing.assert_close(initialized_bias[:, 2], torch.zeros(10))
     torch.testing.assert_close(decoder.initial_local_offset_uv(), torch.sigmoid(expected_bias))
     assert "uv_bias" not in dict(decoder.named_buffers())
+
+
+def test_decoder_caps_child_scales() -> None:
+    cfg = GDStyleGaussianChildDecoderCfg(
+        input_dim=8,
+        hidden_dim=16,
+        child_feat_dim=8,
+        num_children=4,
+        n_frequencies=0,
+        scale_max=0.3,
+    )
+    decoder = GDStyleGaussianChildDecoder(cfg, sh_degree=0)
+    with torch.no_grad():
+        decoder.attr_head[-1].bias[:3].fill_(10.0)
+
+    gaussians = Gaussians(
+        means=torch.tensor([[[0.0, 0.0, 1.0]]]),
+        covariances=torch.eye(3).reshape(1, 1, 3, 3),
+        rotations=torch.tensor([[[0.0, 0.0, 0.0, 1.0]]]),
+        scales=torch.ones(1, 1, 3),
+        harmonics=torch.zeros(1, 1, 3, 1),
+        opacities=torch.full((1, 1), 0.5),
+    )
+    result = decoder(
+        points=gaussians.means,
+        features=torch.zeros(1, 1, cfg.input_dim),
+        gaussians=gaussians,
+        parent_uv=torch.zeros(1, 1, 2),
+        parent_depths=torch.ones(1, 1),
+        extrinsics=torch.eye(4).reshape(1, 1, 4, 4),
+        intrinsics=torch.eye(3).reshape(1, 1, 3, 3),
+        image_shape=(1, 1),
+        points_per_view=1,
+    )
+
+    child_scales = result["gaussians"].scales
+    assert child_scales.shape == (1, cfg.num_children, 3)
+    assert child_scales.amax() <= cfg.scale_max
+    assert child_scales.amin() >= cfg.scale_min

@@ -45,6 +45,7 @@ from ..visualization.layout import add_border, hcat, vcat
 from ..visualization.validation_in_3d import render_cameras, render_projections, render_cameras_es
 from .decoder.decoder import Decoder, DepthRenderingMode
 from .encoder import Encoder
+from .encoder.frozen_nas3rm_depth_teacher import FrozenNAS3RMDepthTeacher
 from .encoder.visualization.encoder_visualizer import EncoderVisualizer
 from ..misc.intrinsics_utils import estimate_intrinsics
 from ..evaluation.metrics import compute_pose_error, compute_pose_error_for_batch
@@ -94,6 +95,8 @@ class TrainCfg:
     child_gaussian_lowfreq_supervision: bool = False
     child_lowfreq_visualization_interval: int = 0
     child_depth_consistency_weight: float = 0.0
+    hr_depth_teacher_weight_path: str | None = None
+    hr_depth_supervision_weight: float = 0.0
 
 
 def dropout_context_views(v_cxt):
@@ -173,6 +176,20 @@ class ModelWrapper(LightningModule):
         self.data_shim = get_data_shim(self.encoder)
         self.losses = nn.ModuleList(losses)
 
+        self.hr_depth_teacher = None
+        if (
+            self.train_cfg.hr_depth_supervision_weight > 0
+            and self.train_cfg.hr_depth_teacher_weight_path
+        ):
+            if getattr(self.encoder.cfg, "name", None) != "nas3r-m":
+                raise ValueError("HR depth teacher supervision currently requires the nas3r-m encoder")
+            self.hr_depth_teacher = FrozenNAS3RMDepthTeacher(
+                self.encoder.cfg,
+                self.train_cfg.hr_depth_teacher_weight_path,
+            )
+            self.hr_depth_teacher.requires_grad_(False)
+            self.hr_depth_teacher.eval()
+
         self.distiller = distiller
         self.distiller_loss = None
         if self.distiller is not None:
@@ -193,6 +210,26 @@ class ModelWrapper(LightningModule):
         self.all_metrics_sub = {}
 
         self.ckpt_path = None
+
+    def on_save_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+        """Keep the externally loaded frozen depth teacher out of train checkpoints."""
+        state_dict = checkpoint.get("state_dict")
+        if state_dict is None:
+            return
+        prefix = "hr_depth_teacher."
+        for key in [key for key in state_dict if key.startswith(prefix)]:
+            del state_dict[key]
+
+    def on_load_checkpoint(self, checkpoint: dict[str, Any]) -> None:
+        """Restore strict loading with the teacher initialized from its external checkpoint."""
+        if self.hr_depth_teacher is None:
+            return
+        state_dict = checkpoint.get("state_dict")
+        if state_dict is None:
+            return
+        prefix = "hr_depth_teacher."
+        for key, value in self.hr_depth_teacher.state_dict().items():
+            state_dict.setdefault(f"{prefix}{key}", value)
 
     def _image_key(self, views: dict) -> str:
         if getattr(self.encoder.cfg, "name", None) == "nas3r-m" and "image_lr" in views:
@@ -257,6 +294,41 @@ class ModelWrapper(LightningModule):
         return apply_color_map_to_image(normalized.clamp(0.0, 1.0), "turbo")
 
     @staticmethod
+    def _depths_for_shared_vis(*depths: Tensor) -> list[Tensor]:
+        """Colorize depth maps with one shared robust log-depth range."""
+        valid_values = [
+            depth[torch.isfinite(depth) & (depth > 0)].detach()
+            for depth in depths
+        ]
+        valid_values = [values for values in valid_values if values.numel() > 0]
+        if not valid_values:
+            return [
+                torch.zeros(3, *depth.shape[-2:], dtype=depth.dtype, device=depth.device)
+                for depth in depths
+            ]
+        log_values = torch.cat(valid_values).clamp_min(1e-6).log()
+        near = log_values.quantile(0.01)
+        far = log_values.quantile(0.99)
+        denom = (far - near).clamp_min(1e-6)
+        visualizations = []
+        for depth in depths:
+            normalized = 1.0 - (depth.clamp_min(1e-6).log() - near) / denom
+            valid = torch.isfinite(depth) & (depth > 0)
+            normalized = torch.where(valid, normalized, torch.zeros_like(normalized))
+            visualizations.append(apply_color_map_to_image(normalized.clamp(0.0, 1.0), "turbo"))
+        return visualizations
+
+    @staticmethod
+    def _error_for_vis(error: Tensor) -> Tensor:
+        finite = error[torch.isfinite(error)].detach()
+        if finite.numel() == 0:
+            normalized = torch.zeros_like(error)
+        else:
+            scale = finite.quantile(0.99).clamp_min(1e-6)
+            normalized = torch.nan_to_num(error / scale, nan=0.0, posinf=1.0, neginf=0.0)
+        return apply_color_map_to_image(normalized.clamp(0.0, 1.0), "inferno")
+
+    @staticmethod
     def _psnr_for_vis(pred: Tensor, target: Tensor) -> float:
         mse = (pred.float() - target.float()).square().mean().clamp_min(1e-12)
         return float((-10.0 * torch.log10(mse)).detach().cpu())
@@ -265,56 +337,64 @@ class ModelWrapper(LightningModule):
         self,
         batch: BatchedExample,
         output,
-        lr_output,
         context_output,
         parent_gaussians,
         child_gaussians,
         child_decode: dict[str, Tensor] | None = None,
-        lr_dpt_depth: Tensor | None = None,
+        teacher_hr_depth: Tensor | None = None,
         ) -> None:
         step_dir = self._checkpoint_dir() / "child_lowfreq_vis" / f"{self.global_step + 1:0>6}"
-        image_path = step_dir / "target_render_depth.png"
+        image_path = step_dir / "hr_teacher_child_depth_comparison.png"
         ply_path = step_dir / "child_gaussians_supersplat.ply"
         group_supersplat_path = step_dir / "parent_child_groups_supersplat.ply"
         group_stats_path = step_dir / "parent_child_stats.npz"
         group_stats_csv_path = step_dir / "parent_child_stats.csv"
 
         target_hr = batch["target"]["image"][0, 0].detach()
-        target_lr = batch["target"].get("image_lr", batch["target"]["image"])[0, 0].detach()
-        target_size = target_hr.shape[-2:]
-
+        context_hr = batch["context"]["image"][0, 0].detach().clamp(0.0, 1.0)
         render_target = output.color[0, 0].detach().clamp(0.0, 1.0)
-        lr_render_target = lr_output.color[0, 0].detach().clamp(0.0, 1.0)
-        target_lr_vis = self._resize_image_for_vis(target_lr, target_size).clamp(0.0, 1.0)
-        child_context_depth_lr = F.interpolate(
-            rearrange(context_output.depth.detach(), "b v h w -> (b v) () h w"),
-            size=lr_dpt_depth.shape[-2:] if lr_dpt_depth is not None else target_lr.shape[-2:],
-            mode="bilinear",
-            align_corners=False,
-        )
-        child_context_depth_lr = rearrange(
-            child_context_depth_lr,
-            "(b v) () h w -> b v h w",
-            b=context_output.depth.shape[0],
-            v=context_output.depth.shape[1],
-        )
-        if lr_dpt_depth is not None:
-            lr_dpt_context_depth = self._depth_for_vis(lr_dpt_depth[0, 0].detach())
-            lr_dpt_context_label = "LR DPT Context Depth"
-        else:
-            lr_dpt_context_depth = self._depth_for_vis(child_context_depth_lr[0, 0].detach())
-            lr_dpt_context_label = "LR DPT Depth N/A"
-        child_context_depth = self._depth_for_vis(child_context_depth_lr[0, 0].detach())
+        render_context = context_output.color[0, 0].detach().clamp(0.0, 1.0)
         scene_psnr = self._psnr_for_vis(render_target, target_hr.clamp(0.0, 1.0))
 
-        comparison = hcat(
-            add_label(lr_render_target, "LR GS Render"),
-            add_label(render_target, f"Child GS Render PSNR {scene_psnr:.2f}"),
-            add_label(target_lr_vis, "GT Target LR"),
-            add_label(target_hr.clamp(0.0, 1.0), "GT Target HR"),
-            add_label(lr_dpt_context_depth, lr_dpt_context_label),
-            add_label(child_context_depth, "Child GS Context Depth -> LR"),
+        if teacher_hr_depth is None:
+            teacher_depth = context_output.depth[0, 0].detach()
+            teacher_label = "Teacher HR Depth N/A"
+        else:
+            teacher_depth = teacher_hr_depth[0, 0].detach()
+            teacher_label = "Frozen NAS3R Teacher HR Depth"
+        child_raw_depth = context_output.depth[0, 0].detach()
+        if context_output.alpha is None:
+            child_alpha = torch.ones_like(child_raw_depth)
+        else:
+            child_alpha = context_output.alpha[0, 0].detach().clamp(0.0, 1.0)
+        child_expected_depth = torch.where(
+            child_alpha > 1e-3,
+            child_raw_depth / child_alpha.clamp_min(1e-6),
+            torch.full_like(child_raw_depth, float("nan")),
         )
+        teacher_depth_vis, child_raw_depth_vis, child_expected_depth_vis = self._depths_for_shared_vis(
+            teacher_depth,
+            child_raw_depth,
+            child_expected_depth,
+        )
+        depth_error_vis = self._error_for_vis((child_raw_depth - teacher_depth).abs())
+        alpha_vis = child_alpha.unsqueeze(0).repeat(3, 1, 1)
+
+        rgb_row = hcat(
+            add_label(context_hr, "GT Context HR"),
+            add_label(render_context, "Child GS Context Render"),
+            add_label((render_context - context_hr).abs().clamp(0.0, 1.0), "Context RGB Abs Error"),
+            add_label(target_hr.clamp(0.0, 1.0), "GT Target HR"),
+            add_label(render_target, f"Child GS Target PSNR {scene_psnr:.2f}"),
+        )
+        depth_row = hcat(
+            add_label(teacher_depth_vis, teacher_label),
+            add_label(child_raw_depth_vis, "Child GS HR Raw Depth"),
+            add_label(child_expected_depth_vis, "Child GS HR Depth / Alpha"),
+            add_label(depth_error_vis, "Raw Depth Abs Error"),
+            add_label(alpha_vis, "Child GS HR Alpha"),
+        )
+        comparison = vcat(rgb_row, depth_row)
         save_image(add_border(comparison), image_path)
 
         export_ply(
@@ -337,6 +417,116 @@ class ModelWrapper(LightningModule):
             group_stats_path,
             group_stats_csv_path,
         )
+
+    def _log_child_gaussian_stats(
+        self,
+        child_gaussians,
+        child_decode: dict[str, Tensor] | None,
+        batch_size: int,
+    ) -> None:
+        scales = child_gaussians.scales.detach()
+        opacities = child_gaussians.opacities.detach()
+        stats = {
+            "child_gs/scale_mean": scales.mean(),
+            "child_gs/scale_std": scales.std(unbiased=False),
+            "child_gs/scale_min": scales.amin(),
+            "child_gs/scale_max": scales.amax(),
+            "child_gs/opacity_mean": opacities.mean(),
+            "child_gs/opacity_std": opacities.std(unbiased=False),
+            "child_gs/opacity_min": opacities.amin(),
+            "child_gs/opacity_max": opacities.amax(),
+            "child_gs/opacity_below_0.05": (opacities < 0.05).float().mean(),
+            "child_gs/opacity_above_0.95": (opacities > 0.95).float().mean(),
+        }
+        if child_decode is not None:
+            local_offset_uv = child_decode.get("local_offset_uv")
+            if local_offset_uv is not None:
+                local_offset_uv = local_offset_uv.detach()
+                stats.update({
+                    "child_gs/offset_u_mean": local_offset_uv[..., 0].mean(),
+                    "child_gs/offset_u_min": local_offset_uv[..., 0].amin(),
+                    "child_gs/offset_u_max": local_offset_uv[..., 0].amax(),
+                    "child_gs/offset_v_mean": local_offset_uv[..., 1].mean(),
+                    "child_gs/offset_v_min": local_offset_uv[..., 1].amin(),
+                    "child_gs/offset_v_max": local_offset_uv[..., 1].amax(),
+                })
+            delta_z = child_decode.get("predicted_delta_z")
+            if delta_z is not None:
+                delta_z = delta_z.detach()
+                stats.update({
+                    "child_gs/delta_z_mean": delta_z.mean(),
+                    "child_gs/delta_z_std": delta_z.std(unbiased=False),
+                    "child_gs/delta_z_abs_mean": delta_z.abs().mean(),
+                    "child_gs/delta_z_abs_max": delta_z.abs().amax(),
+                })
+            child_depths = child_decode.get("child_depths")
+            if child_depths is not None:
+                child_depths = child_depths.detach()
+                stats.update({
+                    "child_gs/depth_mean": child_depths.mean(),
+                    "child_gs/depth_min": child_depths.amin(),
+                    "child_gs/depth_max": child_depths.amax(),
+                    "child_gs/depth_nonpositive_ratio": (child_depths <= 0).float().mean(),
+                })
+            delta_means = child_decode.get("delta_means")
+            if delta_means is not None:
+                offset_norm = delta_means.detach().norm(dim=-1)
+                stats.update({
+                    "child_gs/world_offset_mean": offset_norm.mean(),
+                    "child_gs/world_offset_max": offset_norm.amax(),
+                })
+        self.log_dict(
+            stats,
+            on_step=True,
+            on_epoch=False,
+            logger=True,
+            sync_dist=True,
+            batch_size=batch_size,
+        )
+
+    def _log_new_module_gradient_stats(self) -> None:
+        module_names = getattr(self.encoder.cfg, "trainable_new_modules", [])
+        stats = {}
+        for module_name in module_names:
+            module = getattr(self.encoder, module_name, None)
+            if module is None:
+                continue
+            parameters = [param for param in module.parameters() if param.requires_grad]
+            if not parameters:
+                continue
+            total_numel = sum(param.numel() for param in parameters)
+            parameters_with_grad = [param for param in parameters if param.grad is not None]
+            grad_numel = sum(param.numel() for param in parameters_with_grad)
+            device = parameters[0].device
+            if parameters_with_grad:
+                grad_sq_sum = torch.stack([
+                    param.grad.detach().float().square().sum()
+                    for param in parameters_with_grad
+                ]).sum()
+                grad_abs_max = torch.stack([
+                    param.grad.detach().float().abs().amax()
+                    for param in parameters_with_grad
+                ]).amax()
+                grad_norm = grad_sq_sum.sqrt()
+            else:
+                grad_norm = torch.zeros((), device=device)
+                grad_abs_max = torch.zeros((), device=device)
+            stats.update({
+                f"trainable_modules/{module_name}_grad_coverage": torch.tensor(
+                    grad_numel / max(total_numel, 1),
+                    device=device,
+                ),
+                f"trainable_modules/{module_name}_grad_norm": grad_norm,
+                f"trainable_modules/{module_name}_grad_abs_max": grad_abs_max,
+            })
+        if stats:
+            self.log_dict(
+                stats,
+                on_step=True,
+                on_epoch=False,
+                logger=True,
+                sync_dist=True,
+            )
 
     @staticmethod
     def _save_parent_child_debug(
@@ -474,6 +664,18 @@ class ModelWrapper(LightningModule):
         }
         return loss, stats
 
+    @staticmethod
+    def _unmasked_pearson_depth_loss(pred_depth: Tensor, target_depth: Tensor) -> Tensor:
+        """Compute per-view PCC loss without confidence or validity masking."""
+        pred = rearrange(pred_depth, "b v h w -> (b v) (h w)")
+        target = rearrange(target_depth.detach(), "b v h w -> (b v) (h w)")
+        pred = pred - pred.mean(dim=-1, keepdim=True)
+        target = target - target.mean(dim=-1, keepdim=True)
+        pred = pred / (pred.std(dim=-1, keepdim=True, unbiased=False) + 1e-6)
+        target = target / (target.std(dim=-1, keepdim=True, unbiased=False) + 1e-6)
+        correlation = (pred * target).mean(dim=-1)
+        return (1.0 - correlation).mean()
+
     def training_step(self, batch, batch_idx):
         # combine batch from different dataloaders
         if isinstance(batch, list):
@@ -566,6 +768,11 @@ class ModelWrapper(LightningModule):
         loss_target = target_gt
         if use_child_lowfreq:
             self.log("train/child_hr_supervision", 1.0)
+            self._log_child_gaussian_stats(
+                decoder_gaussians,
+                encoder_output.get("lr_child_decode"),
+                batch_size=b,
+            )
 
         # Compute PSNR
         psnr = compute_psnr(
@@ -578,7 +785,15 @@ class ModelWrapper(LightningModule):
         for loss_fn in self.losses:
             if loss_fn.name in ['mse', 'lpips']:
                 loss = loss_fn.forward(loss_color, loss_target, decoder_gaussians, self.global_step)
-                self.log(f"loss/{loss_fn.name}", loss)
+                self.log(
+                    f"loss/{loss_fn.name}",
+                    loss,
+                    on_step=True,
+                    on_epoch=False,
+                    logger=True,
+                    sync_dist=True,
+                    batch_size=b,
+                )
                 loss_terms[loss_fn.name] = loss.detach()
                 total_loss += loss
 
@@ -604,48 +819,136 @@ class ModelWrapper(LightningModule):
                 lr_depth_for_depth,
             )
             weighted_depth_consistency = depth_consistency_weight * depth_consistency
-            self.log("loss/child_depth_consistency_raw", depth_consistency)
-            self.log("loss/child_depth_consistency_weighted", weighted_depth_consistency)
-            self.log("depth/lr_valid_ratio", depth_stats["valid_ratio"])
-            self.log("depth/render_lr_mean", depth_stats["render_mean"])
-            self.log("depth/lr_dpt_mean", depth_stats["target_mean"])
-            self.log("depth/abs_error_mean", depth_stats["abs_error_mean"])
+            self.log_dict(
+                {
+                    "loss/child_depth_consistency_raw": depth_consistency,
+                    "loss/child_depth_consistency_weighted": weighted_depth_consistency,
+                    "depth/lr_valid_ratio": depth_stats["valid_ratio"],
+                    "depth/render_lr_mean": depth_stats["render_mean"],
+                    "depth/lr_dpt_mean": depth_stats["target_mean"],
+                    "depth/abs_error_mean": depth_stats["abs_error_mean"],
+                },
+                on_step=True,
+                on_epoch=False,
+                logger=True,
+                sync_dist=True,
+                batch_size=b,
+            )
             loss_terms["depth"] = weighted_depth_consistency.detach()
             total_loss += weighted_depth_consistency
 
-        self.log("loss/total", total_loss)
+        hr_depth_weight = self.train_cfg.hr_depth_supervision_weight
+        teacher_hr_depth = None
+        if (
+            use_child_lowfreq
+            and hr_depth_weight > 0
+            and self.hr_depth_teacher is not None
+        ):
+            if context_output_for_depth is None:
+                context_output_for_depth = self.decoder.forward(
+                    decoder_gaussians,
+                    context_extrinsics,
+                    context_intrinsics,
+                    batch["context"]["near"],
+                    batch["context"]["far"],
+                    batch["context"]["image"].shape[-2:],
+                    depth_mode=self.train_cfg.depth_mode,
+                )
+            teacher_hr_depth = self.hr_depth_teacher(
+                batch["context"]["image"],
+                batch["context"]["intrinsics"],
+            ).detach()
+            rendered_hr_depth = context_output_for_depth.depth
+            if rendered_hr_depth.shape != teacher_hr_depth.shape:
+                raise ValueError(
+                    "HR depth shape mismatch: "
+                    f"rendered {tuple(rendered_hr_depth.shape)} vs "
+                    f"teacher {tuple(teacher_hr_depth.shape)}"
+                )
+
+            hr_depth_l1 = F.l1_loss(rendered_hr_depth, teacher_hr_depth)
+            hr_depth_pcc = self._unmasked_pearson_depth_loss(
+                rendered_hr_depth,
+                teacher_hr_depth,
+            )
+            hr_depth_raw = hr_depth_l1 + hr_depth_pcc
+            weighted_hr_depth = hr_depth_weight * hr_depth_raw
+            if context_output_for_depth.alpha is None:
+                render_alpha = torch.ones_like(rendered_hr_depth)
+            else:
+                render_alpha = context_output_for_depth.alpha
+            alpha_normalized_depth = torch.where(
+                render_alpha > 1e-3,
+                rendered_hr_depth / render_alpha.clamp_min(1e-6),
+                torch.full_like(rendered_hr_depth, float("nan")),
+            )
+            valid_alpha_depth = torch.isfinite(alpha_normalized_depth)
+            alpha_normalized_mean = (
+                alpha_normalized_depth[valid_alpha_depth].mean()
+                if valid_alpha_depth.any()
+                else rendered_hr_depth.new_zeros(())
+            )
+            self.log_dict(
+                {
+                    "loss/hr_depth_l1": hr_depth_l1,
+                    "loss/hr_depth_pcc": hr_depth_pcc,
+                    "loss/hr_depth_raw": hr_depth_raw,
+                    "loss/hr_depth_weighted": weighted_hr_depth,
+                    "depth/hr_teacher_mean": teacher_hr_depth.mean(),
+                    "depth/hr_render_raw_mean": rendered_hr_depth.mean(),
+                    "depth/hr_render_alpha_normalized_mean": alpha_normalized_mean,
+                    "depth/hr_render_alpha_mean": render_alpha.mean(),
+                    "depth/hr_render_alpha_below_0.1": (render_alpha < 0.1).float().mean(),
+                },
+                on_step=True,
+                on_epoch=False,
+                logger=True,
+                sync_dist=True,
+                batch_size=b,
+            )
+            loss_terms["hr_depth"] = weighted_hr_depth.detach()
+            total_loss += weighted_hr_depth
+
+        self.log(
+            "loss/total",
+            total_loss,
+            on_step=True,
+            on_epoch=False,
+            logger=True,
+            sync_dist=True,
+            batch_size=b,
+        )
         loss_terms["total"] = total_loss.detach()
 
         if use_child_lowfreq and self._should_save_child_lowfreq_visualization():
             with torch.no_grad():
-                lr_output_for_vis = self.decoder.forward(
-                    gaussians,
-                    extrinsics,
-                    intrinsics,
-                    near,
-                    far,
-                    (h, w),
-                    depth_mode=self.train_cfg.depth_mode,
-                )
-                if context_output_for_depth is None:
+                context_hr_size = batch["context"]["image"].shape[-2:]
+                if (
+                    context_output_for_depth is None
+                    or context_output_for_depth.depth.shape[-2:] != context_hr_size
+                ):
                     context_output_for_depth = self.decoder.forward(
                         decoder_gaussians,
                         context_extrinsics,
                         context_intrinsics,
                         batch["context"]["near"],
                         batch["context"]["far"],
-                        (h, w),
+                        context_hr_size,
                         depth_mode=self.train_cfg.depth_mode,
                     )
+                if teacher_hr_depth is None and self.hr_depth_teacher is not None:
+                    teacher_hr_depth = self.hr_depth_teacher(
+                        batch["context"]["image"],
+                        batch["context"]["intrinsics"],
+                    ).detach()
                 self._save_child_lowfreq_visualization(
                     batch,
                     output,
-                    lr_output_for_vis,
                     context_output_for_depth,
                     gaussians,
                     decoder_gaussians,
                     encoder_output.get("lr_child_decode"),
-                    lr_depth_for_depth if lr_depth_for_depth is not None else encoder_output.get("lr_dpt_depth"),
+                    teacher_hr_depth,
                 )
 
         if self.encoder.cfg.estimating_pose:
@@ -1388,6 +1691,22 @@ class ModelWrapper(LightningModule):
                         pretrained_params.append(param)
                         pretrained_param_names.append(name)
 
+        optimizer_params = new_params + pretrained_params
+        optimizer_param_ids = [id(param) for param in optimizer_params]
+        if len(optimizer_param_ids) != len(set(optimizer_param_ids)):
+            raise RuntimeError("A trainable parameter was added to the optimizer more than once")
+        optimizer_param_id_set = set(optimizer_param_ids)
+        missing_trainable = [
+            name
+            for name, param in self.named_parameters()
+            if param.requires_grad and id(param) not in optimizer_param_id_set
+        ]
+        if missing_trainable:
+            raise RuntimeError(
+                "Trainable parameters missing from optimizer: "
+                + ", ".join(missing_trainable[:20])
+            )
+
         param_dicts = [
             {
                 "params": new_params,
@@ -1424,6 +1743,7 @@ class ModelWrapper(LightningModule):
     def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_closure, **kwargs):
         # Perform the backward pass
         optimizer_closure()
+        self._log_new_module_gradient_stats()
 
         nan_detected = False
         large_detected = False

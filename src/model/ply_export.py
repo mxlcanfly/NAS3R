@@ -24,7 +24,7 @@ def construct_list_of_attributes(num_rest: int) -> list[str]:
 
 
 def export_ply(
-    extrinsics: Float[Tensor, "4 4"],
+    extrinsics: Float[Tensor, "4 4"] | None,
     means: Float[Tensor, "gaussian 3"],
     scales: Float[Tensor, "gaussian 3"],
     rotations: Float[Tensor, "gaussian 4"],
@@ -46,6 +46,8 @@ def export_ply(
     harmonics = harmonics[mask][indices]
 
     if view_transform and means.numel() > 0:
+        if extrinsics is None:
+            raise ValueError("extrinsics are required when view_transform=True")
         # Viewer-only transform: center, scale, and rotate the scene so it opens
         # cleanly in SuperSplat. Disable this when raw world coordinates matter.
         means = means - means.median(dim=0).values
@@ -113,7 +115,7 @@ def export_ply(
 
 
 def export_parent_child_debug_gaussians(
-    extrinsics: Float[Tensor, "4 4"],
+    extrinsics: Float[Tensor, "4 4"] | None,
     parent_means: Float[Tensor, "parent 3"],
     child_means: Float[Tensor, "child 3"],
     parent_indices: Tensor,
