@@ -194,6 +194,39 @@ class DPTGSHead(nn.Module):
         # else:
             # return torch.cat(all_preds, dim=1), torch.cat(all_conf, dim=1)
 
+    def forward_penultimate_features(
+        self,
+        aggregated_tokens_list: List[torch.Tensor],
+        images: torch.Tensor,
+        patch_start_idx: int,
+        frames_chunk_size: int = 8,
+    ) -> torch.Tensor:
+        B, S, _, _, _ = images.shape
+        if frames_chunk_size is None or frames_chunk_size >= S:
+            return self._forward_impl(aggregated_tokens_list, images, patch_start_idx, return_penultimate=True)
+
+        all_features = []
+        for frames_start_idx in range(0, S, frames_chunk_size):
+            frames_end_idx = min(frames_start_idx + frames_chunk_size, S)
+            all_features.append(
+                self._forward_impl(
+                    aggregated_tokens_list,
+                    images,
+                    patch_start_idx,
+                    frames_start_idx,
+                    frames_end_idx,
+                    return_penultimate=True,
+                )
+            )
+        return torch.cat(all_features, dim=1)
+
+    def predict_from_penultimate_features(self, features: torch.Tensor) -> torch.Tensor:
+        B, S, C, H, W = features.shape
+        out = rearrange(features, "b v c h w -> (b v) c h w")
+        out = self.scratch.output_conv2[2](out)
+        out = out.permute(0, 2, 3, 1)
+        return out.view(B, S, H, W, out.shape[-1])
+
     def _forward_impl(
         self,
         aggregated_tokens_list: List[torch.Tensor],
@@ -201,6 +234,7 @@ class DPTGSHead(nn.Module):
         patch_start_idx: int,
         frames_start_idx: int = None,
         frames_end_idx: int = None,
+        return_penultimate: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
         Implementation of the forward pass through the DPT head.
@@ -271,7 +305,11 @@ class DPTGSHead(nn.Module):
         if self.feature_only:
             return out.view(B, S, *out.shape[1:])
 
-        out = self.scratch.output_conv2(out)
+        out = self.scratch.output_conv2[:2](out)
+        if return_penultimate:
+            return out.view(B, S, *out.shape[1:])
+
+        out = self.scratch.output_conv2[2](out)
         preds = out.permute(0, 2, 3, 1)  # (B, H, W, 3)
         # preds, conf = activate_head(out, activation=self.activation, conf_activation=self.conf_activation)
 

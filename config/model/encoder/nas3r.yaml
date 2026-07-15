@@ -13,6 +13,7 @@ num_surfaces: 1
 predict_opacity: false
 
 gaussians_per_pixel: 1
+hammersley_points_per_pixel: 1
 
 gaussian_adapter:
   gaussian_scale_min: 0.5

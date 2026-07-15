@@ -1,6 +1,7 @@
 name: masked_vggt
 intrinsics_embed_loc: 'none'
 pretrained: true
+pretrained_weights: /datasets2/yuhc/modelzoo/VGGT/VGGT-1B/model.pt
 
 init_intrinsics: false
 init_poses: false

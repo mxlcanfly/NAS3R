@@ -24,6 +24,7 @@ class GDStyleGaussianChildDecoderCfg:
     offset_residual_bound: float = 0.5
     num_rings: int | None = None
     max_radius_pixel: float = 0.95
+    hammersley_eps: float = 0.05
 
 
 def positional_encoding(base_freq: Tensor, x: Tensor) -> Tensor:
@@ -60,6 +61,38 @@ def build_quarter_ring_uv_bias(
         rings.append(radius * torch.stack((theta.cos(), theta.sin()), dim=-1))
 
     template_uv = torch.cat(rings, dim=0).clamp(eps, 1.0 - eps)
+    return torch.logit(template_uv) if return_pre_sigmoid else template_uv
+
+
+def build_hammersley_uv_bias(
+    num_children: int,
+    eps: float = 0.05,
+    return_pre_sigmoid: bool = True,
+    dtype: torch.dtype = torch.float32,
+) -> Tensor:
+    """Build a deterministic Hammersley template inside one LR pixel cell."""
+    if num_children < 1:
+        raise ValueError(f"num_children must be positive, got {num_children}")
+    if not 0.0 < eps < 0.5:
+        raise ValueError(f"eps must be in (0, 0.5), got {eps}")
+
+    def radical_inverse_base2(index: int) -> float:
+        value = 0.0
+        inv_base = 0.5
+        while index:
+            value += (index & 1) * inv_base
+            index >>= 1
+            inv_base *= 0.5
+        return value
+
+    indices = torch.arange(num_children, dtype=dtype)
+    u = (indices + 0.5) / num_children
+    v = torch.tensor(
+        [radical_inverse_base2(index) for index in range(num_children)],
+        dtype=dtype,
+    )
+    unit_uv = torch.stack((u, v), dim=-1)
+    template_uv = eps + (1.0 - 2.0 * eps) * unit_uv
     return torch.logit(template_uv) if return_pre_sigmoid else template_uv
 
 
@@ -111,7 +144,7 @@ class GDStyleGaussianChildDecoder(nn.Module):
             nn.GELU(),
             nn.Linear(cfg.hidden_dim, 3 * cfg.num_children),
         )
-        self._init_delta_x_deformable_bias()
+        self._init_delta_x_hammersley_bias()
         self.skip = nn.Linear(cfg.input_dim, cfg.child_feat_dim)
 
         pe_dim = 3 * 2 * cfg.n_frequencies if cfg.n_frequencies > 0 else 3
@@ -135,15 +168,14 @@ class GDStyleGaussianChildDecoder(nn.Module):
         if cfg.n_frequencies > 0:
             self.register_buffer("frequencies", 2.0 ** torch.arange(cfg.n_frequencies), persistent=False)
 
-    def _init_delta_x_deformable_bias(self) -> None:
+    def _init_delta_x_hammersley_bias(self) -> None:
         last = self.delta_x[-1]
         if not isinstance(last, nn.Linear):
             raise TypeError("delta_x is expected to end with nn.Linear")
         nn.init.zeros_(last.weight)
-        uv_bias = build_quarter_ring_uv_bias(
+        uv_bias = build_hammersley_uv_bias(
             num_children=self.cfg.num_children,
-            num_rings=self.cfg.num_rings,
-            max_radius_pixel=self.cfg.max_radius_pixel,
+            eps=self.cfg.hammersley_eps,
             return_pre_sigmoid=True,
             dtype=last.bias.dtype,
         )
@@ -158,14 +190,13 @@ class GDStyleGaussianChildDecoder(nn.Module):
             last.bias.copy_(uvz_bias.reshape(-1))
 
     def initial_local_offset_uv(self) -> Tensor:
-        """Return the immutable quarter-ring initialization template."""
+        """Return the Hammersley initialization template in LR-pixel units."""
         last = self.delta_x[-1]
         if not isinstance(last, nn.Linear):
             raise TypeError("delta_x is expected to end with nn.Linear")
-        return build_quarter_ring_uv_bias(
+        return build_hammersley_uv_bias(
             num_children=self.cfg.num_children,
-            num_rings=self.cfg.num_rings,
-            max_radius_pixel=self.cfg.max_radius_pixel,
+            eps=self.cfg.hammersley_eps,
             return_pre_sigmoid=False,
             dtype=last.bias.dtype,
         ).to(last.bias.device)

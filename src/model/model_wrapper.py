@@ -45,12 +45,22 @@ from ..visualization.layout import add_border, hcat, vcat
 from ..visualization.validation_in_3d import render_cameras, render_projections, render_cameras_es
 from .decoder.decoder import Decoder, DepthRenderingMode
 from .encoder import Encoder
+from .encoder.encoder_nas3rm import _write_pixel_grid_2d_debug_image
 from .encoder.frozen_nas3rm_depth_teacher import FrozenNAS3RMDepthTeacher
 from .encoder.visualization.encoder_visualizer import EncoderVisualizer
 from ..misc.intrinsics_utils import estimate_intrinsics
 from ..evaluation.metrics import compute_pose_error, compute_pose_error_for_batch
 from ..misc.cam_utils import pose_auc
 from .ply_export import export_parent_child_debug_gaussians, export_ply
+
+
+def sparse_opacity_loss(opacity: Tensor, eps: float = 1e-6) -> Tensor:
+    """Minimize binary entropy so child opacities approach zero or one."""
+    opacity = opacity.clamp(eps, 1.0 - eps)
+    return -(
+        opacity * torch.log(opacity)
+        + (1.0 - opacity) * torch.log(1.0 - opacity)
+    ).mean()
 
 
 @dataclass
@@ -94,6 +104,7 @@ class TrainCfg:
     pretrain_camera_head: bool = False
     child_gaussian_lowfreq_supervision: bool = False
     child_lowfreq_visualization_interval: int = 0
+    child_opacity_sparse_weight: float = 0.0
     child_depth_consistency_weight: float = 0.0
     hr_depth_teacher_weight_path: str | None = None
     hr_depth_supervision_weight: float = 0.0
@@ -349,6 +360,37 @@ class ModelWrapper(LightningModule):
         group_supersplat_path = step_dir / "parent_child_groups_supersplat.ply"
         group_stats_path = step_dir / "parent_child_stats.npz"
         group_stats_csv_path = step_dir / "parent_child_stats.csv"
+
+        local_offset_uv = None if child_decode is None else child_decode.get("local_offset_uv")
+        child_decoder = getattr(self.encoder, "gaussian_child_decoder", None)
+        if local_offset_uv is not None and child_decoder is not None:
+            lr_h, lr_w = self._images(batch["context"]).shape[-2:]
+            num_context_views = batch["context"]["image"].shape[1]
+            points_per_view, view_remainder = divmod(
+                local_offset_uv.shape[1],
+                num_context_views,
+            )
+            parents_per_pixel, pixel_remainder = divmod(
+                points_per_view,
+                lr_h * lr_w,
+            )
+            if view_remainder == 0 and pixel_remainder == 0 and parents_per_pixel > 0:
+                initial_local_offset_uv = child_decoder.initial_local_offset_uv()
+                updated_local_offset_uv = local_offset_uv[0, :points_per_view]
+                _write_pixel_grid_2d_debug_image(
+                    image_shape=(lr_h, lr_w),
+                    path=step_dir / "nas3rm_pixel_grid_debug.png",
+                    initial_child_offsets_uv=initial_local_offset_uv,
+                    updated_child_offsets_uv=updated_local_offset_uv,
+                    parents_per_pixel=parents_per_pixel,
+                )
+                np.savez_compressed(
+                    step_dir / "child_uv_offsets.npz",
+                    initial_local_offset_uv=initial_local_offset_uv.detach().float().cpu().numpy(),
+                    updated_local_offset_uv=updated_local_offset_uv.detach().float().cpu().numpy(),
+                    image_shape=np.asarray((lr_h, lr_w), dtype=np.int64),
+                    parents_per_pixel=np.asarray(parents_per_pixel, dtype=np.int64),
+                )
 
         target_hr = batch["target"]["image"][0, 0].detach()
         context_hr = batch["context"]["image"][0, 0].detach().clamp(0.0, 1.0)
@@ -664,18 +706,6 @@ class ModelWrapper(LightningModule):
         }
         return loss, stats
 
-    @staticmethod
-    def _unmasked_pearson_depth_loss(pred_depth: Tensor, target_depth: Tensor) -> Tensor:
-        """Compute per-view PCC loss without confidence or validity masking."""
-        pred = rearrange(pred_depth, "b v h w -> (b v) (h w)")
-        target = rearrange(target_depth.detach(), "b v h w -> (b v) (h w)")
-        pred = pred - pred.mean(dim=-1, keepdim=True)
-        target = target - target.mean(dim=-1, keepdim=True)
-        pred = pred / (pred.std(dim=-1, keepdim=True, unbiased=False) + 1e-6)
-        target = target / (target.std(dim=-1, keepdim=True, unbiased=False) + 1e-6)
-        correlation = (pred * target).mean(dim=-1)
-        return (1.0 - correlation).mean()
-
     def training_step(self, batch, batch_idx):
         # combine batch from different dataloaders
         if isinstance(batch, list):
@@ -797,6 +827,24 @@ class ModelWrapper(LightningModule):
                 loss_terms[loss_fn.name] = loss.detach()
                 total_loss += loss
 
+        opacity_sparse_weight = self.train_cfg.child_opacity_sparse_weight
+        if use_child_lowfreq and opacity_sparse_weight > 0:
+            opacity_sparse = sparse_opacity_loss(decoder_gaussians.opacities)
+            weighted_opacity_sparse = opacity_sparse_weight * opacity_sparse
+            self.log_dict(
+                {
+                    "loss/child_opacity_sparse_raw": opacity_sparse,
+                    "loss/child_opacity_sparse_weighted": weighted_opacity_sparse,
+                },
+                on_step=True,
+                on_epoch=False,
+                logger=True,
+                sync_dist=True,
+                batch_size=b,
+            )
+            loss_terms["child_opacity_sparse"] = weighted_opacity_sparse.detach()
+            total_loss += weighted_opacity_sparse
+
         depth_consistency_weight = self.train_cfg.child_depth_consistency_weight
         context_output_for_depth = None
         lr_depth_for_depth = None
@@ -867,11 +915,7 @@ class ModelWrapper(LightningModule):
                 )
 
             hr_depth_l1 = F.l1_loss(rendered_hr_depth, teacher_hr_depth)
-            hr_depth_pcc = self._unmasked_pearson_depth_loss(
-                rendered_hr_depth,
-                teacher_hr_depth,
-            )
-            hr_depth_raw = hr_depth_l1 + hr_depth_pcc
+            hr_depth_raw = hr_depth_l1
             weighted_hr_depth = hr_depth_weight * hr_depth_raw
             if context_output_for_depth.alpha is None:
                 render_alpha = torch.ones_like(rendered_hr_depth)
@@ -891,7 +935,6 @@ class ModelWrapper(LightningModule):
             self.log_dict(
                 {
                     "loss/hr_depth_l1": hr_depth_l1,
-                    "loss/hr_depth_pcc": hr_depth_pcc,
                     "loss/hr_depth_raw": hr_depth_raw,
                     "loss/hr_depth_weighted": weighted_hr_depth,
                     "depth/hr_teacher_mean": teacher_hr_depth.mean(),

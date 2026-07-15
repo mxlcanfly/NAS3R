@@ -3,13 +3,13 @@ from typing import Literal, Optional
 
 import torch
 import torch.nn.functional as F
-from einops import rearrange
+from einops import rearrange, repeat
 from jaxtyping import Float
 from torch import Tensor, nn
 
 from ...dataset.shims.normalize_shim import apply_normalize_shim
 from ...dataset.types import BatchedExample, DataShim
-from ...geometry.projection import sample_image_grid
+from ...geometry.projection import get_world_rays, sample_image_grid
 from ..types import Gaussians
 from .backbone import BackboneCfg, get_backbone
 from .common.gaussian_adapter import GaussianAdapter, GaussianAdapterCfg, UnifiedGaussianAdapter
@@ -40,6 +40,7 @@ class EncoderNAS3RCfg:
     gaussians_per_pixel: int
     num_surfaces: int
     gs_params_head_type: str
+    hammersley_points_per_pixel: int = 1
     pretrained_weights: str = ""
     input_mean: tuple[float, float, float] = (0.0, 0.0, 0.0)
     input_std: tuple[float, float, float] = (1.0, 1.0, 1.0)
@@ -93,22 +94,84 @@ class EncoderNAS3R(Encoder[EncoderNAS3RCfg]):
             raise NotImplementedError(f"unexpected {head_type=}")
 
     def map_pdf_to_opacity(
-        self,
-        pdf: Float[Tensor, " *batch"],
-        global_step: int,
+            self,
+            pdf: Float[Tensor, " *batch"],
+            global_step: int,
     ) -> Float[Tensor, " *batch"]:
         # https://www.desmos.com/calculator/opvwti3ba9
         cfg = self.cfg.opacity_mapping
         x = cfg.initial + min(global_step / cfg.warm_up, 1) * (cfg.final - cfg.initial)
-        exponent = 2**x
+        exponent = 2 ** x
         return 0.5 * (1 - (1 - pdf) ** exponent + pdf ** (1 / exponent))
 
+    def hammersley_offsets(self, num_points: int, device: torch.device, dtype: torch.dtype) -> Tensor:
+        index = torch.arange(num_points, device=device)
+        x = (index.to(dtype) + 0.5) / num_points
+
+        y = torch.zeros(num_points, device=device, dtype=dtype)
+        base = index + 1
+        factor = 0.5
+        while torch.any(base > 0):
+            y = y + factor * (base % 2).to(dtype)
+            base = torch.div(base, 2, rounding_mode="floor")
+            factor *= 0.5
+
+        return torch.stack((x, y), dim=-1).clamp(1e-4, 1 - 1e-4)
+
+    def sample_hammersley_points(
+            self,
+            feature_map: Tensor,
+            depth_map: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        b, v, c, h, w = feature_map.shape
+        k = self.cfg.hammersley_points_per_pixel
+        offsets = self.hammersley_offsets(k, feature_map.device, feature_map.dtype)
+
+        y, x = torch.meshgrid(
+            torch.arange(h, device=feature_map.device, dtype=feature_map.dtype),
+            torch.arange(w, device=feature_map.device, dtype=feature_map.dtype),
+            indexing="ij",
+        )
+        sample_x = x[..., None] + offsets[:, 0]
+        sample_y = y[..., None] + offsets[:, 1]
+
+        grid_x = (2 * sample_x + 1) / w - 1
+        grid_y = (2 * sample_y + 1) / h - 1
+        grid = torch.stack((grid_x, grid_y), dim=-1)
+        grid = rearrange(grid, "h w k xy -> h (w k) xy")
+        grid = repeat(grid, "h wk xy -> bv h wk xy", bv=b * v)
+
+        flat_features = rearrange(feature_map, "b v c h w -> (b v) c h w")
+        sampled_features = F.grid_sample(
+            flat_features,
+            grid,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=False,
+        )
+        sampled_features = rearrange(sampled_features, "(b v) c h (w k) -> b v (h w) k c", b=b, v=v, k=k)
+
+        flat_depth = rearrange(depth_map, "b v h w -> (b v) () h w")
+        sampled_depth = F.grid_sample(
+            flat_depth,
+            grid,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=False,
+        )
+        sampled_depth = rearrange(sampled_depth, "(b v) () h (w k) -> b v (h w) k", b=b, v=v, k=k)
+
+        coordinates = torch.stack((sample_x / w, sample_y / h), dim=-1)
+        coordinates = rearrange(coordinates, "h w k xy -> (h w) k xy")
+        coordinates = repeat(coordinates, "r k xy -> b v r k xy", b=b, v=v)
+        return sampled_features, sampled_depth, coordinates
+
     def forward(
-        self,
-        context: dict,
-        global_step: int = 0,
-        visualization_dump: Optional[dict] = None,
-        target: Optional[dict] = None,
+            self,
+            context: dict,
+            global_step: int = 0,
+            visualization_dump: Optional[dict] = None,
+            target: Optional[dict] = None,
     ):
         device = context["image"].device
         b, v_cxt, _, h, w = context["image"].shape
@@ -124,7 +187,7 @@ class EncoderNAS3R(Encoder[EncoderNAS3RCfg]):
             aggregated_tokens_list, ps_idx = self.backbone(context, target_num_views=0)
 
         if self.cfg.estimating_pose or self.cfg.estimating_focal:
-            
+
             pose_enc = self.backbone.model.camera_head(
                 aggregated_tokens_list,
                 num_iterations=self.backbone.cfg.num_iterations
@@ -160,42 +223,91 @@ class EncoderNAS3R(Encoder[EncoderNAS3RCfg]):
         context_extrinsics = pred_extrinsics[:, :v_cxt] if self.cfg.estimating_pose else context["extrinsics"]
         context_intrinsics = pred_intrinsics[:, :v_cxt] if self.cfg.estimating_focal else context["intrinsics"]
 
-        point_map_from_depth = unproject_depth_map_to_point_map_batch(
-            rearrange(depth_map, "b v ... -> (b v) ..."),
-            rearrange(context_extrinsics, "b v ... -> (b v) ..."),
-            rearrange(context_intrinsics, "b v ... -> (b v) ..."),
-        )
-        depth_to_pts_all = rearrange(point_map_from_depth, "(b v) ... -> b v ...", b=b, v=v_cxt)
-        depth_to_pts_all = rearrange(depth_to_pts_all, "b v h w xyz -> b v (h w) xyz")
-
-        # Predict gaussians
-        gs_map = self.gaussian_param_head(context_aggregated_tokens_list, context["image"], ps_idx)
-        gaussians = rearrange(gs_map, "b v h w c -> b v (h w) c")
-        gaussians = rearrange(gaussians, "... (srf c) -> ... srf c", srf=self.cfg.num_surfaces)
-        densities = gaussians[..., 0].sigmoid().unsqueeze(-1)
-
-        depth_to_pts_all = depth_to_pts_all.unsqueeze(-2)
-
-        if self.pose_free:
-            gaussians = self.gaussian_adapter.forward(
-                depth_to_pts_all.unsqueeze(-2),
-                self.map_pdf_to_opacity(densities, global_step),
-                rearrange(gaussians[..., 1:], "b v r srf c -> b v r srf () c"),
+        if self.cfg.hammersley_points_per_pixel > 1:
+            gs_features = self.gaussian_param_head.forward_penultimate_features(
+                context_aggregated_tokens_list,
+                context["image"],
+                ps_idx,
             )
+            sampled_features, sampled_depths, sampled_xy = self.sample_hammersley_points(
+                gs_features,
+                depths_per_view,
+            )
+            sampled_feature_map = rearrange(
+                sampled_features,
+                "b v (h w) k c -> b v c h (w k)",
+                h=h,
+                w=w,
+                k=self.cfg.hammersley_points_per_pixel,
+            )
+            gs_map = self.gaussian_param_head.predict_from_penultimate_features(sampled_feature_map)
+            gaussians = rearrange(
+                gs_map,
+                "b v h (w k) c -> b v (h w) k c",
+                k=self.cfg.hammersley_points_per_pixel,
+            )
+            densities = rearrange(gaussians[..., 0].sigmoid(), "b v r k -> b v r () k")
+
+            origins, directions = get_world_rays(
+                sampled_xy,
+                rearrange(context_extrinsics, "b v i j -> b v () () i j"),
+                rearrange(context_intrinsics, "b v i j -> b v () () i j"),
+            )
+            depth_to_pts_all = origins + directions * sampled_depths[..., None]
+
+            if self.pose_free:
+                gaussians = self.gaussian_adapter.forward(
+                    depth_to_pts_all.unsqueeze(-2),
+                    self.map_pdf_to_opacity(densities, global_step),
+                    rearrange(gaussians[..., 1:], "b v r k c -> b v r () k c"),
+                )
+            else:
+                gaussians = self.gaussian_adapter.forward(
+                    rearrange(context_extrinsics, "b v i j -> b v () () () i j"),
+                    rearrange(context_intrinsics, "b v i j -> b v () () () i j"),
+                    rearrange(sampled_xy, "b v r k xy -> b v r () k xy"),
+                    rearrange(sampled_depths, "b v r k -> b v r () k"),
+                    self.map_pdf_to_opacity(densities, global_step),
+                    rearrange(gaussians[..., 1:], "b v r k c -> b v r () k c"),
+                    (h, w),
+                )
         else:
-            xy_ray, _ = sample_image_grid((h, w), device)
-            xy_ray = rearrange(xy_ray, "h w xy -> (h w) () xy")
-            xy_ray = xy_ray[None, None, ...].expand(b, v_cxt, -1, -1, -1)
-
-            gaussians = self.gaussian_adapter.forward(
-                rearrange(context_extrinsics, "b v i j -> b v () () () i j"),
-                rearrange(context_intrinsics, "b v i j -> b v () () () i j"),
-                rearrange(xy_ray, "b v r srf xy -> b v r srf () xy"),
-                rearrange(depths_per_view, "b v h w -> b v (h w) () ()").contiguous(),
-                self.map_pdf_to_opacity(densities, global_step),
-                rearrange(gaussians[..., 1:], "b v r srf c -> b v r srf () c"),
-                (h, w),
+            point_map_from_depth = unproject_depth_map_to_point_map_batch(
+                rearrange(depth_map, "b v ... -> (b v) ..."),
+                rearrange(context_extrinsics, "b v ... -> (b v) ..."),
+                rearrange(context_intrinsics, "b v ... -> (b v) ..."),
             )
+            depth_to_pts_all = rearrange(point_map_from_depth, "(b v) ... -> b v ...", b=b, v=v_cxt)
+            depth_to_pts_all = rearrange(depth_to_pts_all, "b v h w xyz -> b v (h w) xyz")
+
+            # Predict gaussians
+            gs_map = self.gaussian_param_head(context_aggregated_tokens_list, context["image"], ps_idx)
+            gaussians = rearrange(gs_map, "b v h w c -> b v (h w) c")
+            gaussians = rearrange(gaussians, "... (srf c) -> ... srf c", srf=self.cfg.num_surfaces)
+            densities = gaussians[..., 0].sigmoid().unsqueeze(-1)
+
+            depth_to_pts_all = depth_to_pts_all.unsqueeze(-2)
+
+            if self.pose_free:
+                gaussians = self.gaussian_adapter.forward(
+                    depth_to_pts_all.unsqueeze(-2),
+                    self.map_pdf_to_opacity(densities, global_step),
+                    rearrange(gaussians[..., 1:], "b v r srf c -> b v r srf () c"),
+                )
+            else:
+                xy_ray, _ = sample_image_grid((h, w), device)
+                xy_ray = rearrange(xy_ray, "h w xy -> (h w) () xy")
+                xy_ray = xy_ray[None, None, ...].expand(b, v_cxt, -1, -1, -1)
+
+                gaussians = self.gaussian_adapter.forward(
+                    rearrange(context_extrinsics, "b v i j -> b v () () () i j"),
+                    rearrange(context_intrinsics, "b v i j -> b v () () () i j"),
+                    rearrange(xy_ray, "b v r srf xy -> b v r srf () xy"),
+                    rearrange(depths_per_view, "b v h w -> b v (h w) () ()").contiguous(),
+                    self.map_pdf_to_opacity(densities, global_step),
+                    rearrange(gaussians[..., 1:], "b v r srf c -> b v r srf () c"),
+                    (h, w),
+                )
 
         # Dump visualizations if needed.
         if visualization_dump is not None:
@@ -208,10 +320,10 @@ class EncoderNAS3R(Encoder[EncoderNAS3RCfg]):
             )
             visualization_dump["means"] = rearrange(
                 gaussians.means, "b v (h w) srf spp xyz -> b v h w (srf spp) xyz", h=h, w=w
-            ) # (b, v, h, w, 1, 3)
+            )  # (b, v, h, w, 1, 3)
             visualization_dump['opacities'] = rearrange(
                 gaussians.opacities, "b v (h w) srf s -> b v h w srf s", h=h, w=w
-            ) # (b, v, h, w, 1, 1)
+            )  # (b, v, h, w, 1, 1)
 
         encoder_output = dict()
 
@@ -241,24 +353,23 @@ class EncoderNAS3R(Encoder[EncoderNAS3RCfg]):
     def process_pose(self, poses, context_views):
         b, v = poses.shape[:2]
 
-        poses = closed_form_inverse_se3(rearrange(poses, "b v ... -> (b v) ...")) # world to cam -> cam to world 
+        poses = closed_form_inverse_se3(rearrange(poses, "b v ... -> (b v) ..."))  # world to cam -> cam to world
         poses = rearrange(poses, "(b v) ... -> b v ...", b=b, v=v)
 
         if self.cfg.pose_make_baseline_1:
             a = poses[:, 0, :3, 3]  # [b, 3]
-            b = poses[:, context_views - 1, :3, 3]  #  [b, 3]
+            b = poses[:, context_views - 1, :3, 3]  # [b, 3]
 
             scale = (a - b).norm(dim=1, keepdim=True)  # [b, 1]
 
             poses[:, :, :3, 3] /= scale.unsqueeze(-1)
 
         if self.cfg.pose_make_relative:
-            base_context_pose = poses[:,0] # [b, 4, 4]
+            base_context_pose = poses[:, 0]  # [b, 4, 4]
             inv_base_context_pose = torch.inverse(base_context_pose)
-            poses = inv_base_context_pose[:, None, :, :] @ poses # [b,1,4,4] @ [b,v,4,4]
+            poses = inv_base_context_pose[:, None, :, :] @ poses  # [b,1,4,4] @ [b,v,4,4]
 
         return poses
-        
 
     def get_data_shim(self) -> DataShim:
         def data_shim(batch: BatchedExample) -> BatchedExample:

@@ -66,13 +66,6 @@ def _write_pixel_grid_2d_debug_image(
     if initial_child_offsets_uv is None:
         initial_child_offsets_uv = torch.empty(0, 2)
     initial_child_offsets_uv = initial_child_offsets_uv.detach().float().cpu()
-    radii = initial_child_offsets_uv.square().sum(dim=-1).sqrt()
-    ring_radii = torch.unique(radii.round(decimals=5), sorted=True)
-    ring_masks = [
-        torch.isclose(radii, ring_radius, atol=1e-4, rtol=0.0)
-        for ring_radius in ring_radii
-    ]
-
     if updated_child_offsets_uv is not None:
         expected_points = h * w * parents_per_pixel
         if updated_child_offsets_uv.shape[:1] != (expected_points,):
@@ -91,7 +84,7 @@ def _write_pixel_grid_2d_debug_image(
             updated_child_offsets_uv - initial_child_offsets_uv[None, None, None]
         ).norm(dim=-1)
         updated_title = (
-            "Updated XY after bias + predicted residual\n"
+            "Decoded XY after Hammersley initialization\n"
             f"delta L2 in LR pixels: mean={offset_delta_l2.mean():.4f}, "
             f"max={offset_delta_l2.amax():.4f}"
         )
@@ -109,22 +102,23 @@ def _write_pixel_grid_2d_debug_image(
             label="parent: u/W, v/H",
             zorder=4,
         )
-        colors = plt.get_cmap("tab10")
-        for ring_idx, ring_mask in enumerate(ring_masks):
+        colors = plt.get_cmap("tab20")
+        num_children = offsets_uv.shape[-2]
+        for child_idx in range(num_children):
             if offsets_uv.ndim == 2:
-                ring_offsets = offsets_uv[ring_mask]
-                child_x = current_x[..., None] + ring_offsets[:, 0] / w
-                child_y = current_y[..., None] + ring_offsets[:, 1] / h
+                child_offset = offsets_uv[child_idx]
+                child_x = current_x + child_offset[0] / w
+                child_y = current_y + child_offset[1] / h
             else:
-                ring_offsets = offsets_uv[..., ring_mask, :]
-                child_x = current_x[..., None, None] + ring_offsets[..., 0] / w
-                child_y = current_y[..., None, None] + ring_offsets[..., 1] / h
+                child_offset = offsets_uv[..., child_idx, :]
+                child_x = current_x[..., None] + child_offset[..., 0] / w
+                child_y = current_y[..., None] + child_offset[..., 1] / h
             ax.scatter(
                 child_x.flatten(),
                 child_y.flatten(),
-                color=colors(ring_idx % 10),
+                color=colors(child_idx % 20),
                 s=10,
-                label=f"child ring {ring_idx + 1}",
+                label="Hammersley children" if child_idx == 0 else None,
                 zorder=3,
             )
         ax.set_aspect("equal", adjustable="box")
@@ -199,7 +193,7 @@ def _write_pixel_grid_2d_debug_image(
     path.parent.mkdir(parents=True, exist_ok=True)
     panel_count = 3 if updated_child_offsets_uv is not None else 1
     fig, axes = plt.subplots(1, panel_count, figsize=(7 * panel_count, 7), squeeze=False)
-    draw_panel(axes[0, 0], initial_child_offsets_uv, "Initial XY from quarter-ring bias")
+    draw_panel(axes[0, 0], initial_child_offsets_uv, "Initial XY from Hammersley bias")
     if updated_child_offsets_uv is not None:
         draw_panel(
             axes[0, 1],
@@ -208,7 +202,7 @@ def _write_pixel_grid_2d_debug_image(
         )
         draw_single_pixel_panel(axes[0, 2], updated_child_offsets_uv)
     fig.suptitle(f"LR pixel grid: showing {cells_h}x{cells_w} of {h}x{w}")
-    fig.tight_layout()
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.96))
     fig.savefig(path, dpi=180)
     plt.close(fig)
 
