@@ -151,6 +151,7 @@ def export_ply(
     opacities: Float[Tensor, " gaussian"],
     path: Path,
     save_sh_dc_only: bool = False,
+    convert_opacity_to_logit: bool = False,
 ):
     # prune by opacity
     mask = opacities >= 0.005
@@ -160,6 +161,8 @@ def export_ply(
     rotations = rotations[mask][indices]
     scales = scales[mask][indices]
     harmonics = harmonics[mask][indices]
+    if convert_opacity_to_logit:
+        opacities = torch.logit(opacities.clamp(1e-6, 1 - 1e-6))
 
     # Apply the rotation to the Gaussian rotations.
     rotations = R.from_quat(rotations.detach().cpu().numpy()).as_matrix()
