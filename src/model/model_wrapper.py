@@ -44,6 +44,7 @@ from ..visualization.layout import add_border, hcat, vcat
 from ..visualization.validation_in_3d import render_cameras, render_projections, render_cameras_es
 from .decoder.decoder import Decoder, DepthRenderingMode
 from .encoder import Encoder
+from .types import Gaussians
 from .encoder.visualization.encoder_visualizer import EncoderVisualizer
 from ..misc.intrinsics_utils import estimate_intrinsics
 from ..evaluation.metrics import compute_pose_error, compute_pose_error_for_batch
@@ -194,6 +195,72 @@ class ModelWrapper(LightningModule):
     def _images(self, views: dict) -> Tensor:
         return views[self._image_key(views)]
 
+    @staticmethod
+    def _detach_gaussians(gaussians: Gaussians) -> Gaussians:
+        return Gaussians(
+            means=gaussians.means.detach(),
+            covariances=gaussians.covariances.detach(),
+            rotations=gaussians.rotations.detach(),
+            scales=gaussians.scales.detach(),
+            harmonics=gaussians.harmonics.detach(),
+            opacities=gaussians.opacities.detach(),
+        )
+
+    def _encode_with_gaussian_refinement(
+        self,
+        context: dict,
+        target: dict | None = None,
+        visualization_dump: dict | None = None,
+    ) -> dict:
+        encoder_output = self.encoder(
+            context,
+            self.global_step,
+            visualization_dump=visualization_dump,
+            target=target,
+        )
+        if not getattr(self.encoder, "refinement_enabled", False):
+            return encoder_output
+
+        base_gaussians = self._detach_gaussians(encoder_output["gaussians"])
+        context_image_sr = encoder_output["context_image_sr"]
+        _, _, _, h, w = context_image_sr.shape
+        if self.encoder.cfg.estimating_pose:
+            context_extrinsics = encoder_output["extrinsics"]["c"]
+        else:
+            context_extrinsics = context["extrinsics"]
+        if self.encoder.cfg.estimating_focal:
+            context_intrinsics = encoder_output["intrinsics"]["c"]
+        else:
+            context_intrinsics = context["intrinsics"]
+
+        # ReSplat convention: rendered input view minus the input image. Neither
+        # the frozen base Gaussians nor the frozen SR image receives gradients.
+        with torch.no_grad():
+            initial_context_render = self.decoder.forward(
+                base_gaussians,
+                context_extrinsics,
+                context_intrinsics,
+                context["near"],
+                context["far"],
+                (h, w),
+                depth_mode=self.train_cfg.depth_mode,
+            )
+            render_error = initial_context_render.color - context_image_sr
+
+        refine_output = self.encoder.refine_gaussians(
+            base_gaussians,
+            render_error,
+        )
+        encoder_output["initial_gaussians"] = base_gaussians
+        encoder_output["initial_context_render"] = initial_context_render
+        encoder_output["render_error"] = render_error
+        encoder_output["gaussian_refine"] = refine_output
+        encoder_output["gaussians"] = refine_output["gaussians"]
+        if visualization_dump is not None:
+            visualization_dump["initial_context_render"] = initial_context_render.color
+            visualization_dump["render_error"] = render_error
+        return encoder_output
+
     def training_step(self, batch, batch_idx):
         # combine batch from different dataloaders
         if isinstance(batch, list):
@@ -232,8 +299,11 @@ class ModelWrapper(LightningModule):
 
         # Run the model.
         visualization_dump = {}
-        encoder_output = self.encoder(batch["context"], self.global_step, visualization_dump=visualization_dump,
-                                      target=batch["target"] if self.encoder.cfg.estimating_pose else None)
+        encoder_output = self._encode_with_gaussian_refinement(
+            batch["context"],
+            target=batch["target"] if self.encoder.cfg.estimating_pose else None,
+            visualization_dump=visualization_dump,
+        )
 
         if self.encoder.cfg.estimating_pose:
             pred_extrinsics, pred_extrinsics_cwt = encoder_output['extrinsics']['c'], encoder_output['extrinsics'][
@@ -291,6 +361,14 @@ class ModelWrapper(LightningModule):
                 total_loss += loss
 
         self.log("loss/total", total_loss)
+
+        if "gaussian_refine" in encoder_output:
+            refine = encoder_output["gaussian_refine"]
+            self.log("refine/delta_means", refine["delta_means"].abs().mean())
+            self.log("refine/delta_scales", refine["delta_scales"].abs().mean())
+            self.log("refine/delta_rotations", refine["delta_rotations"].abs().mean())
+            self.log("refine/delta_opacities", refine["delta_opacities"].abs().mean())
+            self.log("refine/render_error", encoder_output["render_error"].abs().mean())
 
         if self.encoder.cfg.estimating_pose:
             context_rot_error, context_transl_error = compute_pose_error_for_batch(pred_extrinsics_cwt[:, v_cxt - 1],
@@ -352,8 +430,11 @@ class ModelWrapper(LightningModule):
                     target_data["image_lr"] = batch["target"]["image_lr"][:, target_view:target_view + 1]
 
                 with self.benchmarker.time("encoder"):
-                    encoder_output = self.encoder(batch["context"], self.global_step,
-                                                  visualization_dump=visualization_dump, target=target_data)
+                    encoder_output = self._encode_with_gaussian_refinement(
+                        batch["context"],
+                        target=target_data,
+                        visualization_dump=visualization_dump,
+                    )
 
                 pred_extrinsics_cwt = encoder_output['extrinsics']['cwt']
                 gaussians = encoder_output["gaussians"]
@@ -390,7 +471,9 @@ class ModelWrapper(LightningModule):
         else:
             # Render Gaussians.
             with self.benchmarker.time("encoder"):
-                encoder_output = self.encoder(batch["context"], self.global_step, visualization_dump=visualization_dump)
+                encoder_output = self._encode_with_gaussian_refinement(
+                    batch["context"], visualization_dump=visualization_dump
+                )
 
             target_extrinsics = batch["target"]["extrinsics"]
 
@@ -625,8 +708,11 @@ class ModelWrapper(LightningModule):
         assert b == 1
 
         visualization_dump = {}
-        encoder_output = self.encoder(batch["context"], self.global_step, visualization_dump=visualization_dump,
-                                      target=batch["target"] if self.encoder.cfg.estimating_pose else None)
+        encoder_output = self._encode_with_gaussian_refinement(
+            batch["context"],
+            target=batch["target"] if self.encoder.cfg.estimating_pose else None,
+            visualization_dump=visualization_dump,
+        )
 
         if self.encoder.cfg.estimating_pose:
             pred_extrinsics, pred_extrinsics_cwt = encoder_output['extrinsics']['c'], encoder_output['extrinsics'][
@@ -670,6 +756,19 @@ class ModelWrapper(LightningModule):
             depth_mode=self.train_cfg.depth_mode,
         )
 
+        initial_output = None
+        if "initial_gaussians" in encoder_output:
+            with torch.no_grad():
+                initial_output = self.decoder.forward(
+                    encoder_output["initial_gaussians"],
+                    extrinsics,
+                    intrinsics,
+                    near,
+                    far,
+                    (h, w),
+                    depth_mode=self.train_cfg.depth_mode,
+                )
+
         # Compute validation metrics.
         rgb_gt = target_gt[0]
         rgb_pred = output.color[0]
@@ -683,6 +782,24 @@ class ModelWrapper(LightningModule):
         ssim_val = compute_ssim(rgb_gt[v_cxt:], rgb_pred[v_cxt:]).mean()
         self.log(f"val/ssim", ssim_val)
 
+        if initial_output is not None:
+            initial_rgb_pred = initial_output.color[0]
+            initial_psnr = compute_psnr(
+                rgb_gt[v_cxt:], initial_rgb_pred[v_cxt:]
+            ).mean()
+            initial_lpips = compute_lpips(
+                rgb_gt[v_cxt:], initial_rgb_pred[v_cxt:]
+            ).mean()
+            initial_ssim = compute_ssim(
+                rgb_gt[v_cxt:], initial_rgb_pred[v_cxt:]
+            ).mean()
+            self.log("val/initial_psnr", initial_psnr)
+            self.log("val/initial_lpips", initial_lpips)
+            self.log("val/initial_ssim", initial_ssim)
+            self.log("val/refine_psnr_gain", psnr - initial_psnr)
+            self.log("val/refine_lpips_gain", initial_lpips - lpips)
+            self.log("val/refine_ssim_gain", ssim_val - initial_ssim)
+
         # Context view metrics
         psnr = compute_psnr(rgb_gt[:v_cxt], rgb_pred[:v_cxt]).mean()
         self.log(f"val/context/psnr", psnr)
@@ -695,13 +812,28 @@ class ModelWrapper(LightningModule):
         context_img = context_image[0]
         context_img_depth = vis_depth_map(visualization_dump["depth"][0])  # (v, h, w)
 
-        comparison = hcat(
+        comparison_columns = [
             add_label(vcat(*context_img), "Context"),
             add_label(vcat(*context_img_depth), "Context Depth"),
-            add_label(vcat(*rgb_gt), "Target (Ground Truth)"),
-            add_label(vcat(*rgb_pred), f"Prediction"),
-            add_label(vcat(*depth_pred), f"Depth")
+            add_label(vcat(*rgb_gt), "Ground Truth"),
+        ]
+        if initial_output is not None:
+            comparison_columns.extend(
+                [
+                    add_label(vcat(*initial_output.color[0]), "Initial Gaussians"),
+                    add_label(
+                        vcat(*(encoder_output["render_error"][0].abs() * 4).clamp(0, 1)),
+                        "Initial |Render-SR| x4",
+                    ),
+                ]
+            )
+        comparison_columns.extend(
+            [
+                add_label(vcat(*rgb_pred), "Refined Prediction"),
+                add_label(vcat(*depth_pred), "Depth"),
+            ]
         )
+        comparison = hcat(*comparison_columns)
 
         if self.encoder.cfg.estimating_pose:
             context_rot_error, context_transl_error = compute_pose_error_for_batch(pred_extrinsics_cwt[:, v_cxt - 1],
@@ -821,8 +953,9 @@ class ModelWrapper(LightningModule):
         _, v_cxt, _, _ = batch["context"]["extrinsics"].shape
 
         visualization_dump = {}
-        encoder_output = self.encoder(batch["context"], self.global_step, visualization_dump=visualization_dump,
-                                      target=None)
+        encoder_output = self._encode_with_gaussian_refinement(
+            batch["context"], target=None, visualization_dump=visualization_dump
+        )
         gaussians = encoder_output['gaussians']
 
         if self.encoder.cfg.estimating_pose:
@@ -973,7 +1106,7 @@ class ModelWrapper(LightningModule):
                     continue
 
                 # Heads that are always treated as new
-                if any(x in name for x in ["gaussian_param_head", "intrinsic_encoder"]):
+                if any(x in name for x in ["gaussian_param_head", "intrinsic_encoder", "gaussian_refiner"]):
                     new_params.append(param)
                     new_param_names.append(name)
                     # print(name)

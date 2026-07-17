@@ -1,5 +1,5 @@
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, Optional
 
 import torch
@@ -18,6 +18,10 @@ from ...dataset.types import BatchedExample, DataShim
 from ...geometry.projection import sample_image_grid
 from ..super_resolution import FrozenSwinIRUpsampler
 from ..types import Gaussians
+from ..utils.resplat_gaussian_refiner import (
+    ReSplatGaussianRefiner,
+    ReSplatGaussianRefinerCfg,
+)
 from .backbone import Backbone, BackboneCfg, get_backbone
 from .common.gaussian_adapter import GaussianAdapter, GaussianAdapterCfg, UnifiedGaussianAdapter
 from .encoder import Encoder
@@ -68,6 +72,10 @@ class EncoderNAS3RMCfg:
 
     equal_fxfy: bool = True
     equal_view_intrinsics: bool = True
+    gaussian_refiner: ReSplatGaussianRefinerCfg = field(
+        default_factory=ReSplatGaussianRefinerCfg
+    )
+    freeze_base_for_refine: bool = False
 
 
 def rearrange_head(feat, patch_size, H, W):
@@ -117,6 +125,53 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             FrozenSwinIRUpsampler(cfg.swinir_weight_path)
             if cfg.use_swinir_sr
             else None
+        )
+
+        self.gaussian_refiner = (
+            ReSplatGaussianRefiner(
+                cfg.gaussian_refiner,
+                sh_degree=cfg.gaussian_adapter.sh_degree,
+            )
+            if cfg.gaussian_refiner.enabled
+            else None
+        )
+        self.freeze_base_for_refine = (
+            cfg.freeze_base_for_refine and self.gaussian_refiner is not None
+        )
+        if self.freeze_base_for_refine:
+            self._freeze_base_network()
+
+    @property
+    def refinement_enabled(self) -> bool:
+        return self.gaussian_refiner is not None
+
+    def _freeze_base_network(self) -> None:
+        for name, parameter in self.named_parameters():
+            parameter.requires_grad = name.startswith("gaussian_refiner.")
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.freeze_base_for_refine:
+            for name, module in self.named_children():
+                if name != "gaussian_refiner":
+                    module.eval()
+            self.gaussian_refiner.train(mode)
+        return self
+
+    def refine_gaussians(
+        self,
+        gaussians: Gaussians,
+        render_error: Tensor,
+        points_per_pixel: int | None = None,
+    ) -> dict[str, Tensor | Gaussians]:
+        if self.gaussian_refiner is None:
+            raise RuntimeError("Gaussian refinement is not enabled in the encoder config")
+        if points_per_pixel is None:
+            points_per_pixel = self.cfg.num_surfaces * self.cfg.gaussians_per_pixel
+        return self.gaussian_refiner(
+            gaussians,
+            render_error,
+            points_per_pixel=points_per_pixel,
         )
 
     def set_depth_head(self, output_mode, head_type, landscape_only, depth_mode, conf_mode):
@@ -322,6 +377,9 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             rearrange(gaussians.harmonics, "b v r srf spp c d_sh -> b (v r srf spp) c d_sh"),
             rearrange(gaussians.opacities, "b v r srf spp -> b (v r srf spp)"),
         )
+        # This is the SR image used by FFGS. Its pixel order matches the flattened
+        # Gaussian order and is therefore the correct reference for render error.
+        encoder_output["context_image_sr"] = context_image.detach()
 
         if self.cfg.estimating_pose:
             encoder_output['extrinsics'] = dict()

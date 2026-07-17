@@ -87,6 +87,20 @@
           </mappings>
         </serverdata>
       </paths>
+      <paths name="mengxl@192.168.1.108:22 key (3)">
+        <serverdata>
+          <mappings>
+            <mapping local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="mengxl@192.168.1.108:22 key (4)">
+        <serverdata>
+          <mappings>
+            <mapping local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
       <paths name="nas3r">
         <serverdata>
           <mappings>

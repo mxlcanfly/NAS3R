@@ -8,8 +8,8 @@ defaults:
   - override /loss: [mse, lpips]
 
 wandb:
-  name: re10k
-  tags: [re10k, 256x256]
+  name: re10k_refine
+  tags: [re10k, 256x256, resplat_refine]
   project: nas3r-m
 
 
@@ -21,10 +21,22 @@ model:
 
     gs_params_head_type: dpt_gs
     pose_free: true
-    pretrained_weights: "/space0/mengxl/NAS3R-master/pretrained_weights/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth" #"/space0/mengxl/NAS3R-master/outputs/exp_re10k/64in64/checkpoints/epoch_36-step_300000.ckpt"#
+    # Load only the encoder weights from the completed 150k-step Lightning
+    # checkpoint. This starts a fresh stage-two optimizer/global step.
+    pretrained_weights: "/space0/mengxl/NAS3R-master/outputs/exp_re10k/up64in256/checkpoints/epoch_18-step_150000.ckpt"
+    freeze_base_for_refine: true
+    gaussian_refiner:
+      enabled: true
+      channels: 512
+      knn_samples: 8
+      num_blocks: 4
+      attn_proj_channels: 64
+      use_checkpointing: true
+      scale_min: 1.0e-6
+      scale_max: 0.3
 
 
-    estimating_focal: false 
+    estimating_focal: false
     depth_activation: 'sigmoid'
 
     pose_head:
@@ -53,10 +65,11 @@ optimizer:
 
 data_loader:
   train:
-    batch_size: 8
+    # 2 * 256 * 256 points with KNN attention is memory intensive.
+    batch_size: 4
 
 trainer:
-  max_steps: 150_001
+  max_steps: 75_001
   val_check_interval: 2500
 
 checkpointing:
