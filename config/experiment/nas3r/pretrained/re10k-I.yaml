@@ -52,14 +52,14 @@ optimizer:
 
 data_loader:
   train:
-    batch_size: 10
+    batch_size: 8
 
 trainer:
-  max_steps: 400_001
+  max_steps: 50001
   val_check_interval: 10000
 
 checkpointing:
-  every_n_train_steps: 10000
+  every_n_train_steps: 500
   save_weights_only: false
   save_top_k: 1
 
