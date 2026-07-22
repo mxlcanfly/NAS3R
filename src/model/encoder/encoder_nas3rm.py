@@ -24,6 +24,15 @@ from .visualization.encoder_visualizer_epipolar_cfg import EncoderVisualizerEpip
 from ...misc.cam_utils import camera_normalization, convert_pose_to_4x4, depth_projector, \
     unproject_depth_map_to_point_map_batch
 from .heads.pose_head import PoseHeadCfg
+from .swin_feature_fusion import SwinFeatureFusion, SwinFeatureFusionCfg
+from .enhanced_feature_fusion import (
+    EnhancedFeatureFusion,
+    EnhancedFeatureFusionCfg,
+)
+from .hr_gaussian_head import (
+    HighResolutionGaussianHead,
+    HighResolutionGaussianHeadCfg,
+)
 
 inf = float('inf')
 
@@ -33,6 +42,19 @@ class OpacityMappingCfg:
     initial: float
     final: float
     warm_up: int
+
+
+@dataclass
+class ModuleTrainabilityCfg:
+    backbone: bool
+    depth_heads: bool
+    gs_heads: bool
+    pose_heads: bool
+    gaussian_adapter: bool
+    feature_heads: bool
+    feature_fusion: bool
+    enhanced_feature_fusion: bool
+    hr_gaussian_head: bool
 
 
 @dataclass
@@ -49,6 +71,10 @@ class EncoderNAS3RMCfg:
     num_surfaces: int
     gs_params_head_type: str
     pose_head: PoseHeadCfg
+    trainable: ModuleTrainabilityCfg
+    feature_fusion: SwinFeatureFusionCfg
+    enhanced_feature_fusion: EnhancedFeatureFusionCfg
+    hr_gaussian_head: HighResolutionGaussianHeadCfg
 
     input_mean: tuple[float, float, float] = (0.5, 0.5, 0.5)
     input_std: tuple[float, float, float] = (0.5, 0.5, 0.5)
@@ -105,9 +131,21 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             raise NotImplementedError
 
         self.set_gs_params_head(cfg, cfg.gs_params_head_type)
+        self.set_feature_head()
+        self.feature_fusion = SwinFeatureFusion(cfg.feature_fusion)
+        self.enhanced_feature_fusion = EnhancedFeatureFusion(
+            cfg.enhanced_feature_fusion
+        )
+        self.hr_gaussian_head = HighResolutionGaussianHead(
+            cfg.hr_gaussian_head,
+            feature_dim=cfg.enhanced_feature_fusion.output_dim,
+            raw_gaussian_dim=self.raw_gs_dim * cfg.num_surfaces,
+        )
 
         if self.cfg.estimating_pose:
             self.set_pose_head(cfg, cfg.pose_head_type)
+
+        self.set_module_trainability()
 
     def set_depth_head(self, output_mode, head_type, landscape_only, depth_mode, conf_mode):
         self.backbone.depth_mode = depth_mode
@@ -140,9 +178,50 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
         else:
             raise NotImplementedError(f"unexpected {head_type=}")
 
+    def set_feature_head(self):
+        self.feature_head1 = head_factory(
+            'dpt_feature', 'feature', self.backbone, has_conf=False
+        )
+        self.feature_head2 = head_factory(
+            'dpt_feature', 'feature', self.backbone, has_conf=False
+        )
+
     def set_pose_head(self, cfg, head_type='mlp'):
         self.pose_head = camera_head_factory(head_type, 'pose', self.backbone, cfg.pose_head)
         self.pose_head2 = camera_head_factory(head_type, 'pose', self.backbone, cfg.pose_head)
+
+    @staticmethod
+    def _set_modules_trainable(modules, trainable):
+        for module in modules:
+            for param in module.parameters():
+                param.requires_grad = trainable
+
+    def set_module_trainability(self):
+        trainable = self.cfg.trainable
+        module_groups = {
+            "backbone": [self.backbone],
+            "depth_heads": [
+                self.downstream_depth_head1,
+                self.downstream_depth_head2,
+            ],
+            "gs_heads": [
+                self.gaussian_param_head,
+                self.gaussian_param_head2,
+            ],
+            "gaussian_adapter": [self.gaussian_adapter],
+            "feature_heads": [self.feature_head1, self.feature_head2],
+            "feature_fusion": [self.feature_fusion],
+            "enhanced_feature_fusion": [self.enhanced_feature_fusion],
+            "hr_gaussian_head": [self.hr_gaussian_head],
+        }
+        if self.cfg.estimating_pose:
+            module_groups["pose_heads"] = [self.pose_head, self.pose_head2]
+
+        for group_name, modules in module_groups.items():
+            self._set_modules_trainable(
+                modules,
+                getattr(trainable, group_name),
+            )
 
     def map_pdf_to_opacity(
             self,
@@ -192,11 +271,26 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             # Encode the context images.
             out = self.backbone(context_input)
 
-        dec_feat, shape, images = out['dec_feat'], out['shape'], out['images']
+        enc_feat, dec_feat = out['enc_feat'], out['dec_feat']
+        shape, images = out['shape'], out['images']
 
         with torch.amp.autocast('cuda', enabled=False):
             all_other_params = []
             all_depth_res = []
+            all_dpt_features = []
+            all_gs_features = []
+
+            feature_res1 = self.feature_head1(
+                [tok[:, 0].float() for tok in enc_feat],
+                shape[0, 0].cpu().tolist(),
+            )
+            all_dpt_features.append(feature_res1)
+            for i in range(1, v_cxt):
+                feature_res2 = self.feature_head2(
+                    [tok[:, i].float() for tok in enc_feat],
+                    shape[0, i].cpu().tolist(),
+                )
+                all_dpt_features.append(feature_res2)
 
             if self.cfg.estimating_pose:
                 all_pose_params = []
@@ -212,15 +306,25 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
 
             # for the 3DGS heads
             if 'dpt' in self.gs_params_head_type:
-                GS_res1 = self.gaussian_param_head([tok[:, 0].float() for tok in dec_feat], images[:, 0, :3],
-                                                   shape[0, 0].cpu().tolist())
+                GS_res1, GS_feat1 = self.gaussian_param_head(
+                    [tok[:, 0].float() for tok in dec_feat],
+                    images[:, 0, :3],
+                    shape[0, 0].cpu().tolist(),
+                    return_features=True,
+                )
                 GS_res1 = rearrange(GS_res1, "b d h w -> b (h w) d")
                 all_other_params.append(GS_res1)
+                all_gs_features.append(GS_feat1)
                 for i in range(1, v_cxt):
-                    GS_res2 = self.gaussian_param_head2([tok[:, i].float() for tok in dec_feat], images[:, i, :3],
-                                                        shape[0, i].cpu().tolist())
+                    GS_res2, GS_feat2 = self.gaussian_param_head2(
+                        [tok[:, i].float() for tok in dec_feat],
+                        images[:, i, :3],
+                        shape[0, i].cpu().tolist(),
+                        return_features=True,
+                    )
                     GS_res2 = rearrange(GS_res2, "b d h w -> b (h w) d")
                     all_other_params.append(GS_res2)
+                    all_gs_features.append(GS_feat2)
             else:
                 raise NotImplementedError(f"unexpected {self.gs_params_head_type=}")
 
@@ -241,6 +345,8 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
                         all_intrin_params.append(pose_res2['intrinsics'])
 
         gaussians = torch.stack(all_other_params, dim=1)  # [b, v, 65536, 83]
+        dpt_features = torch.stack(all_dpt_features, dim=1)
+        gs_features = torch.stack(all_gs_features, dim=1)
         # print("gaussians", gaussians.shape)
 
         if self.cfg.estimating_pose:
@@ -266,6 +372,25 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
                                                                                 "b v ... -> (b v ) ..."))
 
         depth_to_pts_all = rearrange(point_map_from_depth, "(b v) ... -> b v ...", b=b, v=v_cxt)
+        with torch.amp.autocast('cuda', enabled=False):
+            encoder_features = self.feature_fusion(
+                context_image.float(),
+                dpt_features,
+                depth_to_pts_all,
+                depth_all,
+                context_extrinsics,
+                context_intrinsics,
+            )
+            enhanced_feat = self.enhanced_feature_fusion(
+                encoder_features,
+                gs_features,
+            )
+            hr_depths, hr_gaussian_params = self.hr_gaussian_head(
+                enhanced_feat,
+                depth_all,
+                context["near"],
+                context["far"],
+            )
         depth_to_pts_all = rearrange(depth_to_pts_all, "b v h w xyz -> b v (h w) xyz")
         # print("depth_to_pts_all", depth_to_pts_all[0,0,0])
         depth_to_pts_all = depth_to_pts_all.unsqueeze(-2)
@@ -278,6 +403,32 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             depth_to_pts_all.unsqueeze(-2),
             self.map_pdf_to_opacity(densities, global_step),
             rearrange(gaussian_params[..., 1:], "b v r srf c -> b v r srf () c"),
+        )
+
+        hr_point_map = unproject_depth_map_to_point_map_batch(
+            rearrange(hr_depths, "b v h w -> (b v) h w"),
+            rearrange(context_extrinsics, "b v i j -> (b v) i j"),
+            rearrange(context_intrinsics, "b v i j -> (b v) i j"),
+        )
+        hr_point_map = rearrange(
+            hr_point_map,
+            "(b v) h w xyz -> b v (h w) xyz",
+            b=b,
+            v=v_cxt,
+        )
+        hr_gaussian_params = rearrange(
+            hr_gaussian_params,
+            "b v (srf c) h w -> b v (h w) srf c",
+            srf=self.cfg.num_surfaces,
+        )
+        hr_densities = hr_gaussian_params[..., 0].sigmoid().unsqueeze(-1)
+        hr_gaussians = self.gaussian_adapter.forward(
+            hr_point_map[:, :, :, None, None],
+            self.map_pdf_to_opacity(hr_densities, global_step),
+            rearrange(
+                hr_gaussian_params[..., 1:],
+                "b v r srf c -> b v r srf () c",
+            ),
         )
 
         # Dump visualizations if needed.
@@ -299,7 +450,7 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
 
         encoder_output = dict()
 
-        encoder_output["gaussians"] = Gaussians(
+        encoder_output["lr_gaussians"] = Gaussians(
             rearrange(gaussians.means, "b v r srf spp xyz -> b (v r srf spp) xyz"),
             rearrange(gaussians.covariances, "b v r srf spp i j -> b (v r srf spp) i j"),
             rearrange(gaussians.rotations, "b v r srf spp i  -> b (v r srf spp) i "),
@@ -307,6 +458,18 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             rearrange(gaussians.harmonics, "b v r srf spp c d_sh -> b (v r srf spp) c d_sh"),
             rearrange(gaussians.opacities, "b v r srf spp -> b (v r srf spp)"),
         )
+        encoder_output["gaussians"] = Gaussians(
+            rearrange(hr_gaussians.means, "b v r srf spp xyz -> b (v r srf spp) xyz"),
+            rearrange(hr_gaussians.covariances, "b v r srf spp i j -> b (v r srf spp) i j"),
+            rearrange(hr_gaussians.rotations, "b v r srf spp i -> b (v r srf spp) i"),
+            rearrange(hr_gaussians.scales, "b v r srf spp i -> b (v r srf spp) i"),
+            rearrange(hr_gaussians.harmonics, "b v r srf spp c d_sh -> b (v r srf spp) c d_sh"),
+            rearrange(hr_gaussians.opacities, "b v r srf spp -> b (v r srf spp)"),
+        )
+        encoder_output["encoder_features"] = encoder_features
+        encoder_output["enhanced_feat"] = enhanced_feat
+        encoder_output["hr_depth"] = hr_depths
+        encoder_output["dpt_features"] = dpt_features
 
         if self.cfg.estimating_pose:
             encoder_output['extrinsics'] = dict()

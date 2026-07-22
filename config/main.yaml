@@ -65,6 +65,7 @@ train:
   random_drop_target_views: true
 
   pretrain_camera_head: false
+  hr_debug_every_n_steps: 500
 
 
 test:

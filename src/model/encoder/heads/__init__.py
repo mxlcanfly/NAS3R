@@ -5,6 +5,7 @@
 # head factory
 # --------------------------------------------------------
 from .dpt_gs_head import create_gs_dpt_head
+from .dpt_feature_head import create_encoder_feature_dpt_head
 from .linear_head import LinearPts3d
 from .dpt_head import create_dpt_head, create_dpt_depth_head
 from .pose_head import create_pose_head
@@ -23,6 +24,8 @@ def head_factory(head_type, output_mode, net, has_conf=False, out_nchan=3):
         return create_dpt_depth_head(net, has_conf=has_conf)
     elif head_type == 'dpt_gs' and output_mode == 'gs_params':
         return create_gs_dpt_head(net, has_conf=False, out_nchan=out_nchan, postprocess_func=None)
+    elif head_type == 'dpt_feature' and output_mode == 'feature':
+        return create_encoder_feature_dpt_head(net)
     else:
         raise NotImplementedError(f"unexpected {head_type=} and {output_mode=}")
     

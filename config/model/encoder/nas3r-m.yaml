@@ -47,6 +47,49 @@ pose_head:
   concat_enc: false
   estimate_focal: true
 
+# Trainability switches for NAS3R-M modules. The original network is frozen by
+# default; newly added feature heads remain trainable.
+trainable:
+  backbone: false
+  depth_heads: false
+  gs_heads: false
+  pose_heads: false
+  gaussian_adapter: false
+  feature_heads: true
+  feature_fusion: true
+  enhanced_feature_fusion: true
+  hr_gaussian_head: true
+
+feature_fusion:
+  image_feature_dim: 64
+  embed_dim: 180
+  output_dim: 256
+  num_rstb: 3
+  depth: 6
+  num_heads: 6
+  window_size: 8
+  mlp_ratio: 2.0
+  projection_kernel_size: 1
+  upsample_scale: 4
+  upsample_num_feat: 256
+  use_checkpoint: true
+  mvca_num_heads: 6
+  mvca_patch_size: 3
+  mvca_depth_tolerance: 0.1
+  mvca_query_chunk_size: 256
+  mvca_residual_init: 0.0
+
+enhanced_feature_fusion:
+  gs_feature_dim: 256
+  encoder_feature_dim: 256
+  output_dim: 256
+  num_groups: 32
+
+hr_gaussian_head:
+  hidden_dim: 256
+  depth_head_layers: 2
+  gaussian_head_layers: 4
+
 
 depth_activation: 'sigmoid'
 

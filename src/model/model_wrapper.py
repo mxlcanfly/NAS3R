@@ -45,6 +45,8 @@ from ..visualization.validation_in_3d import render_cameras, render_projections,
 from .decoder.decoder import Decoder, DepthRenderingMode
 from .encoder import Encoder
 from .encoder.visualization.encoder_visualizer import EncoderVisualizer
+from .hr_debug import save_hr_debug_plane
+from .ply_export import export_ply
 from ..misc.intrinsics_utils import estimate_intrinsics
 from ..evaluation.metrics import compute_pose_error, compute_pose_error_for_batch
 from ..misc.cam_utils import pose_auc
@@ -88,6 +90,7 @@ class TrainCfg:
     random_drop_target_views: bool = False
 
     pretrain_camera_head: bool = False
+    hr_debug_every_n_steps: int = 500
 
 
 def dropout_context_views(v_cxt):
@@ -187,10 +190,9 @@ class ModelWrapper(LightningModule):
         self.all_metrics_sub = {}
 
         self.ckpt_path = None
+        self._last_hr_debug_step = -1
 
     def _image_key(self, views: dict) -> str:
-        if getattr(self.encoder.cfg, "name", None) == "nas3r-m" and "image_lr" in views:
-            return "image_lr"
         return "image"
 
     def _images(self, views: dict) -> Tensor:
@@ -285,6 +287,14 @@ class ModelWrapper(LightningModule):
         )
         self.log(f"train/psnr", psnr.mean())
 
+        self._save_hr_training_debug(
+            batch,
+            encoder_output,
+            output,
+            context_extrinsics,
+            v_cxt,
+        )
+
         # Compute and log loss.
         for loss_fn in self.losses:
             if loss_fn.name in ['mse', 'lpips']:
@@ -326,6 +336,85 @@ class ModelWrapper(LightningModule):
             self.step_tracker.set_step(self.global_step)
 
         return total_loss
+
+    @torch.no_grad()
+    def _save_hr_training_debug(
+            self,
+            batch: BatchedExample,
+            encoder_output: dict,
+            output,
+            context_extrinsics: Tensor,
+            num_context_views: int,
+    ) -> None:
+        interval = self.train_cfg.hr_debug_every_n_steps
+        step = int(self.global_step)
+        if (
+                interval <= 0
+                or step <= 0
+                or step % interval != 0
+                or step == self._last_hr_debug_step
+                or self.global_rank != 0
+                or "hr_depth" not in encoder_output
+        ):
+            return
+        if output.depth is None:
+            return
+
+        checkpoint_callback = getattr(self.trainer, "checkpoint_callback", None)
+        checkpoint_dir = getattr(checkpoint_callback, "dirpath", None)
+        if checkpoint_dir is None:
+            checkpoint_dir = Path(self.trainer.default_root_dir) / "checkpoints"
+        debug_dir = Path(checkpoint_dir) / "debug" / f"step_{step:06d}"
+
+        hr_target = batch["target"]["image"][0, 0]
+        if "image_lr" in batch["target"]:
+            lr_target = batch["target"]["image_lr"][0, 0]
+        else:
+            lr_target = torch.nn.functional.interpolate(
+                hr_target[None],
+                size=(64, 64),
+                mode="bicubic",
+                align_corners=False,
+                antialias=True,
+            )[0]
+        bicubic_target = torch.nn.functional.interpolate(
+            lr_target[None],
+            size=hr_target.shape[-2:],
+            mode="bicubic",
+            align_corners=False,
+            antialias=True,
+        )[0]
+
+        rendered_view = num_context_views if self.train_cfg.training_context else 0
+        rendered_hr = output.color[0, rendered_view]
+        rendered_depth = output.depth[0, rendered_view]
+        refined_depth = encoder_output["hr_depth"][0, 0]
+        view_psnr = compute_psnr(
+            hr_target[None],
+            rendered_hr[None],
+        ).item()
+        save_hr_debug_plane(
+            lr_target,
+            bicubic_target,
+            hr_target,
+            rendered_hr,
+            refined_depth,
+            rendered_depth,
+            view_psnr,
+            debug_dir / "hr_debug_plane.png",
+        )
+
+        hr_gaussians = encoder_output["gaussians"]
+        export_ply(
+            context_extrinsics[0, 0],
+            hr_gaussians.means[0],
+            hr_gaussians.scales[0],
+            hr_gaussians.rotations[0],
+            hr_gaussians.harmonics[0],
+            hr_gaussians.opacities[0],
+            debug_dir / "hr_gaussians.ply",
+        )
+        self._last_hr_debug_step = step
 
     def test_step(self, batch, batch_idx):
         v_cxt = batch["context"]["image"].shape[1]
@@ -975,7 +1064,14 @@ class ModelWrapper(LightningModule):
                     continue
 
                 # Heads that are always treated as new
-                if any(x in name for x in ["gaussian_param_head", "intrinsic_encoder"]):
+                if any(x in name for x in [
+                    "gaussian_param_head",
+                    "intrinsic_encoder",
+                    "feature_head",
+                    "feature_fusion",
+                    "enhanced_feature_fusion",
+                    "hr_gaussian_head",
+                ]):
                     new_params.append(param)
                     new_param_names.append(name)
                     # print(name)

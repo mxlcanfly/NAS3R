@@ -10,12 +10,43 @@
 # --------------------------------------------------------
 from einops import rearrange
 from typing import List
+import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 # import dust3r.utils.path_to_croco
 from .dpt_block import DPTOutputAdapter, Interpolate, make_fusion_block
 from .head_modules import UnetExtractor
 from .postprocess import postprocess
+
+
+def visualize_path1_feature(path_1, title="path_1 + direct_img_feat"):
+    feat = path_1[0].detach().float().cpu()
+    channel_mean = feat.mean(dim=0)
+    channels = feat[:16]
+
+    fig, axes = plt.subplots(5, 4, figsize=(12, 14))
+    fig.suptitle(f"{title}  shape={tuple(path_1.shape)}", fontsize=12)
+
+    axes[0, 0].imshow(channel_mean, cmap="viridis")
+    axes[0, 0].set_title("channel mean")
+    axes[0, 0].axis("off")
+
+    axes[0, 1].imshow(feat.norm(dim=0), cmap="magma")
+    axes[0, 1].set_title("channel norm")
+    axes[0, 1].axis("off")
+
+    for ax in axes[0, 2:]:
+        ax.axis("off")
+
+    for idx, ax in enumerate(axes[1:].reshape(-1)):
+        fmap = channels[idx]
+        ax.imshow(fmap, cmap="viridis")
+        ax.set_title(f"ch {idx}")
+        ax.axis("off")
+
+    plt.tight_layout()
+    plt.show()
+
 
 class DPTOutputAdapter_fix(DPTOutputAdapter):
     """
@@ -31,14 +62,20 @@ class DPTOutputAdapter_fix(DPTOutputAdapter):
         del self.act_3_postprocess
         del self.act_4_postprocess
 
-
         self.feat_up = Interpolate(scale_factor=2, mode="bilinear", align_corners=True)
         self.input_merger = nn.Sequential(
             nn.Conv2d(3, 256, 7, 1, 3),
             nn.ReLU(),
         )
 
-    def forward(self, encoder_tokens: List[torch.Tensor], imgs, image_size=None, conf=None):
+    def forward(
+        self,
+        encoder_tokens: List[torch.Tensor],
+        imgs,
+        image_size=None,
+        conf=None,
+        return_features=False,
+    ):
         assert self.dim_tokens_enc is not None, 'Need to call init(dim_tokens_enc) function first'
         # H, W = input_info['image_size']
         image_size = self.image_size if image_size is None else image_size
@@ -66,15 +103,16 @@ class DPTOutputAdapter_fix(DPTOutputAdapter):
         path_2 = self.scratch.refinenet2(path_3, layers[1])
         path_1 = self.scratch.refinenet1(path_2, layers[0])
 
-
-
         direct_img_feat = self.input_merger(imgs)
         path_1 = self.feat_up(path_1)
         path_1 = path_1 + direct_img_feat
+        # visualize_path1_feature(path_1)
 
         # Output head
         out = self.head(path_1)
 
+        if return_features:
+            return out, path_1
         return out
 
 
@@ -82,7 +120,7 @@ class PixelwiseTaskWithDPT(nn.Module):
     """ DPT module for dust3r, can return 3D points + confidence for all pixels"""
 
     def __init__(self, *, n_cls_token=0, hooks_idx=None, dim_tokens=None,
-                 output_width_ratio=1, num_channels=1, postprocess=None, depth_mode=None, conf_mode=None,  **kwargs):
+                 output_width_ratio=1, num_channels=1, postprocess=None, depth_mode=None, conf_mode=None, **kwargs):
         super(PixelwiseTaskWithDPT, self).__init__()
         self.return_all_layers = True  # backbone needs to return all layers
         self.postprocess = postprocess
@@ -96,16 +134,27 @@ class PixelwiseTaskWithDPT(nn.Module):
         if hooks_idx is not None:
             dpt_args.update(hooks=hooks_idx)
 
-
         self.dpt = DPTOutputAdapter_fix(**dpt_args)
-        
+
         dpt_init_args = {} if dim_tokens is None else {'dim_tokens_enc': dim_tokens}
         self.dpt.init(**dpt_init_args)
 
-    def forward(self, x, imgs, img_info, conf=None):
-        out = self.dpt(x, imgs, image_size=(img_info[0], img_info[1]), conf=conf)
+    def forward(self, x, imgs, img_info, conf=None, return_features=False):
+        dpt_output = self.dpt(
+            x,
+            imgs,
+            image_size=(img_info[0], img_info[1]),
+            conf=conf,
+            return_features=return_features,
+        )
+        if return_features:
+            out, features = dpt_output
+        else:
+            out = dpt_output
         if self.postprocess:
             out = self.postprocess(out, self.depth_mode, self.conf_mode)
+        if return_features:
+            return out, features
         return out
 
 
@@ -116,13 +165,13 @@ def create_gs_dpt_head(net, has_conf=False, out_nchan=3, postprocess_func=postpr
     assert net.dec_depth > 9
     l2 = net.dec_depth
     feature_dim = 256
-    last_dim = feature_dim//2
+    last_dim = feature_dim // 2
     ed = net.enc_embed_dim
     dd = net.dec_embed_dim
     return PixelwiseTaskWithDPT(num_channels=out_nchan + has_conf,
                                 feature_dim=feature_dim,
                                 last_dim=last_dim,
-                                hooks_idx=[0, l2*2//4, l2*3//4, l2],
+                                hooks_idx=[0, l2 * 2 // 4, l2 * 3 // 4, l2],
                                 dim_tokens=[ed, dd, dd, dd],
                                 postprocess=postprocess_func,
                                 depth_mode=net.depth_mode,
