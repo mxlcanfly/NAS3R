@@ -1,5 +1,5 @@
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, Optional
 
 import torch
@@ -16,6 +16,11 @@ from ...dataset.shims.normalize_shim import apply_normalize_shim, normalize_imag
 from ...dataset.shims.patch_shim import apply_patch_shim
 from ...dataset.types import BatchedExample, DataShim
 from ...geometry.projection import sample_image_grid
+from ..super_resolution.external_upsamplers import (
+    FrozenASteISRUpsampler,
+    FrozenHATUpsampler,
+    downsample_for_sr,
+)
 from ..types import Gaussians
 from .backbone import Backbone, BackboneCfg, get_backbone
 from .common.gaussian_adapter import GaussianAdapter, GaussianAdapterCfg, UnifiedGaussianAdapter
@@ -36,6 +41,27 @@ class OpacityMappingCfg:
 
 
 @dataclass
+class ModuleTrainabilityCfg:
+    backbone: bool
+    depth_heads: bool
+    gs_heads: bool
+    pose_heads: bool
+    gaussian_adapter: bool
+
+
+@dataclass
+class BackboneInputSRCfg:
+    mode: Literal["none", "hat", "asteisr"] = "none"
+    source: Literal["auto", "image", "image_lr"] = "image"
+    lr_shape: list[int] = field(default_factory=lambda: [64, 64])
+    target_shape: list[int] = field(default_factory=lambda: [256, 256])
+    hat_weight_path: str = "/space0/mengxl/pth/HAT-L_SRx4_ImageNet-pretrain.pth"
+    asteisr_weight_path: str = "/space0/mengxl/pth/ASteISR_X4.pth"
+    hat_root: str = "/space0/mengxl/HAT"
+    asteisr_root: str = "/space0/mengxl/ASteISR-main"
+
+
+@dataclass
 class EncoderNAS3RMCfg:
     name: Literal["nas3r-m"]
     d_feature: int
@@ -49,9 +75,11 @@ class EncoderNAS3RMCfg:
     num_surfaces: int
     gs_params_head_type: str
     pose_head: PoseHeadCfg
+    trainable: ModuleTrainabilityCfg
 
     input_mean: tuple[float, float, float] = (0.5, 0.5, 0.5)
     input_std: tuple[float, float, float] = (0.5, 0.5, 0.5)
+    backbone_input_sr: BackboneInputSRCfg = field(default_factory=BackboneInputSRCfg)
     pretrained_weights: str = ""
     pose_free: bool = True
     pose_make_baseline_1: bool = True
@@ -82,6 +110,8 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
         super().__init__(cfg)
 
         self.backbone = get_backbone(cfg.backbone, 3)
+        self.backbone_input_sr = self._build_backbone_input_sr(cfg.backbone_input_sr)
+        self._logged_backbone_input = False
 
         self.pose_free = cfg.pose_free
         if self.pose_free:
@@ -108,6 +138,63 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
 
         if self.cfg.estimating_pose:
             self.set_pose_head(cfg, cfg.pose_head_type)
+
+        self.set_module_trainability()
+
+    def _build_backbone_input_sr(self, cfg: BackboneInputSRCfg) -> Optional[nn.Module]:
+        if cfg.mode == "none":
+            return None
+        if cfg.mode == "hat":
+            return FrozenHATUpsampler(
+                cfg.hat_weight_path,
+                hat_root=cfg.hat_root,
+                upscale=4,
+                img_size=cfg.lr_shape[0],
+            )
+        if cfg.mode == "asteisr":
+            return FrozenASteISRUpsampler(
+                cfg.asteisr_weight_path,
+                asteisr_root=cfg.asteisr_root,
+                upscale=4,
+                img_size=tuple(cfg.lr_shape),
+            )
+        raise ValueError(f"Unsupported backbone_input_sr mode: {cfg.mode}")
+
+    def _select_backbone_source_image(self, views: dict) -> Tensor:
+        source = self.cfg.backbone_input_sr.source
+        if source == "image":
+            return views["image"]
+        if source == "image_lr":
+            if "image_lr" in views:
+                return views["image_lr"]
+            return downsample_for_sr(views["image"], tuple(self.cfg.backbone_input_sr.lr_shape))
+        if source == "auto":
+            return views.get("image_lr", views["image"])
+        raise ValueError(f"Unsupported backbone_input_sr source: {source}")
+
+    def _prepare_backbone_image(self, views: dict) -> tuple[Tensor, Tensor]:
+        source_image = self._select_backbone_source_image(views)
+        if self.backbone_input_sr is None:
+            return source_image, source_image
+
+        cfg = self.cfg.backbone_input_sr
+        lr_image = source_image
+        lr_shape = tuple(cfg.lr_shape)
+        target_shape = tuple(cfg.target_shape)
+        if lr_image.shape[-2:] != lr_shape:
+            lr_image = downsample_for_sr(lr_image, lr_shape)
+
+        sr_image = self.backbone_input_sr(lr_image)
+        if sr_image.shape[-2:] != target_shape:
+            sr_image = F.interpolate(
+                rearrange(sr_image, "b v c h w -> (b v) c h w"),
+                size=target_shape,
+                mode="bicubic",
+                align_corners=False,
+                antialias=True,
+            )
+            sr_image = rearrange(sr_image, "(b v) c h w -> b v c h w", b=views["image"].shape[0])
+        return sr_image.clamp(0, 1), source_image
 
     def set_depth_head(self, output_mode, head_type, landscape_only, depth_mode, conf_mode):
         self.backbone.depth_mode = depth_mode
@@ -144,6 +231,35 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
         self.pose_head = camera_head_factory(head_type, 'pose', self.backbone, cfg.pose_head)
         self.pose_head2 = camera_head_factory(head_type, 'pose', self.backbone, cfg.pose_head)
 
+    @staticmethod
+    def _set_modules_trainable(modules, trainable):
+        for module in modules:
+            for param in module.parameters():
+                param.requires_grad = trainable
+
+    def set_module_trainability(self):
+        trainable = self.cfg.trainable
+        module_groups = {
+            "backbone": [self.backbone],
+            "depth_heads": [
+                self.downstream_depth_head1,
+                self.downstream_depth_head2,
+            ],
+            "gs_heads": [
+                self.gaussian_param_head,
+                self.gaussian_param_head2,
+            ],
+            "gaussian_adapter": [self.gaussian_adapter],
+        }
+        if self.cfg.estimating_pose:
+            module_groups["pose_heads"] = [self.pose_head, self.pose_head2]
+
+        for group_name, modules in module_groups.items():
+            self._set_modules_trainable(
+                modules,
+                getattr(trainable, group_name),
+            )
+
     def map_pdf_to_opacity(
             self,
             pdf: Float[Tensor, " *batch"],
@@ -169,8 +285,28 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             target: Optional[dict] = None,
             warmup_pts3d: bool = False,
     ):
-        context_image = context.get("image_lr", context["image"])
-        target_image = target.get("image_lr", target["image"]) if target is not None else None
+        context_image, context_source_image = self._prepare_backbone_image(context)
+        if target is not None:
+            target_image, target_source_image = self._prepare_backbone_image(target)
+        else:
+            target_image, target_source_image = None, None
+        # if not self._logged_backbone_input:
+        #     sr_cfg = self.cfg.backbone_input_sr
+        #     context_min = context_source_image.detach().amin().item()
+        #     context_max = context_source_image.detach().amax().item()
+        #     prepared_min = context_image.detach().amin().item()
+        #     prepared_max = context_image.detach().amax().item()
+        #     print(
+        #         "[NAS3R-M] backbone_input_sr "
+        #         f"mode={sr_cfg.mode} source={sr_cfg.source} "
+        #         f"context_image_shape={tuple(context_image.shape)} "
+        #         f"target_image_shape={tuple(target_image.shape) if target_image is not None else None} "
+        #         f"context_has_image_lr={'image_lr' in context} "
+        #         f"context_source_range=({context_min:.4f},{context_max:.4f}) "
+        #         f"prepared_range=({prepared_min:.4f},{prepared_max:.4f}) "
+        #         f"device={context_image.device}"
+        #     )
+        #     self._logged_backbone_input = True
 
         device = context_image.device
         b, v_cxt, _, h, w = context_image.shape
@@ -192,7 +328,8 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             # Encode the context images.
             out = self.backbone(context_input)
 
-        dec_feat, shape, images = out['dec_feat'], out['shape'], out['images']
+        enc_feat, dec_feat = out['enc_feat'], out['dec_feat']
+        shape, images = out['shape'], out['images']
 
         with torch.amp.autocast('cuda', enabled=False):
             all_other_params = []
@@ -212,13 +349,19 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
 
             # for the 3DGS heads
             if 'dpt' in self.gs_params_head_type:
-                GS_res1 = self.gaussian_param_head([tok[:, 0].float() for tok in dec_feat], images[:, 0, :3],
-                                                   shape[0, 0].cpu().tolist())
+                GS_res1 = self.gaussian_param_head(
+                    [tok[:, 0].float() for tok in dec_feat],
+                    images[:, 0, :3],
+                    shape[0, 0].cpu().tolist(),
+                )
                 GS_res1 = rearrange(GS_res1, "b d h w -> b (h w) d")
                 all_other_params.append(GS_res1)
                 for i in range(1, v_cxt):
-                    GS_res2 = self.gaussian_param_head2([tok[:, i].float() for tok in dec_feat], images[:, i, :3],
-                                                        shape[0, i].cpu().tolist())
+                    GS_res2 = self.gaussian_param_head2(
+                        [tok[:, i].float() for tok in dec_feat],
+                        images[:, i, :3],
+                        shape[0, i].cpu().tolist(),
+                    )
                     GS_res2 = rearrange(GS_res2, "b d h w -> b (h w) d")
                     all_other_params.append(GS_res2)
             else:

@@ -31,6 +31,15 @@ apply_bounds_shim: true
 gs_params_head_type: dpt_gs
 pose_free: true
 pretrained_weights: ""
+backbone_input_sr:
+  mode: none  # none | hat | asteisr
+  source: image  # image: original 256 input; image_lr: 64 input for HAT/ASteISR; auto: old image_lr-first behavior.
+  lr_shape: [64, 64]
+  target_shape: [256, 256]
+  hat_weight_path: /space0/mengxl/pth/HAT-L_SRx4_ImageNet-pretrain.pth
+  asteisr_weight_path: /space0/mengxl/pth/ASteISR_X4.pth
+  hat_root: /space0/mengxl/HAT
+  asteisr_root: /space0/mengxl/ASteISR-main
 
 pose_make_baseline_1: false
 pose_make_relative: true
@@ -46,6 +55,13 @@ pose_head:
   use_homogeneous: false
   concat_enc: false
   estimate_focal: true
+
+trainable:
+  backbone: true
+  depth_heads: true
+  gs_heads: true
+  pose_heads: true
+  gaussian_adapter: true
 
 
 depth_activation: 'sigmoid'
