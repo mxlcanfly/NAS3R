@@ -27,6 +27,7 @@ def downsample_bicubic(
     images: Float[Tensor, "*#batch c h_in w_in"],
     shape: tuple[int, int],
 ) -> Float[Tensor, "*#batch c h_out w_out"]:
+    """Downsample a batch of already cropped images without changing cameras."""
     *batch, c, h, w = images.shape
     images = images.reshape(-1, c, h, w)
     images = torch.stack(

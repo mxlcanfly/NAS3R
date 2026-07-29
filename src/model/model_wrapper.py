@@ -78,19 +78,16 @@ class TrainCfg:
     distiller: str
     distill_max_steps: int
     training_context: bool
-    freeze_pretrained: bool = False
-    freeze_backbone: bool = False
-    freeze_depth_head: bool = False
-    freeze_gaussian_param_head: bool = False
-    freeze_pose_head: bool = False
-    freeze_aggregator: bool = False
-    freeze_intrinsics_head: bool = False
+    freeze_pretrained: bool
+    freeze_backbone: bool
+    freeze_pose_head: bool
+    freeze_aggregator: bool
+    freeze_intrinsics_head: bool
 
     random_drop_context_views: bool = False
     random_drop_target_views: bool = False
 
     pretrain_camera_head: bool = False
-    debug_save_every_n_steps: int = 500
 
 
 def dropout_context_views(v_cxt):
@@ -139,60 +136,6 @@ class ModelWrapper(LightningModule):
     encoder: nn.Module
     encoder_visualizer: Optional[EncoderVisualizer]
     decoder: Decoder
-
-    @rank_zero_only
-    def _save_refine_comparison(
-        self,
-        target_gt: Tensor,
-        render_before: Tensor,
-        render_after: Tensor,
-    ) -> None:
-        checkpoint_dir = Path(self.trainer.checkpoint_callback.dirpath)
-        save_dir = (
-            checkpoint_dir
-            / "debug_train"
-            / f"step_{self.global_step:06d}"
-        )
-
-        target_gt = target_gt[0].detach().float().clamp(0, 1)
-        render_before = render_before[0].detach().float().clamp(0, 1)
-        render_after = render_after[0].detach().float().clamp(0, 1)
-        error_before = (render_before - target_gt).abs().mean(dim=1)
-        error_after = (render_after - target_gt).abs().mean(dim=1)
-
-        shared_error_max = torch.quantile(
-            torch.cat([error_before.flatten(), error_after.flatten()]),
-            0.99,
-        ).clamp_min(1e-6)
-        error_before_vis = apply_color_map_to_image(
-            error_before / shared_error_max,
-        )
-        error_after_vis = apply_color_map_to_image(
-            error_after / shared_error_max,
-        )
-
-        rows = []
-        for view_idx in range(target_gt.shape[0]):
-            rows.append(
-                hcat(
-                    add_label(target_gt[view_idx], "Target GT"),
-                    add_label(render_before[view_idx], "Before refine"),
-                    add_label(render_after[view_idx], "After refine"),
-                    add_label(
-                        error_before_vis[view_idx],
-                        "Before absolute error",
-                    ),
-                    add_label(
-                        error_after_vis[view_idx],
-                        "After absolute error",
-                    ),
-                )
-            )
-
-        save_image(
-            add_border(vcat(*rows)),
-            save_dir / "comparison.png",
-        )
     losses: nn.ModuleList
     optimizer_cfg: OptimizerCfg
     test_cfg: TestCfg
@@ -221,7 +164,6 @@ class ModelWrapper(LightningModule):
         self.encoder = encoder
         self.encoder_visualizer = encoder_visualizer
         self.decoder = decoder
-        object.__setattr__(self.encoder, "decoder", self.decoder)
         self.data_shim = get_data_shim(self.encoder)
         self.losses = nn.ModuleList(losses)
 
@@ -245,7 +187,6 @@ class ModelWrapper(LightningModule):
         self.all_metrics_sub = {}
 
         self.ckpt_path = None
-        self._apply_train_freezing()
 
     def training_step(self, batch, batch_idx):
         # combine batch from different dataloaders
@@ -329,63 +270,12 @@ class ModelWrapper(LightningModule):
             depth_mode=self.train_cfg.depth_mode,
         )
 
-        # Compute PSNR after refinement.
-        psnr_after_refine = compute_psnr(
+        # Compute PSNR
+        psnr = compute_psnr(
             rearrange(target_gt, "b v c h w -> (b v) c h w"),
             rearrange(output.color, "b v c h w -> (b v) c h w"),
         )
-        mean_psnr_after_refine = psnr_after_refine.mean()
-        self.log("train/psnr", mean_psnr_after_refine)
-        self.log("train/psnr_after_refine", mean_psnr_after_refine)
-
-        should_print = (
-            self.global_rank == 0
-            and self.global_step % self.train_cfg.print_log_every_n_steps == 0
-        )
-        should_save_debug = (
-            self.global_rank == 0
-            and self.global_step > 0
-            and self.train_cfg.debug_save_every_n_steps > 0
-            and self.global_step % self.train_cfg.debug_save_every_n_steps == 0
-        )
-        mean_psnr_before_refine = None
-        psnr_refine_gain = None
-        output_before_refine = None
-        if (
-            (should_print or should_save_debug)
-            and "gaussians_before_refine" in encoder_output
-        ):
-            with torch.no_grad():
-                output_before_refine = self.decoder.forward(
-                    encoder_output["gaussians_before_refine"],
-                    extrinsics,
-                    intrinsics,
-                    near,
-                    far,
-                    (h, w),
-                    depth_mode=self.train_cfg.depth_mode,
-                )
-                psnr_before_refine = compute_psnr(
-                    rearrange(target_gt, "b v c h w -> (b v) c h w"),
-                    rearrange(
-                        output_before_refine.color,
-                        "b v c h w -> (b v) c h w",
-                    ),
-                )
-                mean_psnr_before_refine = psnr_before_refine.mean()
-                psnr_refine_gain = (
-                    mean_psnr_after_refine.detach() - mean_psnr_before_refine
-                )
-
-            self.log("train/psnr_before_refine", mean_psnr_before_refine)
-            self.log("train/psnr_refine_gain", psnr_refine_gain)
-
-        if should_save_debug and output_before_refine is not None:
-            self._save_refine_comparison(
-                target_gt,
-                output_before_refine.color,
-                output.color,
-            )
+        self.log(f"train/psnr", psnr.mean())
 
         # Compute and log loss.
         for loss_fn in self.losses:
@@ -408,16 +298,10 @@ class ModelWrapper(LightningModule):
             self.log(f"train/target_angular_error", target_rot_error)
             self.log(f"train/target_transl_error", target_transl_error)
 
-        if should_print:
-            psnr_comparison = ""
-            if mean_psnr_before_refine is not None:
-                psnr_comparison = (
-                    f"psnr_before_refine = "
-                    f"{mean_psnr_before_refine.item():.6f}; "
-                    f"psnr_after_refine = "
-                    f"{mean_psnr_after_refine.item():.6f}; "
-                    f"psnr_refine_gain = {psnr_refine_gain.item():+.6f}; "
-                )
+        if (
+                self.global_rank == 0
+                and self.global_step % self.train_cfg.print_log_every_n_steps == 0
+        ):
             print(
                 f"Epoch {self.current_epoch}; "
                 f"train step {self.global_step}; "
@@ -425,7 +309,7 @@ class ModelWrapper(LightningModule):
                 f"context = {batch['context']['index'].tolist()}; "
                 f"target = {batch['target']['index'].tolist()}; "
                 f"loss = {total_loss:.6f}; "
-                f"{psnr_comparison}"
+                f"psnr = {psnr.mean().item():.6f}; "
             )
         self.log("info/global_step", self.global_step)  # hack for ckpt monitor
 
@@ -573,7 +457,7 @@ class ModelWrapper(LightningModule):
 
         if self.test_cfg.save_image:
             for index, pred in zip(batch["target"]["index"][0], rgb_pred):
-                save_image(pred, path / scene / f"color_no_error/{index:0>6}.png")
+                save_image(pred, path / scene / f"color/{index:0>6}.png")
 
         if self.test_cfg.save_video:
             frame_str = "_".join([str(x.item()) for x in batch["context"]["index"][0]])
@@ -1058,47 +942,22 @@ class ModelWrapper(LightningModule):
                     param.requires_grad = False
                     print(f"Freezing: {name}")
 
-    def _apply_train_freezing(self) -> None:
-        freeze_keywords = []
-
-        if self.train_cfg.freeze_backbone:
-            freeze_keywords.append("encoder.backbone")
-        if self.train_cfg.freeze_depth_head:
-            freeze_keywords.extend(
-                [
-                    "encoder.downstream_depth_head",
-                    "encoder.depth_head",
-                    "encoder.backbone.model.depth_head",
-                ]
-            )
-        if self.train_cfg.freeze_gaussian_param_head:
-            freeze_keywords.append("encoder.gaussian_param_head")
-        if self.train_cfg.freeze_pose_head:
-            freeze_keywords.extend(["encoder.pose_head", "encoder.pose_head2", "camera_head"])
-        if self.train_cfg.freeze_aggregator:
-            freeze_keywords.extend(["encoder.backbone.aggregator", "encoder.backbone.model.aggregator"])
-        if self.train_cfg.freeze_intrinsics_head:
-            freeze_keywords.extend(
-                [
-                    "intrinsic_encoder",
-                    "intrinsics_token",
-                    "intrinsics_head",
-                    "intrinsics_embed",
-                ]
-            )
-
-        if self.train_cfg.freeze_pretrained:
-            freeze_keywords.append("encoder")
-
-        if freeze_keywords:
-            self.freeze_params(freeze_keywords=freeze_keywords)
-
     def configure_optimizers(self):
         new_params, new_param_names = [], []
         pretrained_params, pretrained_param_names = [], []
 
-        has_pretrained_backbone = getattr(self.encoder.backbone.cfg, "pretrained", False)
-        has_pretrained_encoder_weights = bool(getattr(self.encoder.cfg, "pretrained_weights", ""))
+        # VGGT records pretraining on the backbone config, while NAS3R-M records
+        # its MASt3R initialization path on the encoder config. CroCo backbone
+        # configs therefore do not define a `pretrained` attribute at all.
+        has_pretrained_backbone = getattr(
+            self.encoder.backbone.cfg,
+            "pretrained",
+            False,
+        )
+        has_pretrained_encoder_weights = bool(
+            getattr(self.encoder.cfg, "pretrained_weights", "")
+        )
+
         if not (has_pretrained_backbone or has_pretrained_encoder_weights):
             for name, param in self.named_parameters():
                 if not param.requires_grad:
@@ -1111,15 +970,7 @@ class ModelWrapper(LightningModule):
                     continue
 
                 # Heads that are always treated as new
-                if any(
-                    x in name
-                    for x in [
-                        "gaussian_param_head",
-                        "intrinsic_encoder",
-                        "resunet_feature_extractor",
-                        "litept_refiner",
-                    ]
-                ):
+                if any(x in name for x in ["gaussian_param_head", "intrinsic_encoder"]):
                     new_params.append(param)
                     new_param_names.append(name)
                     # print(name)

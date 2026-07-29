@@ -15,21 +15,13 @@ from src.model.decoder import get_decoder
 from src.model.encoder import get_encoder
 from src.misc.weight_modify import checkpoint_filter_fn
 
-
-def load_trusted_checkpoint(path: str | Path, map_location: str = "cpu"):
-    try:
-        return torch.load(path, map_location=map_location, weights_only=False)
-    except TypeError:
-        return torch.load(path, map_location=map_location)
-
-
 # Configure beartype and jaxtyping.
 with install_import_hook(
-        ("src",),
-        ("beartype", "beartype"),
+    ("src",),
+    ("beartype", "beartype"),
 ):
     from src.config import load_typed_config, ModelCfg, CheckpointingCfg, separate_loss_cfg_wrappers, \
-        separate_dataset_cfg_wrappers
+    separate_dataset_cfg_wrappers
     from src.dataset.data_module import DataLoaderCfg, DataModule, DatasetCfgWrapper
     from src.evaluation.evaluation_cfg import EvaluationCfg
     from src.global_cfg import set_cfg
@@ -54,14 +46,14 @@ class RootCfg:
 def evaluate(cfg_dict: DictConfig):
     cfg = load_typed_config(cfg_dict, RootCfg,
                             {list[LossCfgWrapper]: separate_loss_cfg_wrappers,
-                             list[DatasetCfgWrapper]: separate_dataset_cfg_wrappers}, )
+                             list[DatasetCfgWrapper]: separate_dataset_cfg_wrappers},)
     set_cfg(cfg_dict)
     torch.manual_seed(cfg.seed)
 
     encoder, encoder_visualizer = get_encoder(cfg.model.encoder)
 
     if cfg.checkpointing.load is not None:
-        ckpt_weights = load_trusted_checkpoint(cfg.checkpointing.load, map_location='cpu')
+        ckpt_weights = torch.load(cfg.checkpointing.load, map_location='cpu')
         if 'model' in ckpt_weights:
             ckpt_weights = ckpt_weights['model']
             ckpt_weights = checkpoint_filter_fn(ckpt_weights, encoder)
@@ -71,6 +63,7 @@ def evaluate(cfg_dict: DictConfig):
             ckpt_weights = {k[8:] if k.startswith("encoder.") else k: v for k, v in ckpt_weights.items()}
             missing_keys, unexpected_keys = encoder.load_state_dict(ckpt_weights, strict=False)
 
+   
     trainer = Trainer(max_epochs=-1, accelerator="gpu", inference_mode=False)
     pose_evaluator = PoseEvaluator(cfg.evaluation,
                                    encoder,

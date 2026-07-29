@@ -42,9 +42,8 @@ checkpointing:
   load: null
   every_n_train_steps: 5000
   save_top_k: 1
-  save_weights_only: false
+  save_weights_only: true
   resume: true
-  resume_from_latest: false
 
 train:
   depth_mode: null
@@ -57,8 +56,6 @@ train:
   training_context: false
   freeze_pretrained: false
   freeze_backbone: false
-  freeze_depth_head: false
-  freeze_gaussian_param_head: false
   freeze_pose_head: false
   freeze_aggregator: false
   freeze_intrinsics_head: false

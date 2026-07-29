@@ -52,6 +52,3 @@ depth_activation: 'sigmoid'
 
 equal_fxfy: true
 equal_view_intrinsics: true
-use_resunet_feature_extractor: false
-use_context_render_error: false
-use_litept_refiner: false
