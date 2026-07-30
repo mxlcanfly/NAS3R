@@ -52,3 +52,27 @@ depth_activation: 'sigmoid'
 
 equal_fxfy: true
 equal_view_intrinsics: true
+
+# SR3R is opt-in so the original NAS3R-M 64-in/64-supervision path remains
+# available unchanged.
+sr3r:
+  enabled: false
+  upscale: 4
+  swinir_weight_path: /space0/mengxl/NAS3R-master/pretrained_weights/001_classicalSR_DF2K_s64w8_SwinIR-M_x4.pth
+  encoder_dim: 1024
+  decoder_dim: 768
+  token_heads: 8
+  token_dropout: 0.0
+  shuffle_beta: 0.5
+  shuffle_axis_divisor: 4.0
+  shuffle_lateral_divisor: 1.9
+  shuffle_opacity_threshold: 0.5
+  apply_shuffle_opacity_threshold: false
+  ptv3_channels: 768
+  ptv3_depth: 4
+  ptv3_heads: 8
+  ptv3_patch_size: 1024
+  ptv3_mlp_ratio: 4.0
+  ptv3_enable_flash: true
+  ptv3_grid_depth: 15
+  debug_interval: 500

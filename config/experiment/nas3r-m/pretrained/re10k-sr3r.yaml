@@ -1,0 +1,77 @@
+# @package _global_
+
+defaults:
+  - /dataset@_group_.re10k: re10k
+  - override /model/encoder: nas3r-m
+  - override /model/encoder/backbone: masked_croco_multi
+  - override /model/decoder: splatting_cuda
+  - override /loss: [mse, lpips]
+
+wandb:
+  name: sr3r_nas3r
+  tags: [re10k, sr3r, 64in256]
+  project: nas3r-m
+
+model:
+  encoder:
+    backbone:
+      name: masked_croco_multi
+      intrinsics_embed_loc: decoder
+
+    gs_params_head_type: dpt_gs
+    pose_free: true
+    pretrained_weights: /space0/mengxl/NAS3R-master/pretrained_weights/epoch_36-step_300000.ckpt
+    estimating_focal: false
+    depth_activation: sigmoid
+
+    pose_head:
+      pose_init_t: true
+      use_homogeneous: false
+      concat_enc: false
+      estimate_focal: false
+
+    sr3r:
+      enabled: true
+      debug_interval: 500
+
+dataset:
+  re10k:
+    make_baseline_1: true
+    view_sampler:
+      warm_up_steps: 75_000
+      num_target_views: 1
+      num_context_views: 2
+      max_distance_between_context_views: 150
+
+optimizer:
+  lr: 2.5e-5
+  warm_up_steps: 1000
+  backbone_lr_multiplier: 1.0
+  min_lr_multiplier: 0.01
+
+data_loader:
+  train:
+    # Paper: global batch 8 on four GPUs.
+    batch_size: 3
+
+trainer:
+  max_steps: 75_001
+  val_check_interval: 5000
+
+checkpointing:
+  every_n_train_steps: 500
+  save_weights_only: false
+  save_top_k: 1
+
+train:
+  training_context: false
+  random_drop_context_views: false
+  random_drop_target_views: false
+
+test:
+  output_path: outputs/test/nas3r-m/sr3r/
+  align_pose: false
+  compute_scores: true
+  save_image: true
+  save_video: false
+  save_compare: true

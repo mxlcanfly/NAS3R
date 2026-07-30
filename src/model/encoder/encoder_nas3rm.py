@@ -1,5 +1,5 @@
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, Optional
 
 import torch
@@ -24,6 +24,7 @@ from .visualization.encoder_visualizer_epipolar_cfg import EncoderVisualizerEpip
 from ...misc.cam_utils import camera_normalization, convert_pose_to_4x4, depth_projector, \
     unproject_depth_map_to_point_map_batch
 from .heads.pose_head import PoseHeadCfg
+from .sr3r import SR3RCfg, SR3RMapping
 
 inf = float('inf')
 
@@ -64,6 +65,7 @@ class EncoderNAS3RMCfg:
 
     equal_fxfy: bool = True
     equal_view_intrinsics: bool = True
+    sr3r: SR3RCfg = field(default_factory=SR3RCfg)
 
 
 def rearrange_head(feat, patch_size, H, W):
@@ -108,6 +110,34 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
 
         if self.cfg.estimating_pose:
             self.set_pose_head(cfg, cfg.pose_head_type)
+
+        self.sr3r = (
+            SR3RMapping(cfg.sr3r, cfg.gaussian_adapter.sh_degree)
+            if cfg.sr3r.enabled
+            else None
+        )
+        if self.sr3r is not None:
+            # SR3R trains only the token fusion and PTv3 residual branch. The
+            # original 64x64 NAS3R scaffold predictor and SwinIR stay frozen.
+            for name, parameter in self.named_parameters():
+                parameter.requires_grad = (
+                    name.startswith("sr3r.")
+                    and not name.startswith("sr3r.upsampler.")
+                )
+
+    @property
+    def sr3r_enabled(self) -> bool:
+        return self.sr3r is not None
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.sr3r is not None:
+            for name, module in self.named_children():
+                if name != "sr3r":
+                    module.eval()
+            self.sr3r.train(mode)
+            self.sr3r.upsampler.eval()
+        return self
 
     def set_depth_head(self, output_mode, head_type, landscape_only, depth_mode, conf_mode):
         self.backbone.depth_mode = depth_mode
@@ -161,7 +191,7 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
         head = getattr(self, f'depth_head{head_num}')
         return head(decout, img_shape, ray_embedding=ray_embedding)
 
-    def forward(
+    def _forward_base(
             self,
             context: dict,
             global_step: int = 0,
@@ -307,6 +337,8 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             rearrange(gaussians.harmonics, "b v r srf spp c d_sh -> b (v r srf spp) c d_sh"),
             rearrange(gaussians.opacities, "b v r srf spp -> b (v r srf spp)"),
         )
+        encoder_output["lr_encoder_tokens"] = out["encoder_image_tokens"][:, :v_cxt]
+        encoder_output["lr_image_shape"] = (h, w)
 
         if self.cfg.estimating_pose:
             encoder_output['extrinsics'] = dict()
@@ -320,6 +352,65 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             if target is not None:
                 encoder_output['intrinsics']['cwt'] = pred_intrinsics
 
+        return encoder_output
+
+    def forward(
+            self,
+            context: dict,
+            global_step: int = 0,
+            visualization_dump: Optional[dict] = None,
+            target: Optional[dict] = None,
+            warmup_pts3d: bool = False,
+    ):
+        if self.sr3r is None:
+            return self._forward_base(
+                context,
+                global_step,
+                visualization_dump,
+                target,
+                warmup_pts3d,
+            )
+
+        # The LR FFGS/NAS3R branch is a frozen scaffold generator.
+        with torch.no_grad():
+            encoder_output = self._forward_base(
+                context,
+                global_step,
+                visualization_dump,
+                target,
+                warmup_pts3d,
+            )
+
+        v_cxt = context["image_lr"].shape[1]
+        context_extrinsics = (
+            encoder_output["extrinsics"]["c"]
+            if self.cfg.estimating_pose
+            else context["extrinsics"]
+        )
+        context_intrinsics = (
+            encoder_output["intrinsics"]["c"]
+            if self.cfg.estimating_focal
+            else context["intrinsics"]
+        )
+        sr3r_output = self.sr3r(
+            self.backbone,
+            encoder_output["gaussians"],
+            encoder_output["lr_encoder_tokens"],
+            encoder_output["lr_image_shape"],
+            context["image_lr"],
+            context_extrinsics,
+            context_intrinsics,
+        )
+        encoder_output["gaussians"] = sr3r_output["gaussians"]
+        encoder_output["base_gaussians"] = sr3r_output["base_gaussians"]
+        encoder_output["dense_gaussians"] = sr3r_output["dense_gaussians"]
+        encoder_output["sr3r"] = sr3r_output
+
+        if visualization_dump is not None:
+            visualization_dump["sr_images"] = sr3r_output["sr_images"]
+            visualization_dump["shuffle_split_mask"] = sr3r_output[
+                "shuffle_split_mask"
+            ]
         return encoder_output
 
     def process_pose(self, pose_enc, context_views):

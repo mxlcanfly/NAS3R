@@ -4,6 +4,7 @@ from typing import Optional, Protocol, runtime_checkable, Any, Dict
 
 import moviepy.editor as mpy
 import torch
+import torch.nn.functional as F
 import wandb
 from einops import pack, rearrange, repeat
 from jaxtyping import Float
@@ -45,6 +46,7 @@ from ..visualization.validation_in_3d import render_cameras, render_projections,
 from .decoder.decoder import Decoder, DepthRenderingMode
 from .encoder import Encoder
 from .encoder.visualization.encoder_visualizer import EncoderVisualizer
+from .ply_export import export_ply
 from ..misc.intrinsics_utils import estimate_intrinsics
 from ..evaluation.metrics import compute_pose_error, compute_pose_error_for_batch
 from ..misc.cam_utils import pose_auc
@@ -187,9 +189,14 @@ class ModelWrapper(LightningModule):
         self.all_metrics_sub = {}
 
         self.ckpt_path = None
+        self._last_sr3r_debug_step = -1
 
     def _image_key(self, views: dict) -> str:
-        if getattr(self.encoder.cfg, "name", None) == "nas3r-m" and "image_lr" in views:
+        if (
+            getattr(self.encoder.cfg, "name", None) == "nas3r-m"
+            and not getattr(self.encoder, "sr3r_enabled", False)
+            and "image_lr" in views
+        ):
             return "image_lr"
         return "image"
 
@@ -324,11 +331,160 @@ class ModelWrapper(LightningModule):
             )
         self.log("info/global_step", self.global_step)  # hack for ckpt monitor
 
+        if "sr3r" in encoder_output:
+            for name in [
+                "delta_means",
+                "delta_opacities",
+                "delta_rotations",
+                "delta_scales",
+                "delta_harmonics",
+            ]:
+                self.log(
+                    f"sr3r/{name}_abs_mean",
+                    encoder_output["sr3r"][name].detach().abs().mean(),
+                )
+            self._save_sr3r_debug(
+                batch,
+                encoder_output,
+                context_extrinsics,
+                context_intrinsics,
+                target_extrinsics,
+                target_intrinsics,
+                h,
+                w,
+            )
+
         # Tell the data loader processes about the current step.
         if self.step_tracker is not None:
             self.step_tracker.set_step(self.global_step)
 
         return total_loss
+
+    @rank_zero_only
+    @torch.no_grad()
+    def _save_sr3r_debug(
+        self,
+        batch: dict,
+        encoder_output: dict,
+        context_extrinsics: Tensor,
+        context_intrinsics: Tensor,
+        target_extrinsics: Tensor,
+        target_intrinsics: Tensor,
+        height: int,
+        width: int,
+    ) -> None:
+        interval = int(self.encoder.cfg.sr3r.debug_interval)
+        step = int(self.global_step)
+        if (
+            interval <= 0
+            or step <= 0
+            or step % interval != 0
+            or step == self._last_sr3r_debug_step
+        ):
+            return
+        self._last_sr3r_debug_step = step
+
+        checkpoint_dir = Path(self.trainer.checkpoint_callback.dirpath)
+        output_dir = checkpoint_dir / "debug" / f"step_{step:06d}"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        target_extrinsics = target_extrinsics[:1, :1]
+        target_intrinsics = target_intrinsics[:1, :1]
+        target_near = batch["target"]["near"][:1, :1]
+        target_far = batch["target"]["far"][:1, :1]
+
+        def first_batch(gaussians):
+            return type(gaussians)(
+                means=gaussians.means[:1],
+                covariances=gaussians.covariances[:1],
+                rotations=gaussians.rotations[:1],
+                scales=gaussians.scales[:1],
+                harmonics=gaussians.harmonics[:1],
+                opacities=gaussians.opacities[:1],
+            )
+
+        rendered = {}
+        for name, gaussians in [
+            ("base", encoder_output["base_gaussians"]),
+            ("shuffle", encoder_output["dense_gaussians"]),
+            ("child", encoder_output["gaussians"]),
+        ]:
+            rendered[name] = self.decoder.forward(
+                first_batch(gaussians),
+                target_extrinsics,
+                target_intrinsics,
+                target_near,
+                target_far,
+                (height, width),
+                depth_mode="depth",
+            )
+
+        lr = batch["context"]["image_lr"][0, 0]
+        lr_up = F.interpolate(
+            lr[None],
+            size=(height, width),
+            mode="nearest",
+        )[0]
+        sr = encoder_output["sr3r"]["sr_images"][0, 0]
+        gt = batch["target"]["image"][0, 0]
+        colors = {name: value.color[0, 0] for name, value in rendered.items()}
+        depths = {
+            name: vis_depth_map(value.depth[0, 0].clamp_min(1e-6))
+            for name, value in rendered.items()
+        }
+
+        rgb_row = hcat(
+            add_label(lr_up, "LR x4 (nearest)"),
+            add_label(sr, "SwinIR"),
+            add_label(gt, "Target GT"),
+            add_label(colors["base"], "Base GS"),
+            add_label(colors["shuffle"], "Shuffle GS"),
+            add_label(colors["child"], "Child GS"),
+        )
+        diagnostic_row = hcat(
+            add_label((colors["base"] - gt).abs(), "|Base-GT|"),
+            add_label((colors["shuffle"] - gt).abs(), "|Shuffle-GT|"),
+            add_label((colors["child"] - gt).abs(), "|Child-GT|"),
+            add_label(depths["base"], "Base depth"),
+            add_label(depths["shuffle"], "Shuffle depth"),
+            add_label(depths["child"], "Child depth"),
+        )
+        save_image(
+            add_border(vcat(rgb_row, diagnostic_row)),
+            output_dir / "comparison.png",
+        )
+
+        ply_extrinsics = context_extrinsics[0, 0]
+        for name, gaussians in [
+            ("base", encoder_output["base_gaussians"]),
+            ("shuffle", encoder_output["dense_gaussians"]),
+            ("child", encoder_output["gaussians"]),
+        ]:
+            export_ply(
+                ply_extrinsics,
+                gaussians.means[0],
+                gaussians.scales[0],
+                gaussians.rotations[0],
+                gaussians.harmonics[0],
+                gaussians.opacities[0],
+                output_dir / f"{name}.ply",
+                save_sh_dc_only=False,
+            )
+
+        split_mask = encoder_output["sr3r"]["shuffle_split_mask"]
+        metadata = {
+            "step": step,
+            "scene": batch["scene"][0],
+            "context_indices": batch["context"]["index"][0].tolist(),
+            "target_index": int(batch["target"]["index"][0, 0]),
+            "base_gaussians": int(encoder_output["base_gaussians"].means.shape[1]),
+            "child_gaussians": int(encoder_output["gaussians"].means.shape[1]),
+            "split_fraction": float(split_mask.float().mean()),
+        }
+        (output_dir / "metadata.json").write_text(
+            json.dumps(metadata, indent=2),
+            encoding="utf-8",
+        )
 
     def test_step(self, batch, batch_idx):
         v_cxt = batch["context"]["image"].shape[1]
@@ -978,7 +1134,10 @@ class ModelWrapper(LightningModule):
                     continue
 
                 # Heads that are always treated as new
-                if any(x in name for x in ["gaussian_param_head", "intrinsic_encoder"]):
+                if any(
+                    x in name
+                    for x in ["gaussian_param_head", "intrinsic_encoder", "sr3r"]
+                ):
                     new_params.append(param)
                     new_param_names.append(name)
                     # print(name)
