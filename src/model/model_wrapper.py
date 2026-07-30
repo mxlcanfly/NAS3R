@@ -4,6 +4,7 @@ from typing import Optional, Protocol, runtime_checkable, Any, Dict
 
 import moviepy.editor as mpy
 import torch
+import torch.nn.functional as F
 import wandb
 from einops import pack, rearrange, repeat
 from jaxtyping import Float
@@ -45,6 +46,7 @@ from ..visualization.validation_in_3d import render_cameras, render_projections,
 from .decoder.decoder import Decoder, DepthRenderingMode
 from .encoder import Encoder
 from .encoder.visualization.encoder_visualizer import EncoderVisualizer
+from .ply_export import export_ply
 from ..misc.intrinsics_utils import estimate_intrinsics
 from ..evaluation.metrics import compute_pose_error, compute_pose_error_for_batch
 from ..misc.cam_utils import pose_auc
@@ -88,6 +90,7 @@ class TrainCfg:
     random_drop_target_views: bool = False
 
     pretrain_camera_head: bool = False
+    diagnostic_save_interval: int = 500
 
 
 def dropout_context_views(v_cxt):
@@ -187,6 +190,189 @@ class ModelWrapper(LightningModule):
         self.all_metrics_sub = {}
 
         self.ckpt_path = None
+
+    def _checkpoint_diagnostic_dir(self, step: int) -> Path:
+        checkpoint_callback = getattr(self.trainer, "checkpoint_callback", None)
+        checkpoint_dir = getattr(checkpoint_callback, "dirpath", None)
+        if checkpoint_dir is None:
+            checkpoint_dir = Path(self.trainer.default_root_dir) / "checkpoints"
+        return Path(checkpoint_dir) / "train_diagnostics" / f"step_{step:06d}"
+
+    @staticmethod
+    def _visualize_depth_batch(depth: Tensor) -> Tensor:
+        """Convert a batch of metric depth maps to robust, finite RGB maps."""
+        depth = depth.detach().float()
+        valid = torch.isfinite(depth) & (depth > 0)
+        if valid.any():
+            log_depth = depth.clamp_min(1e-8).log()
+            valid_values = log_depth[valid]
+            near = valid_values.quantile(0.01)
+            far = valid_values.quantile(0.99)
+            normalized = 1.0 - (log_depth - near) / (far - near).clamp_min(1e-6)
+            normalized = torch.where(valid, normalized, torch.zeros_like(normalized))
+        else:
+            normalized = torch.zeros_like(depth)
+        normalized = torch.nan_to_num(normalized, nan=0.0, posinf=0.0, neginf=0.0)
+        return apply_color_map_to_image(normalized.clamp(0, 1), "turbo")
+
+    @staticmethod
+    def _labeled_view_strip(
+            images: Tensor,
+            labels: list[str],
+    ) -> Tensor:
+        if len(images) != len(labels):
+            raise ValueError(
+                f"Expected one label per image, got {len(labels)} labels for "
+                f"{len(images)} images"
+            )
+        labeled = [
+            add_label(image, label, font_size=18)
+            for image, label in zip(images, labels)
+        ]
+        return hcat(*labeled, align="top", gap=6)
+
+    @rank_zero_only
+    def _save_training_diagnostics(
+            self,
+            batch: dict,
+            encoder_output: dict,
+            output,
+            gaussians,
+            context_extrinsics: Tensor,
+    ) -> None:
+        """Save one comparison plane and the refined Gaussians for this step."""
+        step = int(self.global_step)
+        output_dir = self._checkpoint_diagnostic_dir(step)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        with torch.no_grad():
+            lr_context = batch["context"]["image_lr"][0].detach()
+            sr_context = encoder_output["refinement"]["sr_image"][0].detach()
+            target_gt = batch["target"]["image"][0].detach()
+
+            # Display the 64x64 LR inputs at the same resolution as HAT/target RGB.
+            lr_context_display = F.interpolate(
+                lr_context,
+                size=sr_context.shape[-2:],
+                mode="bicubic",
+                align_corners=False,
+                antialias=True,
+            ).clamp(0, 1)
+
+            refined_depth = encoder_output["refinement"]["refined_depth"][0]
+            lr_h, lr_w = batch["context"]["image_lr"].shape[-2:]
+            num_samples = self.encoder.anchor_refiner.num_samples
+            refined_depth = rearrange(
+                refined_depth,
+                "v (h w k) -> v k h w",
+                h=lr_h,
+                w=lr_w,
+                k=num_samples,
+            ).mean(dim=1)
+            refined_depth = F.interpolate(
+                refined_depth[:, None],
+                size=sr_context.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(1)
+            refined_depth_rgb = self._visualize_depth_batch(refined_depth)
+
+            num_target_views = target_gt.shape[0]
+            rendered_rgb = output.color[0, -num_target_views:].detach().clamp(0, 1)
+            if output.depth is None:
+                rendered_depth_rgb = torch.zeros_like(rendered_rgb)
+            else:
+                rendered_depth = output.depth[0, -num_target_views:].detach()
+                rendered_depth_rgb = self._visualize_depth_batch(rendered_depth)
+            target_psnr = compute_psnr(target_gt, rendered_rgb)
+
+            num_context_views = lr_context.shape[0]
+            reference_column = vcat(
+                self._labeled_view_strip(
+                    lr_context_display,
+                    [
+                        f"LR Context C{i} (64x64, display x4)"
+                        for i in range(num_context_views)
+                    ],
+                ),
+                self._labeled_view_strip(
+                    sr_context.clamp(0, 1),
+                    [f"HAT SR Context C{i}" for i in range(num_context_views)],
+                ),
+                self._labeled_view_strip(
+                    target_gt,
+                    [f"HR Target GT T{i}" for i in range(num_target_views)],
+                ),
+                gap=10,
+            )
+            reference_column = add_label(
+                reference_column,
+                "INPUT / REFERENCE",
+                font_size=22,
+            )
+
+            prediction_column = vcat(
+                self._labeled_view_strip(
+                    refined_depth_rgb,
+                    [
+                        f"Refined Anchor Depth C{i} (mean K={num_samples})"
+                        for i in range(num_context_views)
+                    ],
+                ),
+                self._labeled_view_strip(
+                    rendered_depth_rgb,
+                    [f"Rendered Target Depth T{i}" for i in range(num_target_views)],
+                ),
+                self._labeled_view_strip(
+                    rendered_rgb,
+                    [
+                        f"Rendered Target RGB T{i} | PSNR {target_psnr[i].item():.2f} dB"
+                        for i in range(num_target_views)
+                    ],
+                ),
+                gap=10,
+            )
+            prediction_column = add_label(
+                prediction_column,
+                "PREDICTION / GEOMETRY",
+                font_size=22,
+            )
+
+            comparison_plane = add_border(
+                hcat(
+                    reference_column,
+                    prediction_column,
+                    align="top",
+                    gap=18,
+                ),
+                border=10,
+            )
+            save_image(comparison_plane, output_dir / "comparison.png")
+
+            export_ply(
+                context_extrinsics[0, 0],
+                gaussians.means[0],
+                gaussians.scales[0],
+                gaussians.rotations[0],
+                gaussians.harmonics[0],
+                gaussians.opacities[0],
+                output_dir / "gaussians.ply",
+            )
+
+            scene = str(batch["scene"][0])
+            metadata = {
+                "step": step,
+                "scene": scene,
+                "context_indices": batch["context"]["index"][0].detach().cpu().tolist(),
+                "target_indices": batch["target"]["index"][0].detach().cpu().tolist(),
+                "target_psnr_db": target_psnr.detach().cpu().tolist(),
+                "num_gaussians_before_ply_opacity_pruning": int(
+                    gaussians.means.shape[1]
+                ),
+                "ply_opacity_threshold": 0.005,
+            }
+            with (output_dir / "metadata.json").open("w") as file:
+                json.dump(metadata, file, indent=2)
 
     def _image_key(self, views: dict) -> str:
         if getattr(self.encoder.cfg, "name", None) == "nas3r-m" and "image_lr" in views:
@@ -319,6 +505,21 @@ class ModelWrapper(LightningModule):
                 f"loss = {total_loss:.6f}; "
                 f"psnr = {psnr.mean().item():.6f}; "
             )
+
+        diagnostic_interval = self.train_cfg.diagnostic_save_interval
+        if (
+                self.global_rank == 0
+                and diagnostic_interval > 0
+                and self.global_step % diagnostic_interval == 0
+        ):
+            self._save_training_diagnostics(
+                batch=batch,
+                encoder_output=encoder_output,
+                output=output,
+                gaussians=gaussians,
+                context_extrinsics=context_extrinsics,
+            )
+
         self.log("info/global_step", self.global_step)  # hack for ckpt monitor
 
         # Tell the data loader processes about the current step.
@@ -975,7 +1176,12 @@ class ModelWrapper(LightningModule):
                     continue
 
                 # Heads that are always treated as new
-                if any(x in name for x in ["gaussian_param_head", "intrinsic_encoder"]):
+                if any(x in name for x in [
+                    "gaussian_param_head",
+                    "intrinsic_encoder",
+                    "encoder.upsampler",
+                    "encoder.anchor_refiner",
+                ]):
                     new_params.append(param)
                     new_param_names.append(name)
                     # print(name)

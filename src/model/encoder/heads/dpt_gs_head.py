@@ -17,6 +17,7 @@ from .dpt_block import DPTOutputAdapter, Interpolate, make_fusion_block
 from .head_modules import UnetExtractor
 from .postprocess import postprocess
 
+
 class DPTOutputAdapter_fix(DPTOutputAdapter):
     """
     Adapt croco's DPTOutputAdapter implementation for dust3r:
@@ -30,7 +31,6 @@ class DPTOutputAdapter_fix(DPTOutputAdapter):
         del self.act_2_postprocess
         del self.act_3_postprocess
         del self.act_4_postprocess
-
 
         self.feat_up = Interpolate(scale_factor=2, mode="bilinear", align_corners=True)
         self.input_merger = nn.Sequential(
@@ -66,23 +66,21 @@ class DPTOutputAdapter_fix(DPTOutputAdapter):
         path_2 = self.scratch.refinenet2(path_3, layers[1])
         path_1 = self.scratch.refinenet1(path_2, layers[0])
 
-
-
         direct_img_feat = self.input_merger(imgs)
         path_1 = self.feat_up(path_1)
         path_1 = path_1 + direct_img_feat
 
-        # Output head
+        gaussian_features = path_1
         out = self.head(path_1)
 
-        return out
+        return out, gaussian_features
 
 
 class PixelwiseTaskWithDPT(nn.Module):
     """ DPT module for dust3r, can return 3D points + confidence for all pixels"""
 
     def __init__(self, *, n_cls_token=0, hooks_idx=None, dim_tokens=None,
-                 output_width_ratio=1, num_channels=1, postprocess=None, depth_mode=None, conf_mode=None,  **kwargs):
+                 output_width_ratio=1, num_channels=1, postprocess=None, depth_mode=None, conf_mode=None, **kwargs):
         super(PixelwiseTaskWithDPT, self).__init__()
         self.return_all_layers = True  # backbone needs to return all layers
         self.postprocess = postprocess
@@ -96,17 +94,21 @@ class PixelwiseTaskWithDPT(nn.Module):
         if hooks_idx is not None:
             dpt_args.update(hooks=hooks_idx)
 
-
         self.dpt = DPTOutputAdapter_fix(**dpt_args)
-        
+
         dpt_init_args = {} if dim_tokens is None else {'dim_tokens_enc': dim_tokens}
         self.dpt.init(**dpt_init_args)
 
     def forward(self, x, imgs, img_info, conf=None):
-        out = self.dpt(x, imgs, image_size=(img_info[0], img_info[1]), conf=conf)
+        out, gaussian_features = self.dpt(
+            x,
+            imgs,
+            image_size=(img_info[0], img_info[1]),
+            conf=conf,
+        )
         if self.postprocess:
             out = self.postprocess(out, self.depth_mode, self.conf_mode)
-        return out
+        return out, gaussian_features
 
 
 def create_gs_dpt_head(net, has_conf=False, out_nchan=3, postprocess_func=postprocess):

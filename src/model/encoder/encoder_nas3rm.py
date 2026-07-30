@@ -24,6 +24,8 @@ from .visualization.encoder_visualizer_epipolar_cfg import EncoderVisualizerEpip
 from ...misc.cam_utils import camera_normalization, convert_pose_to_4x4, depth_projector, \
     unproject_depth_map_to_point_map_batch
 from .heads.pose_head import PoseHeadCfg
+from .hat_upsampler import FrozenHATLUpsampler
+from .anchor_gaussian_refiner import AnchorGaussianRefiner
 
 inf = float('inf')
 
@@ -64,6 +66,8 @@ class EncoderNAS3RMCfg:
 
     equal_fxfy: bool = True
     equal_view_intrinsics: bool = True
+    refinement_num_samples: int = 6
+    refinement_lim_dis: float = 0.1
 
 
 def rearrange_head(feat, patch_size, H, W):
@@ -108,6 +112,55 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
 
         if self.cfg.estimating_pose:
             self.set_pose_head(cfg, cfg.pose_head_type)
+
+        self.hat_upsampler = FrozenHATLUpsampler()
+        self.upsampler = nn.Sequential(
+            nn.Conv2d(256, 64, kernel_size=3, stride=1, padding=1),
+            nn.Upsample(
+                scale_factor=4,
+                mode="bilinear",
+                align_corners=True,
+            ),
+            nn.GELU(),
+        )
+        self.anchor_refiner = AnchorGaussianRefiner(
+            sh_degree=cfg.gaussian_adapter.sh_degree,
+            num_samples=cfg.refinement_num_samples,
+            lim_dis=cfg.refinement_lim_dis,
+        )
+        self._freeze_lr_network()
+
+    def _lr_modules(self) -> list[nn.Module]:
+        module_names = [
+            "backbone",
+            "downstream_depth_head1",
+            "downstream_depth_head2",
+            "depth_head1",
+            "depth_head2",
+            "gaussian_param_head",
+            "gaussian_param_head2",
+            "pose_head",
+            "pose_head2",
+        ]
+        return [
+            module
+            for name in module_names
+            if isinstance((module := getattr(self, name, None)), nn.Module)
+        ]
+
+    def _freeze_lr_network(self) -> None:
+        for module in self._lr_modules():
+            module.requires_grad_(False)
+            module.eval()
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        # Lightning calls train() recursively. Keep the pretrained LR scaffold
+        # deterministic, including the Dropout in its Gaussian DPT heads.
+        for module in self._lr_modules():
+            module.eval()
+        self.hat_upsampler.eval()
+        return self
 
     def set_depth_head(self, output_mode, head_type, landscape_only, depth_mode, conf_mode):
         self.backbone.depth_mode = depth_mode
@@ -197,6 +250,7 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
         with torch.amp.autocast('cuda', enabled=False):
             all_other_params = []
             all_depth_res = []
+            all_gs_feat = []
 
             if self.cfg.estimating_pose:
                 all_pose_params = []
@@ -212,15 +266,17 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
 
             # for the 3DGS heads
             if 'dpt' in self.gs_params_head_type:
-                GS_res1 = self.gaussian_param_head([tok[:, 0].float() for tok in dec_feat], images[:, 0, :3],
+                GS_res1, GS_feat1 = self.gaussian_param_head([tok[:, 0].float() for tok in dec_feat], images[:, 0, :3],
                                                    shape[0, 0].cpu().tolist())
                 GS_res1 = rearrange(GS_res1, "b d h w -> b (h w) d")
                 all_other_params.append(GS_res1)
+                all_gs_feat.append(GS_feat1)
                 for i in range(1, v_cxt):
-                    GS_res2 = self.gaussian_param_head2([tok[:, i].float() for tok in dec_feat], images[:, i, :3],
+                    GS_res2, GS_feat2 = self.gaussian_param_head2([tok[:, i].float() for tok in dec_feat], images[:, i, :3],
                                                         shape[0, i].cpu().tolist())
                     GS_res2 = rearrange(GS_res2, "b d h w -> b (h w) d")
                     all_other_params.append(GS_res2)
+                    all_gs_feat.append(GS_feat2)
             else:
                 raise NotImplementedError(f"unexpected {self.gs_params_head_type=}")
 
@@ -241,6 +297,7 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
                         all_intrin_params.append(pose_res2['intrinsics'])
 
         gaussians = torch.stack(all_other_params, dim=1)  # [b, v, 65536, 83]
+        gaussian_features = torch.stack(all_gs_feat, dim=1)  # [b, v, 256, h, w]
         # print("gaussians", gaussians.shape)
 
         if self.cfg.estimating_pose:
@@ -280,6 +337,30 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
             rearrange(gaussian_params[..., 1:], "b v r srf c -> b v r srf () c"),
         )
 
+        sr_img, sr_feat = self.hat_upsampler(context_image)
+        gaussian_features = rearrange(
+            gaussian_features,
+            "b v c h w -> (b v) c h w",
+        )
+        gaussian_features = self.upsampler(gaussian_features)
+        gaussian_features = rearrange(
+            gaussian_features,
+            "(b v) c h w -> b v c h w",
+            b=b,
+            v=v_cxt,
+        )
+        refinement = self.anchor_refiner(
+            gaussian_features=gaussian_features,
+            sr_features=sr_feat,
+            sr_image=sr_img,
+            lr_depth=depth_all.detach(),
+            lr_gaussians=gaussians,
+            extrinsics=context_extrinsics.detach(),
+            intrinsics=context_intrinsics.detach(),
+            near=context["near"],
+            far=context["far"],
+        )
+
         # Dump visualizations if needed.
         if visualization_dump is not None:
             visualization_dump["depth"] = depths_per_view
@@ -299,14 +380,13 @@ class EncoderNAS3RM(Encoder[EncoderNAS3RMCfg]):
 
         encoder_output = dict()
 
-        encoder_output["gaussians"] = Gaussians(
-            rearrange(gaussians.means, "b v r srf spp xyz -> b (v r srf spp) xyz"),
-            rearrange(gaussians.covariances, "b v r srf spp i j -> b (v r srf spp) i j"),
-            rearrange(gaussians.rotations, "b v r srf spp i  -> b (v r srf spp) i "),
-            rearrange(gaussians.scales, "b v r srf spp i  -> b (v r srf spp) i "),
-            rearrange(gaussians.harmonics, "b v r srf spp c d_sh -> b (v r srf spp) c d_sh"),
-            rearrange(gaussians.opacities, "b v r srf spp -> b (v r srf spp)"),
-        )
+        encoder_output["gaussians"] = refinement.gaussians
+        encoder_output["refinement"] = {
+            "initial_depth": refinement.initial_depth,
+            "refined_depth": refinement.refined_depth,
+            "source_uv": refinement.source_uv,
+            "sr_image": sr_img,
+        }
 
         if self.cfg.estimating_pose:
             encoder_output['extrinsics'] = dict()

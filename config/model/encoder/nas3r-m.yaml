@@ -52,3 +52,6 @@ depth_activation: 'sigmoid'
 
 equal_fxfy: true
 equal_view_intrinsics: true
+
+refinement_num_samples: 6
+refinement_lim_dis: 0.1
