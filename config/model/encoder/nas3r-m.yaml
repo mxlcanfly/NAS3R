@@ -52,3 +52,19 @@ depth_activation: 'sigmoid'
 
 equal_fxfy: true
 equal_view_intrinsics: true
+
+# One-step ReSplat refinement.  The original NAS3R-M 256x256 network is
+# frozen; only these newly introduced refinement modules are trainable.
+refine_enabled: true
+refine_channels: 512
+refine_knn_samples: 8
+refine_point_blocks: 4
+refine_knn_projection_channels: 64
+refine_scale_min: 1.0e-6
+refine_pt_chunk_size: 32768
+
+error_lifting:
+  feature_dim: 256
+  chunk_size: 32
+  max_probe_channels: 34
+  contribution_eps: 1.0e-8

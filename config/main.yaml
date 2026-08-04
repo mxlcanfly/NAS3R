@@ -83,6 +83,7 @@ trainer:
   val_check_interval: 250
   gradient_clip_val: 0.5
   num_nodes: 1
+  num_sanity_val_steps: 2
 
 hydra:
   run:

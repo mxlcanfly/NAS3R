@@ -48,6 +48,7 @@ from .encoder.visualization.encoder_visualizer import EncoderVisualizer
 from ..misc.intrinsics_utils import estimate_intrinsics
 from ..evaluation.metrics import compute_pose_error, compute_pose_error_for_batch
 from ..misc.cam_utils import pose_auc
+from .ply_export import export_ply
 
 
 @dataclass
@@ -188,6 +189,293 @@ class ModelWrapper(LightningModule):
 
         self.ckpt_path = None
 
+    def _run_single_refinement(
+        self,
+        batch: dict,
+        encoder_output: dict,
+        context_extrinsics: Tensor,
+        context_intrinsics: Tensor,
+    ) -> tuple[Any, dict]:
+        initial_gaussians = encoder_output["gaussians"]
+        if not hasattr(self.encoder, "refine_once"):
+            return initial_gaussians, {}
+        return self.encoder.refine_once(
+            batch["context"],
+            initial_gaussians,
+            context_extrinsics,
+            context_intrinsics,
+            self.decoder,
+        )
+
+    @staticmethod
+    def _image_metrics(ground_truth: Tensor, prediction: Tensor) -> dict[str, Tensor]:
+        flattened_gt = rearrange(ground_truth, "b v c h w -> (b v) c h w")
+        flattened_prediction = rearrange(
+            prediction,
+            "b v c h w -> (b v) c h w",
+        )
+        error = prediction - ground_truth
+        return {
+            "psnr": compute_psnr(flattened_gt, flattened_prediction).mean(),
+            "mae": error.abs().mean(),
+            "mse": error.square().mean(),
+        }
+
+    @rank_zero_only
+    @torch.no_grad()
+    def _save_refinement_diagnostics(
+        self,
+        batch: dict,
+        initial_gaussians,
+        refined_gaussians,
+        refine_diagnostics: dict,
+        initial_target_render: Tensor,
+        refined_target_render: Tensor,
+    ) -> None:
+        if not refine_diagnostics or self.global_step % 500 != 0:
+            return
+
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        checkpoint_callback = getattr(self.trainer, "checkpoint_callback", None)
+        checkpoint_dir = getattr(checkpoint_callback, "dirpath", None)
+        if checkpoint_dir is None:
+            checkpoint_dir = Path(self.trainer.default_root_dir) / "checkpoints"
+        output_dir = (
+            Path(checkpoint_dir)
+            / "train_diagnostics"
+            / f"step_{self.global_step:06d}"
+        )
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        context_gt = batch["context"]["image"]
+        initial_context = refine_diagnostics["initial_context_render"].color
+        refined_context = refine_diagnostics["refined_context_render"].color
+        initial_context_metrics = self._image_metrics(context_gt, initial_context)
+        refined_context_metrics = self._image_metrics(context_gt, refined_context)
+        target_gt = batch["target"]["image"]
+        initial_target_metrics = self._image_metrics(
+            target_gt,
+            initial_target_render,
+        )
+        refined_target_metrics = self._image_metrics(
+            target_gt,
+            refined_target_render,
+        )
+
+        # First batch item: one context view per row.  Error maps share [0, 1]
+        # and the signed improvement map is centered at zero.
+        views = context_gt.shape[1]
+        figure, axes = plt.subplots(
+            views + 1,
+            6,
+            figsize=(24, 4 * (views + 1)),
+            squeeze=False,
+        )
+
+        def show_rgb(axis, image, title):
+            axis.imshow(
+                image.detach().float().clamp(0, 1).permute(1, 2, 0).cpu()
+            )
+            axis.set_title(title)
+            axis.axis("off")
+
+        for view in range(views):
+            gt = context_gt[0, view]
+            initial = initial_context[0, view]
+            refined = refined_context[0, view]
+            initial_error = (initial - gt).abs().mean(dim=0)
+            refined_error = (refined - gt).abs().mean(dim=0)
+            improvement = initial_error - refined_error
+            initial_psnr = compute_psnr(gt[None], initial[None]).item()
+            refined_psnr = compute_psnr(gt[None], refined[None]).item()
+
+            show_rgb(axes[view, 0], gt, f"Context {view} GT")
+            show_rgb(
+                axes[view, 1],
+                initial,
+                f"Initial render | PSNR {initial_psnr:.2f}",
+            )
+            axes[view, 2].imshow(
+                initial_error.float().cpu(),
+                cmap="magma",
+                vmin=0,
+                vmax=1,
+            )
+            axes[view, 2].set_title(
+                f"Initial |error| | MAE {initial_error.mean():.4f}"
+            )
+            axes[view, 2].axis("off")
+            show_rgb(
+                axes[view, 3],
+                refined,
+                (
+                    f"Refined render | PSNR {refined_psnr:.2f} "
+                    f"(Δ {refined_psnr - initial_psnr:+.2f})"
+                ),
+            )
+            axes[view, 4].imshow(
+                refined_error.float().cpu(),
+                cmap="magma",
+                vmin=0,
+                vmax=1,
+            )
+            axes[view, 4].set_title(
+                f"Refined |error| | MAE {refined_error.mean():.4f}"
+            )
+            axes[view, 4].axis("off")
+            limit = max(float(improvement.abs().max()), 1e-6)
+            axes[view, 5].imshow(
+                improvement.float().cpu(),
+                cmap="coolwarm",
+                vmin=-limit,
+                vmax=limit,
+            )
+            axes[view, 5].set_title(
+                "Error decrease (+ is better) | "
+                f"mean {improvement.mean():+.5f}"
+            )
+            axes[view, 5].axis("off")
+
+        # Bottom row shows the first target view and leaves the error statistics
+        # alongside it for a compact before/after quality check.
+        target_initial_psnr = compute_psnr(
+            target_gt[0, :1],
+            initial_target_render[0, :1],
+        ).item()
+        target_refined_psnr = compute_psnr(
+            target_gt[0, :1],
+            refined_target_render[0, :1],
+        ).item()
+        show_rgb(axes[-1, 0], target_gt[0, 0], "Target GT")
+        show_rgb(
+            axes[-1, 1],
+            initial_target_render[0, 0],
+            f"Initial target | PSNR {target_initial_psnr:.2f}",
+        )
+        show_rgb(
+            axes[-1, 2],
+            refined_target_render[0, 0],
+            (
+                f"Refined target | PSNR {target_refined_psnr:.2f} "
+                f"(Δ {target_refined_psnr - target_initial_psnr:+.2f})"
+            ),
+        )
+        for column in range(3, 6):
+            axes[-1, column].axis("off")
+
+        scene = str(batch["scene"][0])
+        figure.suptitle(
+            f"step {self.global_step} | scene {scene} | "
+            f"context ΔPSNR "
+            f"{refined_context_metrics['psnr'] - initial_context_metrics['psnr']:+.3f} dB | "
+            f"target ΔPSNR "
+            f"{refined_target_metrics['psnr'] - initial_target_metrics['psnr']:+.3f} dB"
+        )
+        figure.tight_layout()
+        figure.savefig(output_dir / "comparison.png", dpi=150)
+        plt.close(figure)
+
+        residual_names = (
+            "delta_mean",
+            "delta_scale",
+            "delta_rotation",
+            "delta_opacity",
+            "delta_sh",
+        )
+        statistics = {
+            "step": int(self.global_step),
+            "scene": scene,
+            "context_indices": batch["context"]["index"][0].detach().cpu().tolist(),
+            "target_indices": batch["target"]["index"][0].detach().cpu().tolist(),
+            "context_initial": {
+                key: float(value) for key, value in initial_context_metrics.items()
+            },
+            "context_refined": {
+                key: float(value) for key, value in refined_context_metrics.items()
+            },
+            "context_delta_psnr": float(
+                refined_context_metrics["psnr"] - initial_context_metrics["psnr"]
+            ),
+            "context_error_decrease": float(
+                initial_context_metrics["mae"] - refined_context_metrics["mae"]
+            ),
+            "context_fraction_pixels_improved": float(
+                (
+                    (initial_context - context_gt).abs().mean(dim=2)
+                    > (refined_context - context_gt).abs().mean(dim=2)
+                )
+                .float()
+                .mean()
+            ),
+            "target_initial": {
+                key: float(value) for key, value in initial_target_metrics.items()
+            },
+            "target_refined": {
+                key: float(value) for key, value in refined_target_metrics.items()
+            },
+            "target_delta_psnr": float(
+                refined_target_metrics["psnr"] - initial_target_metrics["psnr"]
+            ),
+            "gaussians": {
+                "count": int(refined_gaussians.means.shape[1]),
+                "opacity_mean_initial": float(initial_gaussians.opacities.mean()),
+                "opacity_mean_refined": float(refined_gaussians.opacities.mean()),
+                "scale_mean_initial": float(initial_gaussians.scales.mean()),
+                "scale_mean_refined": float(refined_gaussians.scales.mean()),
+                "non_finite_values": int(
+                    sum(
+                        (~torch.isfinite(value)).sum().item()
+                        for value in (
+                            refined_gaussians.means,
+                            refined_gaussians.scales,
+                            refined_gaussians.rotations,
+                            refined_gaussians.opacities,
+                            refined_gaussians.harmonics,
+                        )
+                    )
+                ),
+            },
+            "cuda_peak_memory_gib": (
+                float(torch.cuda.max_memory_allocated() / 1024**3)
+                if torch.cuda.is_available()
+                else 0.0
+            ),
+            "error_lifting": {
+                "feature_probe_count": int(
+                    refine_diagnostics["feature_probe_count"]
+                ),
+                "feature_total_seconds": float(
+                    refine_diagnostics["feature_lifting_seconds"]
+                ),
+                "feature_mean_probe_seconds": float(
+                    refine_diagnostics["feature_chunk_seconds"]
+                ),
+            },
+            "residuals": {
+                name: {
+                    "abs_mean": float(refine_diagnostics[name].abs().mean()),
+                    "abs_max": float(refine_diagnostics[name].abs().max()),
+                    "std": float(refine_diagnostics[name].std()),
+                }
+                for name in residual_names
+            },
+        }
+        with (output_dir / "metrics.json").open("w") as file:
+            json.dump(statistics, file, indent=2)
+
+        export_ply(
+            torch.eye(4, device=self.device),
+            refined_gaussians.means[0],
+            refined_gaussians.scales[0],
+            refined_gaussians.rotations[0],
+            refined_gaussians.harmonics[0],
+            refined_gaussians.opacities[0],
+            output_dir / "refined_gaussians.ply",
+        )
+
     def training_step(self, batch, batch_idx):
         # combine batch from different dataloaders
         if isinstance(batch, list):
@@ -246,7 +534,13 @@ class ModelWrapper(LightningModule):
 
         total_loss = 0
 
-        gaussians = encoder_output["gaussians"]
+        initial_gaussians = encoder_output["gaussians"]
+        gaussians, refine_diagnostics = self._run_single_refinement(
+            batch,
+            encoder_output,
+            context_extrinsics,
+            context_intrinsics,
+        )
         # Determine decoder inputs
         extrinsics = target_extrinsics if not self.train_cfg.training_context else torch.cat(
             [context_extrinsics, target_extrinsics], dim=1)
@@ -259,7 +553,20 @@ class ModelWrapper(LightningModule):
         target_gt = batch["target"]["image"] if not self.train_cfg.training_context else torch.cat(
             [batch["context"]["image"], batch["target"]["image"]], dim=1)
 
-        # Run decoder
+        # The frozen initial prediction is rendered only for the before/after
+        # metric.  The training loss below is applied to the refined result.
+        with torch.no_grad():
+            initial_output = self.decoder.forward(
+                initial_gaussians,
+                extrinsics,
+                intrinsics,
+                near,
+                far,
+                (h, w),
+                depth_mode=self.train_cfg.depth_mode,
+            )
+
+        # Run decoder on the one-step refined Gaussians.
         output = self.decoder.forward(
             gaussians,
             extrinsics,
@@ -276,6 +583,46 @@ class ModelWrapper(LightningModule):
             rearrange(output.color, "b v c h w -> (b v) c h w"),
         )
         self.log(f"train/psnr", psnr.mean())
+        initial_psnr = compute_psnr(
+            rearrange(target_gt, "b v c h w -> (b v) c h w"),
+            rearrange(initial_output.color, "b v c h w -> (b v) c h w"),
+        )
+        psnr_delta = psnr.mean() - initial_psnr.mean()
+        self.log("train/psnr_initial", initial_psnr.mean())
+        self.log("train/psnr_delta", psnr_delta)
+
+        if refine_diagnostics:
+            initial_context_metrics = self._image_metrics(
+                batch["context"]["image"],
+                refine_diagnostics["initial_context_render"].color,
+            )
+            refined_context_metrics = self._image_metrics(
+                batch["context"]["image"],
+                refine_diagnostics["refined_context_render"].color,
+            )
+            self.log("train/context_psnr_initial", initial_context_metrics["psnr"])
+            self.log("train/context_psnr_refined", refined_context_metrics["psnr"])
+            self.log(
+                "train/context_psnr_delta",
+                refined_context_metrics["psnr"] - initial_context_metrics["psnr"],
+            )
+            self.log("train/context_mae_initial", initial_context_metrics["mae"])
+            self.log("train/context_mae_refined", refined_context_metrics["mae"])
+            self.log(
+                "train/feature_lifting_seconds",
+                refine_diagnostics["feature_lifting_seconds"],
+            )
+            for residual_name in (
+                "delta_mean",
+                "delta_scale",
+                "delta_rotation",
+                "delta_opacity",
+                "delta_sh",
+            ):
+                self.log(
+                    f"train/refine_{residual_name}_abs_mean",
+                    refine_diagnostics[residual_name].abs().mean(),
+                )
 
         # Compute and log loss.
         for loss_fn in self.losses:
@@ -309,8 +656,20 @@ class ModelWrapper(LightningModule):
                 f"context = {batch['context']['index'].tolist()}; "
                 f"target = {batch['target']['index'].tolist()}; "
                 f"loss = {total_loss:.6f}; "
-                f"psnr = {psnr.mean().item():.6f}; "
+                f"psnr initial/refined/delta = "
+                f"{initial_psnr.mean().item():.4f}/"
+                f"{psnr.mean().item():.4f}/"
+                f"{psnr_delta.item():+.4f}; "
             )
+
+        self._save_refinement_diagnostics(
+            batch,
+            initial_gaussians,
+            gaussians,
+            refine_diagnostics,
+            initial_output.color[:, -v_tgt:],
+            output.color[:, -v_tgt:],
+        )
         self.log("info/global_step", self.global_step)  # hack for ckpt monitor
 
         # Tell the data loader processes about the current step.
@@ -347,14 +706,23 @@ class ModelWrapper(LightningModule):
                                                   visualization_dump=visualization_dump, target=target_data)
 
                 pred_extrinsics_cwt = encoder_output['extrinsics']['cwt']
-                gaussians = encoder_output["gaussians"]
+                context_extrinsics = pred_extrinsics_cwt[:, :v_cxt]
 
                 if self.encoder.cfg.estimating_focal:
                     pred_intrinsics_cwt = encoder_output['intrinsics']['cwt']
                     target_intrinsics = pred_intrinsics_cwt[:, v_cxt:]
+                    context_intrinsics = pred_intrinsics_cwt[:, :v_cxt]
                     # print("estimate focal", target_intrinsics[0,0,0,0]*w, "gt focal", batch["target"]["intrinsics"][0,target_view,0,0]*w)
                 else:
                     target_intrinsics = target_data["intrinsics"]
+                    context_intrinsics = batch["context"]["intrinsics"]
+
+                gaussians, _ = self._run_single_refinement(
+                    batch,
+                    encoder_output,
+                    context_extrinsics,
+                    context_intrinsics,
+                )
 
                 if self.test_cfg.align_pose:
                     output, updated_extrinsics = self.test_step_align(target_data, gaussians, target_intrinsics,
@@ -392,7 +760,12 @@ class ModelWrapper(LightningModule):
             else:
                 target_intrinsics = batch["target"]["intrinsics"]
 
-            gaussians = encoder_output['gaussians']
+            gaussians, _ = self._run_single_refinement(
+                batch,
+                encoder_output,
+                batch["context"]["extrinsics"],
+                batch["context"]["intrinsics"],
+            )
 
             # align the target pose
             if self.test_cfg.align_pose:
@@ -637,7 +1010,12 @@ class ModelWrapper(LightningModule):
             target_intrinsics = batch["target"]["intrinsics"]
             context_intrinsics = batch["context"]["intrinsics"]
 
-        gaussians = encoder_output['gaussians']
+        gaussians, _ = self._run_single_refinement(
+            batch,
+            encoder_output,
+            context_extrinsics,
+            context_intrinsics,
+        )
 
         # Render context + target views for validation visualization
         extrinsics = torch.cat([context_extrinsics, target_extrinsics], dim=1)
@@ -810,8 +1188,6 @@ class ModelWrapper(LightningModule):
         visualization_dump = {}
         encoder_output = self.encoder(batch["context"], self.global_step, visualization_dump=visualization_dump,
                                       target=None)
-        gaussians = encoder_output['gaussians']
-
         if self.encoder.cfg.estimating_pose:
             pred_extrinsics = encoder_output['extrinsics']['c']
             context_extrinsics = pred_extrinsics[:, :v_cxt]
@@ -823,6 +1199,13 @@ class ModelWrapper(LightningModule):
             context_intrinsics = pred_intrinsics_cwt[:, :v_cxt]
         else:
             context_intrinsics = batch["context"]["intrinsics"]
+
+        gaussians, _ = self._run_single_refinement(
+            batch,
+            encoder_output,
+            context_extrinsics,
+            context_intrinsics,
+        )
 
         t = torch.linspace(0, 1, num_frames, dtype=torch.float32, device=self.device)
         if smooth:
@@ -970,7 +1353,10 @@ class ModelWrapper(LightningModule):
                     continue
 
                 # Heads that are always treated as new
-                if any(x in name for x in ["gaussian_param_head", "intrinsic_encoder"]):
+                if any(
+                    x in name
+                    for x in ["gaussian_param_head", "intrinsic_encoder", "refiner"]
+                ):
                     new_params.append(param)
                     new_param_names.append(name)
                     # print(name)

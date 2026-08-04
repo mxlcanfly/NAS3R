@@ -1,23 +1,34 @@
+from dataclasses import dataclass
 from math import isqrt
 from typing import Literal
 
 import torch
 from diff_gauss_camera import GaussianRasterizationSettings, GaussianRasterizer
 
-
 from einops import einsum, rearrange, repeat
 from jaxtyping import Float
 from torch import Tensor
 
 from ...geometry.projection import get_fov, homogenize_points
+
+
 # from ..encoder.costvolume.conversions import depth_to_relative_disparity
 
 
+@dataclass
+class RenderCUDAAux:
+    """Optional rasterizer outputs used by contribution analysis."""
+
+    alpha: Tensor
+    radii: Tensor
+    extra: Tensor
+
+
 def get_projection_matrix(
-    near: Float[Tensor, " batch"],
-    far: Float[Tensor, " batch"],
-    fov_x: Float[Tensor, " batch"],
-    fov_y: Float[Tensor, " batch"],
+        near: Float[Tensor, " batch"],
+        far: Float[Tensor, " batch"],
+        fov_x: Float[Tensor, " batch"],
+        fov_y: Float[Tensor, " batch"],
 ) -> Float[Tensor, "batch 4 4"]:
     """Maps points in the viewing frustum to (-1, 1) on the X/Y axes and (0, 1) on the Z
     axis. Differs from the OpenGL version in that Z doesn't have range (-1, 1) after
@@ -44,24 +55,40 @@ def get_projection_matrix(
 
 
 def render_cuda(
-    extrinsics: Float[Tensor, "batch 4 4"],
-    intrinsics: Float[Tensor, "batch 3 3"],
-    near: Float[Tensor, " batch"],
-    far: Float[Tensor, " batch"],
-    image_shape: tuple[int, int],
-    background_color: Float[Tensor, "batch 3"],
-    gaussian_means: Float[Tensor, "batch gaussian 3"],
-    gaussian_covariances: Float[Tensor, "batch gaussian 3 3"],
-    gaussian_sh_coefficients: Float[Tensor, "batch gaussian 3 d_sh"],
-    gaussian_opacities: Float[Tensor, "batch gaussian"],
-    gaussian_rotations: Float[Tensor, "batch gaussian 4"],
-    gaussian_scales: Float[Tensor, "batch gaussian 3"],
-    scale_invariant: bool = True,
-    use_sh: bool = True,
-    enable_cov_grad: bool = False,
-    enable_sh_grad: bool = False
-) :
+        extrinsics: Float[Tensor, "batch 4 4"],
+        intrinsics: Float[Tensor, "batch 3 3"],
+        near: Float[Tensor, " batch"],
+        far: Float[Tensor, " batch"],
+        image_shape: tuple[int, int],
+        background_color: Float[Tensor, "batch 3"],
+        gaussian_means: Float[Tensor, "batch gaussian 3"],
+        gaussian_covariances: Float[Tensor, "batch gaussian 3 3"],
+        gaussian_sh_coefficients: Float[Tensor, "batch gaussian 3 d_sh"],
+        gaussian_opacities: Float[Tensor, "batch gaussian"],
+        gaussian_rotations: Float[Tensor, "batch gaussian 4"],
+        gaussian_scales: Float[Tensor, "batch gaussian 3"],
+        scale_invariant: bool = True,
+        use_sh: bool = True,
+        enable_cov_grad: bool = False,
+        enable_sh_grad: bool = False,
+        gaussian_extra_attrs: Tensor | None = None,
+        return_aux: bool = False,
+):
     assert use_sh or gaussian_sh_coefficients.shape[-1] == 1
+    if gaussian_extra_attrs is not None:
+        if gaussian_extra_attrs.ndim != 3:
+            raise ValueError(
+                "gaussian_extra_attrs must have shape [batch, gaussian, channel], "
+                f"got {tuple(gaussian_extra_attrs.shape)}"
+            )
+        if gaussian_extra_attrs.shape[:2] != gaussian_means.shape[:2]:
+            raise ValueError(
+                "gaussian_extra_attrs batch/Gaussian dimensions must match means: "
+                f"extra={tuple(gaussian_extra_attrs.shape)}, "
+                f"means={tuple(gaussian_means.shape)}"
+            )
+        if gaussian_extra_attrs.shape[-1] > 34:
+            raise ValueError("The CUDA rasterizer supports at most 34 extra channels")
 
     # Make sure everything is in a range where numerical issues don't appear.
     if scale_invariant:
@@ -94,6 +121,8 @@ def render_cuda(
     all_images = []
     all_radii = []
     all_depths = []
+    all_alphas = []
+    all_extras = []
     for i in range(b):
         # Set up a tensor for the gradients of the screen-space means.
         mean_gradients = torch.zeros_like(gaussian_means[i], requires_grad=True)
@@ -102,7 +131,6 @@ def render_cuda(
         except Exception:
             pass
 
-      
         settings = GaussianRasterizationSettings(
             image_height=h,
             image_width=w,
@@ -119,51 +147,65 @@ def render_cuda(
             enable_cov_grad=enable_cov_grad,
             enable_sh_grad=enable_sh_grad
         )
-        
-
 
         rasterizer = GaussianRasterizer(settings)
 
         row, col = torch.triu_indices(3, 3)
-       
-        image, rendered_depth, rendered_norm, rendered_alpha, radii, extra = rasterizer(
-                means3D = gaussian_means[i],
-                means2D = mean_gradients,
-                shs = shs[i] if use_sh else None,
-                colors_precomp = None if use_sh else shs[i, :, 0, :],
-                opacities = gaussian_opacities[i, ..., None],
-                scales = gaussian_scales[i],
-                rotations = gaussian_rotations[i],
-                # cov3Ds_precomp = gaussian_covariances[i, :, row, col],
-                viewmatrix = view_matrix[i],
-                projmatrix = projection_matrix[i]
-            )
 
+        image, rendered_depth, rendered_norm, rendered_alpha, radii, extra = rasterizer(
+            means3D=gaussian_means[i],
+            means2D=mean_gradients,
+            shs=shs[i] if use_sh else None,
+            colors_precomp=None if use_sh else shs[i, :, 0, :],
+            opacities=gaussian_opacities[i, ..., None],
+            scales=gaussian_scales[i],
+            rotations=gaussian_rotations[i],
+            # cov3Ds_precomp = gaussian_covariances[i, :, row, col],
+            viewmatrix=view_matrix[i],
+            projmatrix=projection_matrix[i],
+            extra_attrs=(
+                gaussian_extra_attrs[i]
+                if gaussian_extra_attrs is not None
+                else None
+            ),
+        )
 
         all_images.append(image)
         all_radii.append(radii)
         all_depths.append(rendered_depth)
-    return torch.stack(all_images), torch.stack(all_depths)
+        all_alphas.append(rendered_alpha)
+        all_extras.append(extra)
+
+    images = torch.stack(all_images)
+    depths = torch.stack(all_depths)
+    if return_aux:
+        return images, depths, RenderCUDAAux(
+            alpha=torch.stack(all_alphas),
+            radii=torch.stack(all_radii),
+            extra=torch.stack(all_extras),
+        )
+    return images, depths
+
 
 def render_cuda_orthographic(
-    extrinsics: Float[Tensor, "batch 4 4"],
-    width: Float[Tensor, " batch"],
-    height: Float[Tensor, " batch"],
-    near: Float[Tensor, " batch"],
-    far: Float[Tensor, " batch"],
-    image_shape: tuple[int, int],
-    background_color: Float[Tensor, "batch 3"],
-    gaussian_means: Float[Tensor, "batch gaussian 3"],
-    gaussian_covariances: Float[Tensor, "batch gaussian 3 3"],
-    gaussian_sh_coefficients: Float[Tensor, "batch gaussian 3 d_sh"],
-    gaussian_opacities: Float[Tensor, "batch gaussian"],
-    gaussian_rotations: Float[Tensor, "batch gaussian 4"],
-    gaussian_scales: Float[Tensor, "batch gaussian 3"],
-    fov_degrees: float = 0.1,
-    use_sh: bool = True,
-    dump: dict | None = None,
-    enable_cov_grad: bool = False,
-    enable_sh_grad: bool = False
+        extrinsics: Float[Tensor, "batch 4 4"],
+        width: Float[Tensor, " batch"],
+        height: Float[Tensor, " batch"],
+        near: Float[Tensor, " batch"],
+        far: Float[Tensor, " batch"],
+        image_shape: tuple[int, int],
+        background_color: Float[Tensor, "batch 3"],
+        gaussian_means: Float[Tensor, "batch gaussian 3"],
+        gaussian_covariances: Float[Tensor, "batch gaussian 3 3"],
+        gaussian_sh_coefficients: Float[Tensor, "batch gaussian 3 d_sh"],
+        gaussian_opacities: Float[Tensor, "batch gaussian"],
+        gaussian_rotations: Float[Tensor, "batch gaussian 4"],
+        gaussian_scales: Float[Tensor, "batch gaussian 3"],
+        fov_degrees: float = 0.1,
+        use_sh: bool = True,
+        dump: dict | None = None,
+        enable_cov_grad: bool = False,
+        enable_sh_grad: bool = False
 ) -> Float[Tensor, "batch 3 height width"]:
     b, _, _ = extrinsics.shape
     h, w = image_shape
@@ -207,15 +249,12 @@ def render_cuda_orthographic(
 
     for i in range(b):
 
-
         # Set up a tensor for the gradients of the screen-space means.
         mean_gradients = torch.zeros_like(gaussian_means[i], requires_grad=True)
         try:
             mean_gradients.retain_grad()
         except Exception:
             pass
-
-    
 
         settings = GaussianRasterizationSettings(
             image_height=h,
@@ -233,26 +272,23 @@ def render_cuda_orthographic(
             enable_cov_grad=enable_cov_grad,
             enable_sh_grad=enable_sh_grad
         )
-        
+
         rasterizer = GaussianRasterizer(settings)
 
         row, col = torch.triu_indices(3, 3)
 
         image, rendered_depth, rendered_norm, rendered_alpha, radii, extra = rasterizer(
-                means3D = gaussian_means[i],
-                means2D = mean_gradients,
-                shs = shs[i] if use_sh else None,
-                colors_precomp = None if use_sh else shs[i, :, 0, :],
-                opacities = gaussian_opacities[i, ..., None],
-                scales = gaussian_scales[i],
-                rotations = gaussian_rotations[i],
-                # cov3Ds_precomp = gaussian_covariances[i, :, row, col],
-                viewmatrix = view_matrix[i],
-                projmatrix = full_projection[i],
-            )
-        
-
-
+            means3D=gaussian_means[i],
+            means2D=mean_gradients,
+            shs=shs[i] if use_sh else None,
+            colors_precomp=None if use_sh else shs[i, :, 0, :],
+            opacities=gaussian_opacities[i, ..., None],
+            scales=gaussian_scales[i],
+            rotations=gaussian_rotations[i],
+            # cov3Ds_precomp = gaussian_covariances[i, :, row, col],
+            viewmatrix=view_matrix[i],
+            projmatrix=full_projection[i],
+        )
 
         all_images.append(image)
         all_radii.append(radii)
@@ -260,8 +296,5 @@ def render_cuda_orthographic(
     return torch.stack(all_images)
 
 
-
-
 DepthRenderingMode = Literal["depth", "disparity", "relative_disparity", "log"]
-
 

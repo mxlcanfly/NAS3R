@@ -21,8 +21,8 @@ from src.model.distiller import get_distiller
 
 # Configure beartype and jaxtyping.
 with install_import_hook(
-    ("src",),
-    ("beartype", "beartype"),
+        ("src",),
+        ("beartype", "beartype"),
 ):
     from src.config import load_typed_root_config
     from src.dataset.data_module import DataModule
@@ -38,6 +38,7 @@ with install_import_hook(
 
 def cyan(text: str) -> str:
     return f"{Fore.CYAN}{text}{Fore.RESET}"
+
 
 class IterationTimer(Callback):
     def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
@@ -64,14 +65,13 @@ def train(cfg_dict: DictConfig):
     )
     print(cyan(f"Saving outputs to {output_dir}."))
 
-
     # Set up logging with wandb.
     callbacks = []
     if cfg_dict.wandb.mode != "disabled":
-    
+
         if cfg.checkpointing.load is not None and cfg.checkpointing.resume:
             print(cfg.checkpointing.load, Path(cfg.checkpointing.load).parent.parent)
-            with open( Path(cfg.checkpointing.load).parent.parent / "wandb_run_id.txt") as f:
+            with open(Path(cfg.checkpointing.load).parent.parent / "wandb_run_id.txt") as f:
                 resume_id = f.read().strip()
             logger = WandbLogger(
                 project=cfg_dict.wandb.project,
@@ -81,7 +81,7 @@ def train(cfg_dict: DictConfig):
                 log_model=False,
                 save_dir=output_dir,
                 config=OmegaConf.to_container(cfg_dict),
-                id=resume_id,  
+                id=resume_id,
                 resume="allow",
             )
 
@@ -101,14 +101,14 @@ def train(cfg_dict: DictConfig):
                 log_model=False,
                 save_dir=output_dir,
                 config=OmegaConf.to_container(cfg_dict),
-                id=new_id,  
+                id=new_id,
             )
             # save new_id
             id_path = output_dir / "wandb_run_id.txt"
             if not id_path.exists():
                 with open(id_path, "w") as f:
                     f.write(str(new_id))
-        
+
         callbacks.append(LearningRateMonitor("step", True))
         callbacks.append(IterationTimer())
 
@@ -153,9 +153,17 @@ def train(cfg_dict: DictConfig):
         check_val_every_n_epoch=None,
         enable_progress_bar=False,
         gradient_clip_val=cfg.trainer.gradient_clip_val,
+        num_sanity_val_steps=cfg.trainer.num_sanity_val_steps,
         max_steps=cfg.trainer.max_steps,
         # plugins=[SLURMEnvironment(requeue_signal=signal.SIGUSR1)],  # Uncomment for SLURM auto resubmission.
-        inference_mode=False if (cfg.mode == "test" and cfg.test.align_pose) else True,
+        # Renderer-side Gaussian probes use a local autograd graph for virtual
+        # attributes. torch.no_grad() is reversible by torch.enable_grad(), but
+        # torch.inference_mode() is not, so refinement validation/test must use
+        # Lightning's no-grad evaluation mode instead of inference tensors.
+        inference_mode=not (
+            getattr(cfg.model.encoder, "refine_enabled", False)
+            or (cfg.mode == "test" and cfg.test.align_pose)
+        ),
     )
     torch.manual_seed(cfg_dict.seed + trainer.global_rank)
 
@@ -183,7 +191,7 @@ def train(cfg_dict: DictConfig):
             missing_keys, unexpected_keys = encoder.load_state_dict(ckpt_weights, strict=False)
         else:
             raise ValueError(f"Invalid checkpoint format: {weight_path}")
-        
+
     model_kwargs = {
         'optimizer_cfg': cfg.optimizer,
         'test_cfg': cfg.test,
@@ -208,8 +216,6 @@ def train(cfg_dict: DictConfig):
     else:
         model_wrapper = ModelWrapper(**model_kwargs)
 
-    
-    
     data_module = DataModule(
         cfg.dataset,
         cfg.data_loader,
@@ -218,7 +224,8 @@ def train(cfg_dict: DictConfig):
     )
 
     if cfg.mode == "train":
-        trainer.fit(model_wrapper, datamodule=data_module, ckpt_path=checkpoint_path  if cfg.checkpointing.resume else None,)
+        trainer.fit(model_wrapper, datamodule=data_module,
+                    ckpt_path=checkpoint_path if cfg.checkpointing.resume else None, )
     else:
         model_wrapper.ckpt_path = checkpoint_path
         trainer.test(
